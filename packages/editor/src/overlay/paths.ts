@@ -4,6 +4,7 @@ import {
   midpoint,
   polygonSides,
   polygonVertices,
+  rotateVector,
   type CapKind,
   type ConnectorArc,
   type ConnectorGeometry,
@@ -59,7 +60,7 @@ export function traceCap(
 }
 
 /**
- * Adds a connector's line to a new path as the board draws it: straight pieces through its
+ * Adds a connector's line to the path (a subpath of its own) as the board draws it: straight pieces through its
  * points, rounded elbow bends as exact arcs (`points` only approximates them).
  */
 export function traceConnector(
@@ -69,7 +70,6 @@ export function traceConnector(
   const arcAt = new Map<number, ConnectorArc>();
   for (const arc of geometry.arcs ?? []) arcAt.set(arc.from, arc);
   const points = geometry.points;
-  context.beginPath();
   context.moveTo(points[0]!.x, points[0]!.y);
   for (let index = 0; index + 1 < points.length;) {
     const arc = arcAt.get(index);
@@ -122,6 +122,7 @@ export function traceShape(context: CanvasRenderingContext2D, shape: ShapeElemen
   const halfWidth = shape.width / 2 + grow;
   const halfHeight = shape.height / 2 + grow;
   if (shape.type === 'ellipse') {
+    context.moveTo(halfWidth, 0); // a subpath of its own, not joined to the previous one
     context.ellipse(0, 0, halfWidth, halfHeight, 0, 0, Math.PI * 2);
     return;
   }
@@ -146,4 +147,33 @@ export function traceShape(context: CanvasRenderingContext2D, shape: ShapeElemen
   if (radius > 0)
     context.roundRect(-halfWidth, -halfHeight, halfWidth * 2, halfHeight * 2, radius + grow);
   else context.rect(-halfWidth, -halfHeight, halfWidth * 2, halfHeight * 2);
+}
+
+/**
+ * Adds the shape's box, grown by `grow` on every side, to the path in world coordinates
+ * (rotated with the shape): a cheap outline for shapes too small on screen to show theirs.
+ */
+export function traceBox(context: CanvasRenderingContext2D, shape: ShapeElement, grow: number) {
+  const left = shape.x - grow;
+  const top = shape.y - grow;
+  const width = shape.width + grow * 2;
+  const height = shape.height + grow * 2;
+  if (shape.rotation === 0) {
+    context.rect(left, top, width, height);
+    return;
+  }
+  const center = { x: shape.x + shape.width / 2, y: shape.y + shape.height / 2 };
+  const corner = (x: number, y: number) => {
+    const turned = rotateVector({ x: x - center.x, y: y - center.y }, shape.rotation);
+    return { x: center.x + turned.x, y: center.y + turned.y };
+  };
+  const corners = [
+    corner(left, top),
+    corner(left + width, top),
+    corner(left + width, top + height),
+    corner(left, top + height),
+  ];
+  context.moveTo(corners[0]!.x, corners[0]!.y);
+  for (const point of corners.slice(1)) context.lineTo(point.x, point.y);
+  context.closePath();
 }

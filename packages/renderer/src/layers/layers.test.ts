@@ -5,7 +5,7 @@ import { GlyphAtlas } from '../text/glyph-atlas';
 import { byteRuns, coalesceRuns, DirtyRanges } from './buffer-upload';
 import { INSTANCE_STRIDE, InstanceStore } from './instance-store';
 import { LINE_STRIDE, LineLayer } from './line-layer';
-import { pickTier, SDF_TIERS } from './text-layer';
+import { pickTier, SDF_TIERS, TextLayer } from './text-layer';
 
 const rectangle = (id: string, z: number, patch: Record<string, unknown> = {}) => ({
   id,
@@ -160,5 +160,72 @@ describe('text', () => {
     expect(atlas.generation).toBeGreaterThan(generation);
     expect(atlas.insert('huge', raster(64), 32)).toMatchObject({ width: 0, height: 0 });
     expect(atlas.takeUploads().full).toBe(true);
+  });
+});
+
+describe('TextLayer bitmap glyphs', () => {
+  test('settled text comes from exact-size bitmaps on whole pixels, moving text from distance fields', () => {
+    const scene = new Scene();
+    scene.add(
+      rectangle('label', 0, {
+        x: 3.3,
+        y: 7.1,
+        width: 200,
+        height: 60,
+        text: {
+          runs: [{ text: 'ab' }],
+          fontSize: 16,
+          align: 'left',
+          verticalAlign: 'top',
+          color: 0x000000ff,
+        },
+      }),
+    );
+    const raster = (width: number) => ({
+      data: new Uint8Array(width * 8),
+      width,
+      height: 8,
+      left: -1,
+      top: 7,
+    });
+    const bitmapCalls: Array<{ size: number; offsetX: number }> = [];
+    const layer = new TextLayer(
+      new GlyphAtlas({ channels: 1, initialSize: 256 }),
+      new GlyphAtlas({ channels: 4, initialSize: 256 }),
+      { advance: () => 0.55, ascent: 0.8, descent: 0.2 },
+      {
+        sdf: () => raster(6),
+        color: () => raster(6),
+        bitmap: (_cluster, _variant, size, offsetX) => {
+          bitmapCalls.push({ size, offsetX });
+          return raster(5);
+        },
+      },
+      { budgetMs: 1000, budgetUnits: 1_000_000 },
+    );
+    const view = { minX: -100, minY: -100, maxX: 400, maxY: 400 };
+    const modes = () => {
+      const floats = new Float32Array(layer.data);
+      return Array.from({ length: layer.count }, (_, quad) => floats[quad * 14 + 12]);
+    };
+    layer.update(scene, view, 1, 2, () => 0);
+    expect(modes()).toEqual([0, 0]);
+    expect(layer.needsMoreFrames).toBe(true);
+    for (let frame = 0; frame < 3; frame++) layer.update(scene, view, 1, 2, () => 0);
+    expect(modes()).toEqual([3, 3]);
+    expect(layer.needsMoreFrames).toBe(false);
+    // Rasterized at the size on screen, positions in quarter pixels.
+    expect(bitmapCalls.every((call) => call.size === 32 && (call.offsetX * 4) % 1 === 0)).toBe(
+      true,
+    );
+    // Offsets from the anchor are whole device pixels (the shader snaps the anchor).
+    const floats = new Float32Array(layer.data);
+    for (let quad = 0; quad < layer.count; quad++) {
+      expect(Number.isInteger(Math.round(floats[quad * 14 + 2]! * 2 * 1e4) / 1e4)).toBe(true);
+      expect(Number.isInteger(Math.round(floats[quad * 14 + 3]! * 2 * 1e4) / 1e4)).toBe(true);
+    }
+    // Zooming: distance fields again until it settles.
+    layer.update(scene, view, 1.1, 2, () => 0);
+    expect(modes()).toEqual([0, 0]);
   });
 });

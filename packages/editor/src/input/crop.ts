@@ -26,6 +26,7 @@ export function cropTarget(context: InputContext): ShapeElement | null {
 
 /** Enters crop mode: the image switches to `crop`, showing the same part as before. */
 export function startCrop(context: InputContext, id: string): void {
+  if (context.isLocked(id)) return;
   const shape = context.getShape(id);
   if (!shape || shape.type !== 'image' || !shape.media) return;
   if (shape.imageFit !== 'crop' || !shape.crop)

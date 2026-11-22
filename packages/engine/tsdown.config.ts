@@ -2,14 +2,17 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import { defineConfig } from 'tsdown';
 
 /**
- * One package, two entries. The workspace packages (`@apeiro/*`, TypeScript sources) are
+ * One package, five entries. The workspace packages (`@apeiro/*`, TypeScript sources) are
  * bundled in; shared code goes into common chunks, so `apeiro` and `apeiro/react` see the
- * same classes. react stays a peer dependency.
+ * same classes. React and collaboration dependencies stay external.
  */
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
     react: 'src/react.ts',
+    yjs: 'src/yjs.ts',
+    'socket.io': 'src/socket.io.ts',
+    'socket.io-server': 'src/socket.io-server.ts',
   },
   format: 'esm',
   platform: 'browser',
@@ -18,8 +21,16 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   deps: {
-    neverBundle: [/^react($|\/)/, /^react-dom($|\/)/, '@mapbox/tiny-sdf'],
-    alwaysBundle: [/^@apeiro\//],
+    neverBundle: [
+      /^react($|\/)/,
+      /^react-dom($|\/)/,
+      '@mapbox/tiny-sdf',
+      /^yjs($|\/)/,
+      /^y-protocols($|\/)/,
+      /^socket\.io($|\/)/,
+      /^socket\.io-client($|\/)/,
+    ],
+    alwaysBundle: [/^@apeiro\//, /^lib0\//],
   },
   outputOptions: {
     chunkFileNames: 'chunks/[name]-[hash].js',

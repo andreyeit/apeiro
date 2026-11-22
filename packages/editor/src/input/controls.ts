@@ -224,7 +224,9 @@ export function attachControls(
     event.preventDefault();
     if (event.ctrlKey || event.metaKey) {
       // Pinch on trackpads arrives as ctrl+wheel with small deltas.
-      const factor = Math.exp(-event.deltaY * (event.deltaMode === 1 ? 0.05 : 0.01));
+      const factor = Math.exp(
+        -event.deltaY * (event.deltaMode === 1 ? 0.05 : 0.01) * camera.wheelZoomSensitivity,
+      );
       animator.zoomAt(local(event), factor);
     } else {
       const lineHeight = event.deltaMode === 1 ? 16 : 1; // lines → px

@@ -43,7 +43,19 @@
       "default": "./dist/react.js"
     },
     "./styles.css": "./dist/styles.css",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./yjs": {
+      "types": "./dist/yjs.d.ts",
+      "default": "./dist/yjs.js"
+    },
+    "./socket.io": {
+      "types": "./dist/socket.io.d.ts",
+      "default": "./dist/socket.io.js"
+    },
+    "./socket.io/server": {
+      "types": "./dist/socket.io-server.d.ts",
+      "default": "./dist/socket.io-server.js"
+    }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -57,10 +69,26 @@
     "@mapbox/tiny-sdf": "^2.3.0"
   },
   "peerDependencies": {
-    "react": "^18.2.0 || ^19.0.0"
+    "react": "^18.2.0 || ^19.0.0",
+    "yjs": "^13.6.27",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "y-protocols": "^1.0.6"
   },
   "peerDependenciesMeta": {
     "react": {
+      "optional": true
+    },
+    "yjs": {
+      "optional": true
+    },
+    "socket.io": {
+      "optional": true
+    },
+    "socket.io-client": {
+      "optional": true
+    },
+    "y-protocols": {
       "optional": true
     }
   },
@@ -71,7 +99,14 @@
     "@apeiro/renderer": "workspace:*",
     "@types/react": "^19.3.0",
     "react": "^19.3.1",
-    "tsdown": "^0.23.7"
+    "tsdown": "^0.23.7",
+    "yjs": "^13.6.27",
+    "y-protocols": "^1.0.6",
+    "happy-dom": "^21.0.4",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "lib0": "^0.2.85",
+    "@types/node": "^22.0.0"
   },
   "engines": {
     "node": ">=18"

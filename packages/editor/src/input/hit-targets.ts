@@ -75,6 +75,7 @@ export function dotAt(
   point: Vec2,
 ): { shape: ShapeElement; anchor: Vec2 } | null {
   if (!handlesLive(context) || !context.overlay.anchorsFor) return null;
+  if (context.isLocked(context.overlay.anchorsFor)) return null;
   if (context.overlay.selection.has(context.overlay.anchorsFor)) return null; // no dots on a selected element
   const shape = context.getShape(context.overlay.anchorsFor);
   if (!shape || !context.showsDots(shape)) return null;

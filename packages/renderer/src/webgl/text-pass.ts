@@ -23,7 +23,7 @@ interface Resources {
   sdf: AtlasTexture;
   color: AtlasTexture;
   uniforms: Record<
-    'u_camera' | 'u_viewport' | 'u_sdf' | 'u_colorAtlas' | 'u_edge',
+    'u_camera' | 'u_viewport' | 'u_pixelRatio' | 'u_sdf' | 'u_colorAtlas' | 'u_edge',
     WebGLUniformLocation | null
   >;
 }
@@ -67,6 +67,7 @@ export class TextPass {
       uniforms: uniforms(gl, program, [
         'u_camera',
         'u_viewport',
+        'u_pixelRatio',
         'u_sdf',
         'u_colorAtlas',
         'u_edge',
@@ -83,7 +84,14 @@ export class TextPass {
     this.resources = null;
   }
 
-  draw(x: number, y: number, zoom: number, viewportWidth: number, viewportHeight: number): void {
+  draw(
+    x: number,
+    y: number,
+    zoom: number,
+    viewportWidth: number,
+    viewportHeight: number,
+    pixelRatio: number,
+  ): void {
     const resources = this.resources;
     if (!resources) return;
     const gl = this.gl;
@@ -95,6 +103,7 @@ export class TextPass {
     gl.useProgram(resources.program);
     gl.uniform3f(resources.uniforms.u_camera, x, y, zoom);
     gl.uniform2f(resources.uniforms.u_viewport, viewportWidth, viewportHeight);
+    gl.uniform1f(resources.uniforms.u_pixelRatio, pixelRatio);
     gl.uniform1f(resources.uniforms.u_edge, this.edge);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, resources.sdf.texture);

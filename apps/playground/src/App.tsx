@@ -1,13 +1,16 @@
-import type { BoardElement } from '@apeiro/core';
+import { newId, type BoardElement } from '@apeiro/core';
 import type { BoardEditor, Tool } from '@apeiro/editor';
 import {
   Board,
   BoardProvider,
+  Sticky,
+  Rect,
+  Ellipse,
+  Polygon,
   useBoard,
-  useEditor,
   useHistory,
   useTool,
-  useZoom,
+  useZoomPercent,
   type BoardTheme,
 } from '@apeiro/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -74,6 +77,8 @@ export function App() {
   );
   const initialElements = useMemo(() => loadSaved() ?? [], []);
   const save = useSave();
+  const [demos, setDemos] = useState<DemoLayout[]>([]);
+  const addDemo = (board: BoardEditor) => setDemos((items) => [...items, demoLayout(board)]);
 
   useEffect(() => {
     params.set('theme', theme);
@@ -87,32 +92,68 @@ export function App() {
   return (
     <div className={dark ? 'app dark' : 'app'}>
       {/* The renderer backend is a creation option: a new key makes a new board. */}
-      <BoardProvider key={backend} config={{ backend, theme, initialElements, onChange: save }}>
+      <BoardProvider
+        key={backend}
+        config={{
+          backend,
+          theme,
+          initialElements,
+          onChange: save,
+          onReady: (board) => {
+            (window as unknown as { __board: BoardEditor }).__board = board;
+            if (initialElements.length === 0 && board.scene.size === 0) {
+              setDemos((items) => (items.length > 0 ? items : [demoLayout(board)]));
+            }
+          },
+        }}
+      >
         <Board
           className="board"
           fallback={<div className="fallback">Загрузка…</div>}
-          onReady={(editor) => {
-            (window as unknown as { __board: BoardEditor }).__board = editor;
-            if (initialElements.length === 0 && editor.getElements().length === 0) demo(editor);
-          }}
+          errorFallback={
+            <div className="fallback">Нет WebGPU и WebGL2: доска не может работать.</div>
+          }
         >
+          <DemoElements layouts={demos} />
           <TextToolbar />
         </Board>
         <Tools />
-        <Panel theme={theme} setTheme={setTheme} backend={backend} setBackend={setBackend} />
+        <Panel
+          theme={theme}
+          setTheme={setTheme}
+          backend={backend}
+          setBackend={setBackend}
+          onDemo={addDemo}
+          onClear={() => setDemos([])}
+        />
       </BoardProvider>
     </div>
   );
 }
 
-function demo(editor: BoardEditor): void {
-  const center = editor.viewCenter();
-  editor.place('sticky', { x: center.x - 260, y: center.y - 130 });
-  editor.place('rect', { x: center.x, y: center.y - 130 });
-  editor.place('ellipse', { x: center.x + 260, y: center.y - 130 });
-  editor.place('polygon', { x: center.x, y: center.y + 130 });
-  editor.stopEditing();
-  editor.clearSelection();
+interface DemoLayout {
+  id: string;
+  x: number;
+  y: number;
+}
+
+function demoLayout(board: BoardEditor): DemoLayout {
+  return { id: newId('demo'), ...board.camera.center() };
+}
+
+function DemoElements({ layouts }: { layouts: DemoLayout[] }) {
+  return layouts.map(({ id, x, y }) => <DemoGroup key={id} id={id} x={x} y={y} />);
+}
+
+function DemoGroup({ id, x, y }: DemoLayout) {
+  return (
+    <>
+      <Sticky id={`${id}-sticky`} x={x - 350} y={y - 220} />
+      <Rect id={`${id}-rect`} x={x - 90} y={y - 220} />
+      <Ellipse id={`${id}-ellipse`} x={x + 170} y={y - 220} />
+      <Polygon id={`${id}-polygon`} x={x - 90} y={y + 44} />
+    </>
+  );
 }
 
 const TOOLS: Array<[Tool, string]> = [
@@ -129,20 +170,25 @@ const TOOLS: Array<[Tool, string]> = [
 ];
 
 function Tools() {
-  const [tool, setTool] = useTool();
-  const { canUndo, canRedo, undo, redo } = useHistory();
+  const board = useBoard();
+  const tool = useTool();
+  const { canUndo, canRedo } = useHistory();
   return (
     <div className="bar tools">
       {TOOLS.map(([id, label]) => (
-        <button key={id} className={tool === id ? 'active' : ''} onClick={() => setTool(id)}>
+        <button
+          key={id}
+          className={tool === id ? 'active' : ''}
+          onClick={() => board.tools.activate(id)}
+        >
           {label}
         </button>
       ))}
       <span className="sep" />
-      <button disabled={!canUndo} onClick={undo} title="Отменить (Ctrl+Z)">
+      <button disabled={!canUndo} onClick={board.history.undo} title="Отменить (Ctrl+Z)">
         ↶
       </button>
-      <button disabled={!canRedo} onClick={redo} title="Повторить (Ctrl+Shift+Z)">
+      <button disabled={!canRedo} onClick={board.history.redo} title="Повторить (Ctrl+Shift+Z)">
         ↷
       </button>
     </div>
@@ -154,12 +200,13 @@ interface PanelProps {
   setTheme: (theme: BoardTheme) => void;
   backend: Backend;
   setBackend: (backend: Backend) => void;
+  onDemo: (board: BoardEditor) => void;
+  onClear: () => void;
 }
 
-function Panel({ theme, setTheme, backend, setBackend }: PanelProps) {
-  const editor = useEditor();
+function Panel({ theme, setTheme, backend, setBackend, onDemo, onClear }: PanelProps) {
   const board = useBoard();
-  const { percent } = useZoom();
+  const percent = useZoomPercent();
   return (
     <div className="bar panel">
       <select value={theme} onChange={(event) => setTheme(event.target.value as BoardTheme)}>
@@ -177,8 +224,15 @@ function Panel({ theme, setTheme, backend, setBackend }: PanelProps) {
         {percent}%
       </button>
       <button onClick={() => board.camera.zoomTo('in')}>+</button>
-      <button onClick={() => demo(editor)}>Демо</button>
-      <button onClick={() => board.elements.load([])}>Очистить</button>
+      <button onClick={() => onDemo(board)}>Демо</button>
+      <button
+        onClick={() => {
+          onClear();
+          board.elements.load([]);
+        }}
+      >
+        Очистить
+      </button>
       <Stats />
     </div>
   );
@@ -186,18 +240,18 @@ function Panel({ theme, setTheme, backend, setBackend }: PanelProps) {
 
 /** Backend, frames per second and drawn elements, once a second. */
 function Stats() {
-  const editor = useEditor();
+  const board = useBoard();
   const [text, setText] = useState('');
   useEffect(() => {
-    let last = editor.renderer?.stats.frames ?? 0;
+    let last = board.renderer?.stats.frames ?? 0;
     const timer = setInterval(() => {
-      const renderer = editor.renderer;
+      const renderer = board.renderer;
       if (!renderer) return;
       const frames = renderer.stats.frames;
       setText(`${renderer.backend} · ${frames - last} кадр/с · ${renderer.stats.instances} эл.`);
       last = frames;
     }, 1000);
     return () => clearInterval(timer);
-  }, [editor]);
+  }, [board]);
   return <span className="stats">{text}</span>;
 }

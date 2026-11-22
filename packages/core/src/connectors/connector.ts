@@ -279,3 +279,34 @@ export function freezeConnectorEnds(
     end: freeze(connector.end, geometry.points[geometry.points.length - 1]!),
   };
 }
+
+/** The same geometry moved by (`deltaX`, `deltaY`). */
+export function translateGeometry(
+  geometry: ConnectorGeometry,
+  deltaX: number,
+  deltaY: number,
+): ConnectorGeometry {
+  const move = (point: Vec2): Vec2 => ({ x: point.x + deltaX, y: point.y + deltaY });
+  const { bounds, handle, path, arcs } = geometry;
+  return {
+    ...geometry,
+    points: geometry.points.map(move),
+    bounds: {
+      minX: bounds.minX + deltaX,
+      minY: bounds.minY + deltaY,
+      maxX: bounds.maxX + deltaX,
+      maxY: bounds.maxY + deltaY,
+    },
+    handle: handle && { ...handle, point: move(handle.point) },
+    ...(path ? { path: path.map(move) } : {}),
+    ...(arcs
+      ? {
+          arcs: arcs.map((arc) => ({
+            ...arc,
+            centerX: arc.centerX + deltaX,
+            centerY: arc.centerY + deltaY,
+          })),
+        }
+      : {}),
+  };
+}

@@ -23,6 +23,9 @@ import type { ConnectorElement, ConnectorEnd, ConnectorRoute } from './types';
 
 type ShapeLookup = (id: string) => ShapeElement | undefined;
 
+/** Halvings of the search for a border's outer edge (see `caplessDistance`). */
+const BISECTION_STEPS = 16;
+
 /** The point the other end aims at: a free point, an anchor's box point or the shape center. */
 function referencePoint(end: ConnectorEnd, getShape: ShapeLookup): Vec2 | null {
   if (end.kind === 'point') return { x: end.x, y: end.y };
@@ -193,7 +196,8 @@ function caplessDistance(
       high = along;
     }
     if (Number.isNaN(low)) return null;
-    for (let iteration = 0; iteration < 40; iteration++) {
+    // The bracket is one step wide: 16 halvings place the edge within a 65536th of a step.
+    for (let iteration = 0; iteration < BISECTION_STEPS; iteration++) {
       const middle = (low + high) / 2;
       if (outside(middle)) high = middle;
       else low = middle;

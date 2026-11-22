@@ -16,7 +16,7 @@ export interface BoardChanges {
   removed: string[];
   /**
    * Where the changes come from: `undefined` for this user's edits, `'history'` for undo
-   * and redo, `'load'` for `editor.load()`, or the tag you passed to
+   * and redo, `'load'` for `elements.load()`, or the tag you passed to
    * `scene.transact(fn, tag)`.
    */
   origin: string | undefined;
@@ -99,7 +99,7 @@ export function useChangeListener(
       if (!active || log.isEmpty || editor.isInteracting || editor.isDestroyed) return;
       const groups = log.take(editor.scene);
       // One copy of the elements per flush (not per origin group).
-      const elements = editor.getElements();
+      const elements = editor.elements.getAll();
       for (const changes of groups) reference.current?.(elements, changes);
     };
     const schedule = () => {

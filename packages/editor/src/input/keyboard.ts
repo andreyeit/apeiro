@@ -120,9 +120,9 @@ export function handleShortcut(
       hooks.editText?.(only.id);
     }
   } else if (plain && (event.key === '=' || event.key === '+')) {
-    zoomStep(context, 1.25);
+    zoomStep(context, context.camera.zoomStep);
   } else if (plain && (event.key === '-' || event.key === '_')) {
-    zoomStep(context, 0.8);
+    zoomStep(context, 1 / context.camera.zoomStep);
   }
 }
 

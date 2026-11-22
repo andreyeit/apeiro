@@ -24,19 +24,83 @@ export const hasCornerRadius = (element: ShapeElement): boolean =>
 export const polygonSides = (element: Pick<ShapeElement, 'sides'>): number =>
   Math.min(MAX_POLYGON_SIDES, Math.max(MIN_POLYGON_SIDES, Math.round(element.sides ?? 3)));
 
+/** A regular polygon's outline in its local frame, with what distance queries and rounding need. */
+interface PolygonOutline {
+  vertices: readonly Vec2[];
+  /** Outward unit normal of each edge (vertex i → vertex i + 1). */
+  normals: readonly Vec2[];
+  /** Largest corner radius before the arcs of two corners meet on some edge. */
+  maxRadius: number;
+  /** The vertices moved in for each corner radius asked for (see `roundedPolygonSdf`). */
+  eroded: Map<number, readonly Vec2[]>;
+}
+
+/**
+ * Outlines by size and corner count. Hit tests, connector ends and overlays ask for the same
+ * polygon many times per pointer move; building it each time dominated dragging.
+ */
+const outlines = new Map<string, PolygonOutline>();
+const OUTLINE_CACHE_SIZE = 256;
+/** Corner radii kept per outline (a radius handle drag asks for a new one each move). */
+const ERODED_CACHE_SIZE = 8;
+
+/** Adds to a bounded cache, dropping its oldest entry when full. */
+function remember<Key, Value>(
+  cache: Map<Key, Value>,
+  limit: number,
+  key: Key,
+  value: Value,
+): Value {
+  if (cache.size >= limit) cache.delete(cache.keys().next().value!);
+  cache.set(key, value);
+  return value;
+}
+
+/** The outline asked for last: distance searches ask for one shape many times in a row. */
+let lastOutline: { width: number; height: number; sides: number; outline: PolygonOutline } | null =
+  null;
+
+function polygonOutline(width: number, height: number, sides: number): PolygonOutline {
+  const last = lastOutline;
+  if (last && last.width === width && last.height === height && last.sides === sides)
+    return last.outline;
+  const outline = cachedOutline(width, height, sides);
+  lastOutline = { width, height, sides, outline };
+  return outline;
+}
+
+function cachedOutline(width: number, height: number, sides: number): PolygonOutline {
+  const key = `${width}|${height}|${sides}`;
+  const cached = outlines.get(key);
+  if (cached) return cached;
+  const vertices = regularPolygon(width, height, sides);
+  const normals = edgeNormals(vertices);
+  return remember(outlines, OUTLINE_CACHE_SIZE, key, {
+    vertices,
+    normals,
+    maxRadius: polygonMaxRadius(vertices, cornerCuts(normals)),
+    eroded: new Map(),
+  });
+}
+
 /**
  * Vertices of a regular polygon with `sides` corners, the first one at the top, clockwise
  * on screen, stretched so that the polygon's bounding box is exactly the `width` × `height` box
- * (a triangle has its apex at the top middle and its base on the bottom edge).
+ * (a triangle has its apex at the top middle and its base on the bottom edge). Shared: don't
+ * modify the array.
  */
-export function polygonVertices(width: number, height: number, sides: number): Vec2[] {
+export function polygonVertices(width: number, height: number, sides: number): readonly Vec2[] {
+  return polygonOutline(width, height, sides).vertices;
+}
+
+function regularPolygon(width: number, height: number, sides: number): Vec2[] {
   const unit: Vec2[] = [];
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  for (let i = 0; i < sides; i++) {
-    const angle = (2 * Math.PI * i) / sides;
+  for (let index = 0; index < sides; index++) {
+    const angle = (2 * Math.PI * index) / sides;
     const vertex = { x: Math.sin(angle), y: -Math.cos(angle) };
     unit.push(vertex);
     minX = Math.min(minX, vertex.x);
@@ -55,9 +119,9 @@ export function polygonVertices(width: number, height: number, sides: number): V
 }
 
 /** Outward unit normal of each edge (vertex i → vertex i + 1) of clockwise-on-screen vertices. */
-function edgeNormals(vertices: Vec2[]): Vec2[] {
-  return vertices.map((point, i) => {
-    const next = vertices[(i + 1) % vertices.length]!;
+function edgeNormals(vertices: readonly Vec2[]): Vec2[] {
+  return vertices.map((point, index) => {
+    const next = vertices[(index + 1) % vertices.length]!;
     const edgeX = next.x - point.x;
     const edgeY = next.y - point.y;
     const length = Math.hypot(edgeX, edgeY) || 1;
@@ -66,22 +130,25 @@ function edgeNormals(vertices: Vec2[]): Vec2[] {
 }
 
 /** For each vertex: how much a rounding of radius 1 eats into each adjacent edge (cot of half the angle). */
-function cornerCuts(normals: Vec2[]): number[] {
+function cornerCuts(normals: readonly Vec2[]): number[] {
   const count = normals.length;
-  return normals.map((current, i) => {
-    const previous = normals[(i + count - 1) % count]!;
+  return normals.map((current, index) => {
+    const previous = normals[(index + count - 1) % count]!;
     const cross = Math.abs(previous.x * current.y - previous.y * current.x);
     return cross / (1 + previous.x * current.x + previous.y * current.y);
   });
 }
 
 /** Largest corner radius before the arcs of two corners meet on some edge. */
-function polygonMaxRadius(vertices: Vec2[], cuts: number[]): number {
+function polygonMaxRadius(vertices: readonly Vec2[], cuts: readonly number[]): number {
   let maximum = Infinity;
-  for (let i = 0; i < vertices.length; i++) {
-    const j = (i + 1) % vertices.length;
-    const length = Math.hypot(vertices[j]!.x - vertices[i]!.x, vertices[j]!.y - vertices[i]!.y);
-    const cutSum = cuts[i]! + cuts[j]!;
+  for (let index = 0; index < vertices.length; index++) {
+    const next = (index + 1) % vertices.length;
+    const length = Math.hypot(
+      vertices[next]!.x - vertices[index]!.x,
+      vertices[next]!.y - vertices[index]!.y,
+    );
+    const cutSum = cuts[index]! + cuts[next]!;
     if (cutSum > 0) maximum = Math.min(maximum, length / cutSum);
   }
   return Number.isFinite(maximum) ? maximum * RADIUS_CAP : 0;
@@ -90,10 +157,8 @@ function polygonMaxRadius(vertices: Vec2[], cuts: number[]): number {
 /** Largest useful corner radius of a shape (a square at this radius is a circle). */
 export function maxCornerRadius(element: ShapeElement): number {
   if (element.type === 'ellipse' || element.type === 'audio') return 0;
-  if (element.type === 'polygon') {
-    const vertices = polygonVertices(element.width, element.height, polygonSides(element));
-    return polygonMaxRadius(vertices, cornerCuts(edgeNormals(vertices)));
-  }
+  if (element.type === 'polygon')
+    return polygonOutline(element.width, element.height, polygonSides(element)).maxRadius;
   return Math.min(element.width, element.height) / 2;
 }
 
@@ -104,12 +169,16 @@ export function effectiveRadius(element: ShapeElement): number {
 }
 
 /** Exact signed distance to a polygon (negative inside); after Inigo Quilez. */
-function polygonSdf(point: Vec2, vertices: Vec2[]): number {
+function polygonSdf(point: Vec2, vertices: readonly Vec2[]): number {
   let distanceSquared = (point.x - vertices[0]!.x) ** 2 + (point.y - vertices[0]!.y) ** 2;
   let sign = 1;
-  for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i, i++) {
-    const vertex = vertices[i]!;
-    const previousVertex = vertices[j]!;
+  for (
+    let index = 0, previous = vertices.length - 1;
+    index < vertices.length;
+    previous = index, index++
+  ) {
+    const vertex = vertices[index]!;
+    const previousVertex = vertices[previous]!;
     const edgeX = previousVertex.x - vertex.x;
     const edgeY = previousVertex.y - vertex.y;
     const offsetX = point.x - vertex.x;
@@ -131,21 +200,28 @@ function polygonSdf(point: Vec2, vertices: Vec2[]): number {
   return sign * Math.sqrt(distanceSquared);
 }
 
-/** Polygon with every corner rounded by `radius`: the polygon shrunk by it, then grown back. */
-export function roundedPolygonSdf(point: Vec2, vertices: Vec2[], radius: number): number {
-  if (radius <= 0) return polygonSdf(point, vertices);
-  const normals = edgeNormals(vertices);
+/** The outline's vertices moved in so that each corner's arc of `radius` fits. */
+function erodedVertices(outline: PolygonOutline, radius: number): readonly Vec2[] {
+  const cached = outline.eroded.get(radius);
+  if (cached) return cached;
+  const { vertices, normals } = outline;
   const count = vertices.length;
-  const eroded = vertices.map((vertex, i) => {
-    const previousNormal = normals[(i + count - 1) % count]!;
-    const normal = normals[i]!;
+  const eroded = vertices.map((vertex, index) => {
+    const previousNormal = normals[(index + count - 1) % count]!;
+    const normal = normals[index]!;
     const miter = radius / (1 + previousNormal.x * normal.x + previousNormal.y * normal.y);
     return {
       x: vertex.x - (previousNormal.x + normal.x) * miter,
       y: vertex.y - (previousNormal.y + normal.y) * miter,
     };
   });
-  return polygonSdf(point, eroded) - radius;
+  return remember(outline.eroded, ERODED_CACHE_SIZE, radius, eroded);
+}
+
+/** Polygon with every corner rounded by `radius`: the polygon shrunk by it, then grown back. */
+function roundedPolygonSdf(point: Vec2, outline: PolygonOutline, radius: number): number {
+  if (radius <= 0) return polygonSdf(point, outline.vertices);
+  return polygonSdf(point, erodedVertices(outline, radius)) - radius;
 }
 
 /** Signed distance from a local point to the shape's outline (negative inside, stroke ignored). */
@@ -164,11 +240,8 @@ export function shapeSdf(element: ShapeElement, point: Vec2): number {
   }
   const radius = effectiveRadius(element);
   if (element.type === 'polygon') {
-    return roundedPolygonSdf(
-      point,
-      polygonVertices(element.width, element.height, polygonSides(element)),
-      radius,
-    );
+    const outline = polygonOutline(element.width, element.height, polygonSides(element));
+    return roundedPolygonSdf(point, outline, radius);
   }
   const cornerX = Math.abs(point.x) - (halfWidth - radius);
   const cornerY = Math.abs(point.y) - (halfHeight - radius);
@@ -236,8 +309,11 @@ export function radiusCorner(element: ShapeElement): {
   sinHalf: number;
 } {
   if (element.type === 'polygon') {
-    const vertices = polygonVertices(element.width, element.height, polygonSides(element));
-    const normals = edgeNormals(vertices);
+    const { vertices, normals } = polygonOutline(
+      element.width,
+      element.height,
+      polygonSides(element),
+    );
     const lastNormal = normals[normals.length - 1]!;
     const firstNormal = normals[0]!;
     const bisectorX = -(lastNormal.x + firstNormal.x);

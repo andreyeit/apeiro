@@ -1,12 +1,4 @@
-import {
-  newId,
-  hexColor,
-  type Scene,
-  type ShapeElement,
-  type ShapeKind,
-  type Vec2,
-  type LineDash,
-} from '@apeiro/core';
+import { hexColor, type LineDash, type ShapeKind } from '@apeiro/core';
 
 /** What the "add shape" buttons create. */
 export interface ShapePreset {
@@ -30,6 +22,16 @@ export const ELEMENT_SIZE = 180;
 
 /** Corner radius of a new sticky note and of new rectangles and polygons: all alike. */
 export const CORNER_RADIUS = 8;
+
+/** A new sticky note: Miro's classic light yellow, without a border. */
+export const STICKY_STYLE = Object.freeze({
+  width: ELEMENT_SIZE,
+  height: ELEMENT_SIZE,
+  fill: hexColor('#fff9b1'),
+  stroke: 0,
+  strokeWidth: 0,
+  radius: CORNER_RADIUS,
+});
 
 /**
  * New shapes look like the design's Canvas Block: white (color/background), a 1.5px border
@@ -66,25 +68,3 @@ export const SHAPE_PRESETS = {
     ...BLOCK,
   },
 } satisfies Record<string, ShapePreset>;
-
-/** A new shape centered at `center`, above everything else. */
-export function createShape(scene: Scene, preset: ShapePreset, center: Vec2): ShapeElement {
-  const element: ShapeElement = {
-    id: newId('s'),
-    type: preset.type,
-    x: center.x - preset.width / 2,
-    y: center.y - preset.height / 2,
-    width: preset.width,
-    height: preset.height,
-    rotation: 0,
-    z: scene.maxZ() + 1,
-    fill: preset.fill,
-    stroke: preset.stroke,
-    strokeWidth: preset.strokeWidth,
-    ...(preset.strokeStyle !== undefined ? { strokeStyle: preset.strokeStyle } : {}),
-    radius: preset.radius,
-    ...(preset.sides !== undefined ? { sides: preset.sides } : {}),
-  };
-  scene.add(element);
-  return element;
-}

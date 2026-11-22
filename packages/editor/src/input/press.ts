@@ -217,6 +217,7 @@ export function pressConnectorTool(context: InputContext, { point, world }: Pres
 export function pressTextTool(context: InputContext, { point, world }: Press): void {
   const shape = context.scene.hitTestShape(world, context.pixelsToWorld(HIT_TOLERANCE_PX));
   if (canHoldText(shape)) {
+    if (context.isLocked(shape.id)) return;
     context.overlay.selection = new Set([shape.id]);
     context.tools.complete();
     context.hooks.editText?.(shape.id);
@@ -234,6 +235,10 @@ export function pressSelect(context: InputContext, press: Press, readOnly: boole
   const { overlay, scene } = context;
   const { world } = press;
   const hit = scene.hitTest(world, context.pixelsToWorld(HIT_TOLERANCE_PX));
+  if (hit && context.isLocked(hit.id)) {
+    context.setCursor('not-allowed');
+    return;
+  }
 
   // Audio player controls act right away and don't change the selection.
   const control =
@@ -254,6 +259,7 @@ export function pressSelect(context: InputContext, press: Press, readOnly: boole
   if (hit) {
     const pressed = selectionAfterPress(scene, overlay.selection, hit.id, press.shift, press.deep);
     overlay.selection = pressed.selection;
+    for (const id of overlay.selection) if (context.isLocked(id)) overlay.selection.delete(id);
     // Read-only: a press selects (and a click opens a link) but moves nothing.
     const origin = new Map<string, DragOrigin>();
     for (const id of readOnly ? [] : overlay.selection) {

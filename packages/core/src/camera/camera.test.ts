@@ -26,6 +26,18 @@ function manualScheduler() {
 }
 
 describe('Camera', () => {
+  test('validates configured zoom step and wheel sensitivity', () => {
+    const camera = new Camera({ zoomStep: 1.1, wheelZoomSensitivity: 0.5 });
+    expect(camera.zoomStep).toBe(1.1);
+    expect(camera.wheelZoomSensitivity).toBe(0.5);
+    expect(new Camera().zoomStep).toBe(1.25);
+    expect(new Camera().wheelZoomSensitivity).toBe(1);
+    expect(new Camera({ zoomStep: 1 }).zoomStep).toBe(1);
+    for (const zoomStep of [0, 0.5, -1, Number.NaN, Number.POSITIVE_INFINITY])
+      expect(() => new Camera({ zoomStep })).toThrow('zoomStep');
+    for (const wheelZoomSensitivity of [0, -1, Number.NaN, Number.POSITIVE_INFINITY])
+      expect(() => new Camera({ wheelZoomSensitivity })).toThrow('wheelZoomSensitivity');
+  });
   test('maps between screen and world', () => {
     const camera = new Camera();
     camera.setViewport(800, 600);

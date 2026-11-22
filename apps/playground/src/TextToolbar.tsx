@@ -1,7 +1,7 @@
 import { FONT_FAMILIES, type BooleanStyle, type ListKind, type TextAlign } from '@apeiro/core';
 import type { TextFormatCommand } from '@apeiro/editor';
-import { useBoard, useBoardState, useElementScreenBounds, useTextFormat } from '@apeiro/react';
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useBoard, useFloating, useTextEditing } from '@apeiro/react';
+import { useEffect, useRef, useState } from 'react';
 
 const COLORS = [0x1f2937ff, 0xdc2626ff, 0xea580cff, 0x16a34aff, 0x2563ebff, 0x7c3aedff];
 
@@ -42,47 +42,23 @@ function AlignIcon({ align }: { align: TextAlign }) {
 
 const css = (color: number) => `#${(color >>> 0).toString(16).padStart(8, '0')}`;
 
-/** Keys typed in a field are not board shortcuts. */
-const swallow = (event: KeyboardEvent) => event.stopPropagation();
-
 /**
  * The app's formatting toolbar, over the text being edited. The board has none of its
- * own: this reads `useTextFormat` and changes it with `text.format`.
+ * own: this reads `useTextEditing` and changes the text with `board.text.apply`.
  */
 export function TextToolbar() {
-  const format = useTextFormat();
-  const id = useBoardState((board) => board.editing);
-  const box = useElementScreenBounds(id);
+  const editing = useTextEditing();
+  const floating = useFloating(editing?.bounds);
   const board = useBoard();
-  const reference = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ width: 0, height: 0, board: 0 });
   const [linkOpen, setLinkOpen] = useState(false);
   const [link, setLink] = useState('');
   const [linkInvalid, setLinkInvalid] = useState(false);
-
-  useLayoutEffect(() => {
-    const element = reference.current;
-    if (!element) return;
-    const next = {
-      width: element.offsetWidth,
-      height: element.offsetHeight,
-      board: element.parentElement?.clientWidth ?? 0,
-    };
-    setSize((current) =>
-      current.width === next.width && current.height === next.height && current.board === next.board
-        ? current
-        : next,
-    );
-  });
+  const id = editing?.id;
   useEffect(() => setLinkOpen(false), [id]);
 
-  if (!format || !box) return null;
-  const apply = (command: TextFormatCommand) => board.text.format(command);
-
-  // Above the text, or under it when there is no room; kept inside the board sideways.
-  const top = box.minY - 12 - size.height >= 8 ? box.minY - 12 - size.height : box.maxY + 12;
-  const centered = (box.minX + box.maxX) / 2 - size.width / 2;
-  const left = Math.max(8, Math.min(centered, size.board - size.width - 8));
+  if (!editing) return null;
+  const { format } = editing;
+  const apply = (command: TextFormatCommand) => board.text.apply(command);
 
   const openLink = () => {
     setLink(format.link ?? '');
@@ -95,24 +71,12 @@ export function TextToolbar() {
   };
 
   return (
-    <div
-      ref={reference}
-      className="text-toolbar"
-      style={{ left, top }}
-      // Pressing it keeps the text open; buttons don't take the focus (the selection stays).
-      data-ap-text-controls
-      onMouseDown={(event) => {
-        if (
-          !(event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement)
-        )
-          event.preventDefault();
-      }}
-    >
+    // Pressing it keeps the text open, and its buttons keep the text's selection.
+    <div ref={floating.ref} className="text-toolbar" style={floating.style} data-ap-text-controls>
       <div className="row">
         <select
           value={format.font ?? ''}
           title="Шрифт"
-          onKeyDown={swallow}
           onChange={(event) => apply({ type: 'font', font: event.target.value })}
         >
           {format.font === null && <option value="">—</option>}
@@ -207,7 +171,6 @@ export function TextToolbar() {
               setLinkInvalid(false);
             }}
             onKeyDown={(event) => {
-              swallow(event);
               if (event.key === 'Enter') applyLink(link);
               if (event.key === 'Escape') setLinkOpen(false);
             }}
@@ -224,7 +187,7 @@ export function TextToolbar() {
   );
 }
 
-/** Font size field: shows the size at the selection ("Авто" while it is automatic), applies on Enter or when left. */
+/** Font size field: applies valid edits and native spinner steps without leaving the field. */
 function SizeField({
   size,
   auto,
@@ -236,10 +199,12 @@ function SizeField({
 }) {
   const [value, setValue] = useState('');
   const [focused, setFocused] = useState(false);
+  // The click that focused the field must not collapse the selection of its value.
+  const selectingClick = useRef(false);
   const shown = focused ? value : size === null || auto ? '' : String(size);
-  const commit = () => {
-    const parsed = Number(value);
-    if (value.trim() !== '' && Number.isFinite(parsed) && parsed > 0 && parsed !== size)
+  const commit = (next: string) => {
+    const parsed = Number(next);
+    if (next.trim() !== '' && Number.isFinite(parsed) && parsed > 0 && (parsed !== size || auto))
       onSize(parsed);
   };
   return (
@@ -251,20 +216,30 @@ function SizeField({
       title="Размер шрифта (выделенного текста или всего)"
       placeholder={auto ? 'Авто' : ''}
       value={shown}
-      onFocus={() => {
+      onFocus={(event) => {
         setValue(size === null ? '' : String(size));
         setFocused(true);
+        // Typing replaces the size instead of adding digits to it.
+        const input = event.currentTarget;
+        selectingClick.current = true;
+        requestAnimationFrame(() => input.select());
+      }}
+      onMouseUp={(event) => {
+        if (selectingClick.current) event.preventDefault();
+        selectingClick.current = false;
       }}
       onBlur={() => {
-        commit();
         setFocused(false);
       }}
-      onChange={(event) => setValue(event.target.value)}
+      onChange={(event) => {
+        const next = event.target.value;
+        setValue(next);
+        commit(next);
+      }}
       onKeyDown={(event) => {
-        swallow(event);
-        if (event.key === 'Enter') {
-          commit();
-          setFocused(false);
+        if (event.key === 'Enter' || event.key === 'Escape') {
+          event.preventDefault();
+          event.currentTarget.blur();
         }
       }}
     />

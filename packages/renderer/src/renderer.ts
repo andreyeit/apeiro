@@ -24,6 +24,7 @@ import type { AudioVisualState, AudioWidgetStyle } from './media/audio-widget';
 import { MediaPass, type MediaDrawItem, type MediaPassOptions } from './media/media-pass';
 import {
   CanvasFontMeasurer,
+  createBitmapRasterizer,
   createColorRasterizer,
   createSdfRasterizer,
   cssFont,
@@ -176,7 +177,11 @@ export class BoardRenderer {
       this.sdfAtlas,
       this.colorAtlas,
       this.measurer,
-      { sdf: createSdfRasterizer(), color: createColorRasterizer() },
+      {
+        sdf: createSdfRasterizer(),
+        color: createColorRasterizer(),
+        bitmap: createBitmapRasterizer(),
+      },
       options.text,
     );
 

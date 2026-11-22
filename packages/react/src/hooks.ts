@@ -1,17 +1,24 @@
 import type { BoardElement, Box, SceneChanges } from '@apeiro/core';
 import type {
-  BoardDraft,
   BoardEditor,
   BoardEditorEvent,
-  NormalizedDraft,
   BoardThemeName,
+  NormalizedDraft,
   TextFormatState,
   Tool,
 } from '@apeiro/editor';
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+} from 'react';
 import { useChangeListener, type BoardChangeListener } from './changes';
-import { boardApi } from './board-api';
-import { useEditor } from './editor-context';
+import { useBoard } from './editor-context';
 import {
   idSet,
   sameDependencies,
@@ -71,7 +78,7 @@ function useStoreValue<T>(subscribe: Subscribe, select: () => T, isEqual: Equal<
 
 /** The editor of the surrounding board and its store. */
 function useStore(): [BoardEditor, BoardStore] {
-  const editor = useEditor();
+  const editor = useBoard();
   return [editor, storeOf(editor)];
 }
 
@@ -101,22 +108,25 @@ interface Tracked<T> {
   stale: boolean;
   /** Inside React's render: subscriptions are switched in an effect then, not here. */
   rendering: boolean;
+  /** The misuse warning was shown (see `get` in `useBoardState`). */
+  warned: boolean;
 }
 
 /**
- * Any state of the board, picked by `select` from the editor; re-renders only when the
- * picked value changes (`isEqual`, shallow by default: arrays and plain objects are
- * compared item by item).
+ * Any state of the board, picked by `select`; re-renders only when the picked value
+ * changes (`isEqual`, shallow by default: arrays and plain objects are compared item by
+ * item, so a selector may return a fresh one).
  *
- * `select` runs again only when something it read can have changed: reading `b.tool`
- * listens to tool changes, `b.view` to the camera, `b.scene` or `b.getElements()` to the
- * content… Read the state through the argument (not an editor from a closure) for this to
- * work; a selector that reads nothing known runs on every change.
+ * `select` runs again only when something it read can have changed: reading
+ * `board.tools.current` listens to tool changes, `board.camera.zoom` to the camera,
+ * `board.scene.get(id)` to that element… Read the state through the argument (not a
+ * board from a closure) for this to work: a selector that reads nothing through it runs on
+ * every change, and warns once when its value changes anyway.
  *
  * ```tsx
- * const zoom = useBoardState((board) => board.view.zoom);
+ * const zoom = useBoardState((board) => board.camera.zoom);
  * const stickies = useBoardState((board) =>
- *   board.selectedElements().filter((element) => element.type === 'sticky'),
+ *   board.selection.elements().filter((element) => element.type === 'sticky'),
  * );
  * ```
  */
@@ -139,6 +149,7 @@ export function useBoardState<T>(
           select: null,
           stale: true,
           rendering: false,
+          warned: false,
         });
 
   const listen = useCallback(() => {
@@ -179,7 +190,20 @@ export function useBoardState<T>(
   // React a new value each time a selector builds fresh objects, and loop.
   const get = (): T => {
     if (!state.stale && state.last && state.select === select) return state.last.value;
-    const { value, dependencies } = store.track(select);
+    const { value, dependencies, untracked } = store.track(select);
+    const previous = state.last;
+    // The same selector read nothing through its argument, yet its value changed: it reads a
+    // board from a closure, which can't be tracked (so it runs on every change).
+    if (untracked && previous && state.select === select && !state.warned) {
+      if (!isEqual(previous.value, value)) {
+        state.warned = true;
+        console.warn(
+          'apeiro: a useBoardState selector changed without reading the board from its ' +
+            'argument, so it runs on every change. Read the state through the argument: ' +
+            'useBoardState((board) => board.selection.ids).',
+        );
+      }
+    }
     state.stale = false;
     state.select = select;
     if (!sameDependencies(state.dependencies, dependencies)) {
@@ -187,7 +211,6 @@ export function useBoardState<T>(
       // After a change (not while rendering): listen to what it reads now right away.
       if (!state.rendering) rewatch();
     }
-    const previous = state.last;
     if (previous && isEqual(previous.value, value)) return previous.value;
     state.last = { value };
     return value;
@@ -214,18 +237,18 @@ export function useBoardState<T>(
  */
 export function useBoardEvent(
   event: BoardEditorEvent,
-  handler: (editor: BoardEditor) => void,
+  handler: (board: BoardEditor) => void,
 ): void {
-  const editor = useEditor();
+  const editor = useBoard();
   const reference = useRef(handler);
   reference.current = handler;
   useEffect(() => editor.on(event, () => reference.current(editor)), [editor, event]);
 }
 
 /**
- * Calls `onChange` when the board's content changes, like `<Board onChange>` but from any
- * component below the board or its provider (an autosave, a "saved" badge…). Changes made
- * together are reported once, a drag or a stroke when it ends, each origin separately.
+ * Calls `onChange` when the board's content changes, like `onChange` of the config but from
+ * any component below the board or its provider (an autosave, a "saved" badge…). Changes
+ * made together are reported once, a drag or a stroke when it ends, each origin separately.
  *
  * ```tsx
  * function Autosave({ boardId }: { boardId: string }) {
@@ -235,21 +258,19 @@ export function useBoardEvent(
  * ```
  */
 export function useBoardChange(onChange: BoardChangeListener): void {
-  useChangeListener(useEditor(), onChange);
+  useChangeListener(useBoard(), onChange);
 }
 
-/** Current tool and a setter. */
-export function useTool(): [Tool, (tool: Tool) => void] {
+/** The active tool (`board.tools.current`); pick one with `board.tools.activate`. */
+export function useTool(): Tool {
   const [editor, store] = useStore();
-  const tool = useStoreValue(useWatch(store, 'tool'), () => editor.tool);
-  const set = useCallback((tool: Tool) => editor.setTool(tool), [editor]);
-  return [tool, set];
+  return useStoreValue(useWatch(store, 'tool'), () => editor.tools.current);
 }
 
 /** Ids of the selected elements (same array until the selection changes). */
 export function useSelectedIds(): readonly string[] {
   const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'selection'), () => editor.selection);
+  return useStoreValue(useWatch(store, 'selection'), () => editor.selection.ids);
 }
 
 /** Listens to the selection and to scene changes of selected elements only. */
@@ -261,7 +282,7 @@ function useSelectionWatch(store: BoardStore, onSelectionChange?: () => void): S
         onChange();
       });
       const offScene = store.onScene((changes: SceneChanges) => {
-        if (!touches(changes, idSet(store.editor.selection))) return;
+        if (!touches(changes, idSet(store.editor.selection.ids))) return;
         onSelectionChange?.();
         onChange();
       });
@@ -277,7 +298,7 @@ function useSelectionWatch(store: BoardStore, onSelectionChange?: () => void): S
 /** The selected elements, updated when they change (other elements' changes are skipped). */
 export function useSelectedElements(): readonly BoardElement[] {
   const [editor, store] = useStore();
-  return useStoreValue(useSelectionWatch(store), () => editor.selectedElements(), shallowEqual);
+  return useStoreValue(useSelectionWatch(store), () => editor.selection.elements(), shallowEqual);
 }
 
 /** One element by id (undefined if it doesn't exist), updated when it changes. */
@@ -294,69 +315,80 @@ export interface HistoryState {
   /** There is something to undo and the board isn't read-only. */
   canUndo: boolean;
   canRedo: boolean;
-  undo: () => void;
-  redo: () => void;
 }
 
-/** Undo/redo availability and actions (both unavailable on a read-only board). */
+/** Whether undo and redo are available, for toolbar buttons (`board.history.undo`…). */
 export function useHistory(): HistoryState {
   const [editor, store] = useStore();
-  const { canUndo, canRedo } = useStoreValue(
+  return useStoreValue(
     useWatch(store, 'history', 'readOnly'),
-    () => ({
-      canUndo: editor.canUndo && !editor.readOnly,
-      canRedo: editor.canRedo && !editor.readOnly,
-    }),
+    () => ({ canUndo: editor.history.canUndo, canRedo: editor.history.canRedo }),
     shallowEqual,
   );
-  const { undo, redo } = boardApi(editor).history;
-  return useMemo(() => ({ canUndo, canRedo, undo, redo }), [canUndo, canRedo, undo, redo]);
 }
 
-export interface ZoomState {
-  /** Whole percent, for showing it: `83`. */
-  percent: number;
-  /** The same zoom as a factor, the unit of `editor.zoomTo(…)`: `0.83`. */
-  zoom: number;
+export interface ClipboardState {
+  /** Something is selected (`board.clipboard.copy`). */
+  canCopy: boolean;
+  /** Something is selected and the board isn't read-only (`cut`, `duplicate`). */
+  canCut: boolean;
+  /** The board isn't read-only (`paste`). */
+  canPaste: boolean;
+  /** This board copied something (the system clipboard may hold more: `paste` reads it). */
+  hasCopy: boolean;
+}
+
+/** What copy, cut, paste and duplicate can do now, for toolbar buttons (`board.clipboard`…). */
+export function useClipboard(): ClipboardState {
+  const [editor, store] = useStore();
+  return useStoreValue(
+    useWatch(store, 'selection', 'clipboard', 'readOnly'),
+    () => {
+      const canCopy = editor.selection.ids.length > 0;
+      return {
+        canCopy,
+        canCut: canCopy && !editor.readOnly,
+        canPaste: !editor.readOnly,
+        hasCopy: editor.clipboard.content !== null,
+      };
+    },
+    shallowEqual,
+  );
+}
+
+/** The draft being previewed (`board.preview.show`), or null. */
+export function usePreview(): NormalizedDraft | null {
+  const [editor, store] = useStore();
+  return useStoreValue(useWatch(store, 'preview'), () => editor.preview.draft);
 }
 
 /**
- * The zoom rounded to whole percent: re-renders only when the shown number changes, not on
- * every frame of an animated zoom. The exact zoom: `useBoardState((board) => board.view.zoom)`.
+ * The zoom in whole percent (`83`): re-renders only when that number changes, not on every
+ * frame of an animated zoom. The exact zoom: `useBoardState((board) => board.camera.zoom)`.
  *
  * ```tsx
- * const { percent } = useZoom();
- * <button onClick={() => editor.zoomTo('reset')}>{percent}%</button>
+ * const percent = useZoomPercent();
+ * <button onClick={() => board.camera.zoomTo('reset')}>{percent}%</button>
  * ```
  */
-export function useZoom(): ZoomState {
+export function useZoomPercent(): number {
   const [editor, store] = useStore();
-  const percent = useStoreValue(useWatch(store, 'camera'), () =>
-    Math.round(editor.camera.zoom * 100),
-  );
-  return useMemo(() => ({ percent, zoom: percent / 100 }), [percent]);
+  return useStoreValue(useWatch(store, 'camera'), () => Math.round(editor.camera.zoom * 100));
 }
 
 /**
- * Formatting at the selection of the text being edited (bold, font, size, color, list,
- * link…), or null when no text is edited. Change it with `useBoard().text.format`.
+ * How the board is drawn now: `'light'` or `'dark'` (`'system'` resolved). The theme is
+ * set by `theme` of the config.
  */
-export function useTextFormat(): TextFormatState | null {
+export function useBoardTheme(): BoardThemeName {
   const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'textFormat'), () => editor.textFormat);
-}
-
-/** The board theme and a setter. */
-export function useBoardTheme(): [BoardThemeName, (theme: BoardThemeName) => void] {
-  const [editor, store] = useStore();
-  const theme = useStoreValue(useWatch(store, 'theme'), () => editor.theme);
-  const set = useCallback((theme: BoardThemeName) => editor.setTheme(theme), [editor]);
-  return [theme, set];
+  return useStoreValue(useWatch(store, 'theme'), () => editor.theme);
 }
 
 /**
  * Screen box of the selection relative to the board's box (CSS pixels), for placing a
- * floating toolbar above it; null without a selection. Follows pans, zooms and edits.
+ * floating toolbar above it (see `useFloating`); null without a selection. Follows pans,
+ * zooms and edits.
  */
 export function useSelectionScreenBounds(): Box | null {
   const [editor, store] = useStore();
@@ -387,7 +419,7 @@ export function useSelectionScreenBounds(): Box | null {
   );
   const compute = (): Box | null => {
     if (!world.valid) {
-      world.box = editor.selectionBounds();
+      world.box = editor.selection.bounds();
       world.valid = true;
     }
     return world.box ? toScreen(editor, world.box) : null;
@@ -432,75 +464,120 @@ export function useElementScreenBounds(id: string | null | undefined): Box | nul
   return useStoreValue(subscribe, compute, shallowEqual);
 }
 
-export interface PreviewState {
-  /** The draft being previewed (as applying it would change the board), or null. */
-  draft: NormalizedDraft | null;
-  /** Shows a draft over the board for this user only; throws if it is invalid. */
-  show: (draft: BoardDraft) => void;
-  /** Applies the draft as one undo step; returns the ids added and changed. */
-  apply: () => string[];
-  /** Drops the draft. */
-  discard: () => void;
+/** The text being edited, for a formatting toolbar (see `useTextEditing`). */
+export interface TextEditing {
+  /** Id of the element whose text is edited. */
+  id: string;
+  /** Formatting at the caret or selection; change it with `board.text.apply`. */
+  format: TextFormatState;
+  /** Screen box of the element relative to the board's box (CSS pixels). */
+  bounds: Box;
 }
 
 /**
- * Proposed changes shown before they are made, e.g. an AI assistant's result: `show` it,
- * then let the user `apply` or `discard` it. Until applied, nobody else sees it.
+ * The text being edited, or null: its element, its formatting and where it is on screen.
+ * Everything a formatting toolbar needs (the board has none of its own): place it with
+ * `useFloating(editing?.bounds)`, change the text with `board.text.apply`, and put it inside
+ * `data-ap-text-controls` so pressing it keeps the text open.
  *
  * ```tsx
- * const preview = usePreview();
- * // after the AI answered: preview.show({ add: stickers });
- * {preview.draft && <><button onClick={preview.apply}>Apply</button>
- *   <button onClick={preview.discard}>Discard</button></>}
+ * function TextToolbar() {
+ *   const editing = useTextEditing();
+ *   const floating = useFloating(editing?.bounds);
+ *   const board = useBoard();
+ *   if (!editing) return null;
+ *   return (
+ *     <div ref={floating.ref} style={floating.style} data-ap-text-controls>
+ *       <button
+ *         aria-pressed={editing.format.bold}
+ *         onClick={() => board.text.apply({ type: 'toggle', style: 'bold' })}
+ *       >
+ *         B
+ *       </button>
+ *     </div>
+ *   );
+ * }
  * ```
  */
-export function usePreview(): PreviewState {
+export function useTextEditing(): TextEditing | null {
   const [editor, store] = useStore();
-  const draft = useStoreValue(useWatch(store, 'preview'), () => editor.preview);
-  const { show, apply, discard } = boardApi(editor).preview;
-  return useMemo(() => ({ draft, show, apply, discard }), [draft, show, apply, discard]);
-}
-
-export interface ClipboardState {
-  /** Something is selected. */
-  canCopy: boolean;
-  /** This board copied something (the system clipboard may hold more: `paste` reads it). */
-  hasCopy: boolean;
-  /** Something is selected and the board isn't read-only (also for `duplicate`). */
-  canCut: boolean;
-  /** The board isn't read-only. */
-  canPaste: boolean;
-  copy: () => void;
-  cut: () => void;
-  /** Pastes from the system clipboard (asks the browser), else what this board copied. */
-  paste: () => void;
-  duplicate: () => void;
-}
-
-/** Copy, cut, paste and duplicate, for toolbar buttons (the keyboard shortcuts work anyway). */
-export function useClipboard(): ClipboardState {
-  const [editor, store] = useStore();
-  const { canCopy, hasCopy, readOnly } = useStoreValue(
-    useWatch(store, 'selection', 'clipboard', 'readOnly'),
-    () => ({
-      canCopy: editor.selection.length > 0,
-      hasCopy: editor.clipboard !== null,
-      readOnly: editor.readOnly,
-    }),
-    shallowEqual,
-  );
-  const api = boardApi(editor).clipboard;
+  const id = useStoreValue(useWatch(store, 'editing'), () => editor.text.editing);
+  const format = useStoreValue(useWatch(store, 'textFormat', 'mount'), () => editor.text.format);
+  const bounds = useElementScreenBounds(id);
   return useMemo(
-    () => ({
-      canCopy,
-      hasCopy,
-      canCut: canCopy && !readOnly,
-      canPaste: !readOnly,
-      copy: api.copy,
-      cut: api.cut,
-      paste: () => void api.paste(),
-      duplicate: api.duplicate,
-    }),
-    [api, canCopy, hasCopy, readOnly],
+    () => (id && format && bounds ? { id, format, bounds } : null),
+    [id, format, bounds],
   );
+}
+
+export interface FloatingOptions {
+  /** Above the anchor (default) or below it; flips to the other side when there's no room. */
+  placement?: 'top' | 'bottom';
+  /** Space between the anchor and the element (CSS pixels, default 12). */
+  gap?: number;
+  /** Space kept from the board's edges (CSS pixels, default 8). */
+  margin?: number;
+}
+
+export interface Floating {
+  /** Give it to the floating element. */
+  ref: (element: HTMLElement | null) => void;
+  /** Its position: absolute, next to the anchor, inside the board. */
+  style: CSSProperties;
+}
+
+/**
+ * Places an element of yours (a toolbar, a menu) next to a box on the board: centered above
+ * it, below when there's no room, and kept inside the board. For a child of `<Board>`, with
+ * `useSelectionScreenBounds`, `useElementScreenBounds` or `useTextEditing`; hidden while
+ * `anchor` is null.
+ *
+ * ```tsx
+ * const floating = useFloating(useSelectionScreenBounds());
+ * <div ref={floating.ref} style={floating.style}>…</div>
+ * ```
+ */
+export function useFloating(
+  anchor: Box | null | undefined,
+  options: FloatingOptions = {},
+): Floating {
+  const { placement = 'top', gap = 12, margin = 8 } = options;
+  const [element, setElement] = useState<HTMLElement | null>(null);
+  const [size, setSize] = useState({ width: 0, height: 0, boardWidth: 0, boardHeight: 0 });
+  // Measured before the browser paints, so the element never shows at a wrong place.
+  useLayoutEffect(() => {
+    if (!element) return;
+    const parent = element.offsetParent;
+    const next = {
+      width: element.offsetWidth,
+      height: element.offsetHeight,
+      boardWidth: parent?.clientWidth ?? 0,
+      boardHeight: parent?.clientHeight ?? 0,
+    };
+    setSize((current) =>
+      current.width === next.width &&
+      current.height === next.height &&
+      current.boardWidth === next.boardWidth &&
+      current.boardHeight === next.boardHeight
+        ? current
+        : next,
+    );
+  });
+  if (!anchor) return { ref: setElement, style: { position: 'absolute', display: 'none' } };
+  const { width, height, boardWidth, boardHeight } = size;
+  const above = anchor.minY - gap - height;
+  const below = anchor.maxY + gap;
+  let top =
+    placement === 'top'
+      ? above >= margin
+        ? above
+        : below
+      : below + height <= boardHeight - margin || boardHeight === 0
+        ? below
+        : above;
+  if (boardHeight > 0) top = Math.max(margin, Math.min(top, boardHeight - height - margin));
+  const centered = (anchor.minX + anchor.maxX) / 2 - width / 2;
+  const left =
+    boardWidth > 0 ? Math.max(margin, Math.min(centered, boardWidth - width - margin)) : centered;
+  return { ref: setElement, style: { position: 'absolute', left, top } };
 }

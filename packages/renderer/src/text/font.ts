@@ -222,3 +222,54 @@ export function createColorRasterizer(): GlyphRasterizer {
     return { data, width, height, left: -reachLeft - padding, top: ascent + padding };
   };
 }
+
+/**
+ * Rasterizes a glyph at an exact pixel size, its pen `offsetX` (0..1 px) to the right of a
+ * whole pixel: the coverage the browser itself draws the text with.
+ */
+export type BitmapRasterizer = (
+  cluster: string,
+  variant: FontVariant,
+  size: number,
+  offsetX: number,
+) => RasterGlyph;
+
+/**
+ * One-channel coverage bitmaps (`MODE_BITMAP`), drawn by Canvas 2D: the same rasterizer,
+ * hinting and antialiasing as the page's text. `left` and `top` are whole pixels from the
+ * pen; the fractional offset is in the bitmap.
+ */
+export function createBitmapRasterizer(): BitmapRasterizer {
+  let context: Context2D | null = null;
+  return (cluster, variant, size, offsetX) => {
+    const padding = 1;
+    context ??= createContext(8, 8);
+    context.font = cssFont(variant, size);
+    const measured = context.measureText(cluster);
+    // As for color glyphs: a cluster can't reach further than two em (see there).
+    const reach = (value: number) => Math.min(Math.ceil(value), Math.ceil(size * 2));
+    const reachLeft = reach(measured.actualBoundingBoxLeft);
+    const reachRight = reach(measured.actualBoundingBoxRight + offsetX);
+    const ascent = reach(measured.actualBoundingBoxAscent);
+    const descent = reach(measured.actualBoundingBoxDescent);
+    const width = reachLeft + reachRight + padding * 2;
+    const height = ascent + descent + padding * 2;
+    if (!(width > padding * 2) || !(height > padding * 2)) {
+      return { data: new Uint8Array(0), width: 0, height: 0, left: 0, top: 0 };
+    }
+    const canvas = context.canvas;
+    if (canvas.width < width || canvas.height < height) {
+      canvas.width = Math.max(canvas.width, width);
+      canvas.height = Math.max(canvas.height, height);
+      context.font = cssFont(variant, size); // resizing resets the context state
+    }
+    context.clearRect(0, 0, width, height);
+    context.textBaseline = 'alphabetic';
+    context.fillStyle = '#000';
+    context.fillText(cluster, padding + reachLeft + offsetX, padding + ascent);
+    const pixels = context.getImageData(0, 0, width, height).data;
+    const data = new Uint8Array(width * height);
+    for (let index = 0; index < data.length; index++) data[index] = pixels[index * 4 + 3]!;
+    return { data, width, height, left: -reachLeft - padding, top: ascent + padding };
+  };
+}

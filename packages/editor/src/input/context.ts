@@ -71,6 +71,8 @@ export interface ControlsHooks {
    * that changes it — no handles, creating tools, moving, typing, deleting or undo.
    */
   readOnly?: () => boolean;
+  /** Elements reserved by another participant cannot be selected or edited. */
+  isLocked?: (id: string) => boolean;
   /**
    * Whether keyboard shortcuts are for this board. With several boards on a page, only the
    * one in use should react to Delete, Ctrl+Z and the tool keys. Default: always.
@@ -133,6 +135,10 @@ export class InputContext {
 
   readOnly(): boolean {
     return this.hooks.readOnly?.() ?? false;
+  }
+
+  isLocked(id: string): boolean {
+    return this.hooks.isLocked?.(id) ?? false;
   }
 
   /** Screen distance between `screenPoint` and `worldPoint`. */

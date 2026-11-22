@@ -13,6 +13,10 @@ export interface CameraState {
 export interface CameraOptions {
   minZoom?: number;
   maxZoom?: number;
+  /** Zoom-in multiplier; zoom-out uses its reciprocal. Must be >= 1. Default 1.25. */
+  zoomStep?: number;
+  /** Wheel/pinch sensitivity multiplier. Must be > 0. Default 1. */
+  wheelZoomSensitivity?: number;
 }
 
 type Listener = (state: Readonly<CameraState>) => void;
@@ -24,6 +28,8 @@ type Listener = (state: Readonly<CameraState>) => void;
 export class Camera {
   readonly minZoom: number;
   readonly maxZoom: number;
+  readonly zoomStep: number;
+  readonly wheelZoomSensitivity: number;
   private state: CameraState = { x: 0, y: 0, zoom: 1 };
   private width = 0;
   private height = 0;
@@ -32,8 +38,14 @@ export class Camera {
   constructor(options: CameraOptions = {}) {
     this.minZoom = options.minZoom ?? 0.01;
     this.maxZoom = options.maxZoom ?? 64;
+    this.zoomStep = options.zoomStep ?? 1.25;
+    this.wheelZoomSensitivity = options.wheelZoomSensitivity ?? 1;
     if (!(this.minZoom > 0) || !(this.maxZoom >= this.minZoom) || !Number.isFinite(this.maxZoom))
       throw new Error(`Invalid zoom range ${this.minZoom}..${this.maxZoom}`);
+    if (!Number.isFinite(this.zoomStep) || this.zoomStep < 1)
+      throw new Error('zoomStep must be finite and at least 1');
+    if (!Number.isFinite(this.wheelZoomSensitivity) || this.wheelZoomSensitivity <= 0)
+      throw new Error('wheelZoomSensitivity must be finite and greater than 0');
   }
 
   get x(): number {

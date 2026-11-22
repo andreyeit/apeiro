@@ -88,7 +88,7 @@ function marquee(context: InputContext, mode: ModeOf<'marquee'>, point: Vec2): v
   // only the elements touched.
   const hits = context.scene.queryBox(box, 'intersect').map((hit) => hit.id);
   for (const id of context.modifiers.deep ? hits : expandToGroups(context.scene, hits))
-    next.add(id);
+    if (!context.isLocked(id)) next.add(id);
   context.overlay.selection = next;
 }
 

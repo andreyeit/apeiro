@@ -3,6 +3,7 @@ import {
   connectorCrossesBox,
   hitTestConnector,
   resolveConnector,
+  translateGeometry,
   type ConnectorElement,
   type ConnectorGeometry,
 } from '../connectors';
@@ -91,6 +92,14 @@ export class Scene {
   private dirtyRoutes = new Set<string>();
   /** Areas where shapes appeared/moved/vanished: elbow routes there may need a re-route. */
   private dirtyAreas: Box[] = [];
+  /**
+   * How each shape moved since routes were last settled, if it only moved (same size,
+   * rotation and outline); null if it changed otherwise, appeared or went away. A connector
+   * between two shapes that moved alike is shifted with them instead of resolved again.
+   */
+  private moves = new Map<string, Vec2 | null>();
+  /** Connectors whose own data changed since routes were last settled: resolved again. */
+  private changedConnectors = new Set<string>();
   private readonly getShape = (id: string): ShapeElement | undefined => {
     const element = this.elements.get(id);
     return element && isShape(element) ? element : undefined;
@@ -114,6 +123,7 @@ export class Scene {
   private zMax: number | null = 0;
   private readonly freeze: boolean;
   private guard: ((id: string) => boolean) | null = null;
+  private editGuards = new Set<(id: string, origin: string | undefined) => boolean>();
 
   constructor(options: SceneOptions = {}) {
     this.index = new SpatialIndex(options.index);
@@ -161,11 +171,19 @@ export class Scene {
     this.guard = canEdit;
   }
 
+  /** Adds an independent guard, including for tagged batches. Returns its disposer. */
+  addEditGuard(canEdit: (id: string, origin: string | undefined) => boolean): () => void {
+    this.editGuards.add(canEdit);
+    return () => {
+      this.editGuards.delete(canEdit);
+    };
+  }
+
   /** Whether the edit guard refuses changing `id` in the current batch. */
   private blocked(id: string): boolean {
-    if (!this.guard) return false;
     const origin = this.depth === 0 ? undefined : this.origin;
-    return (origin === undefined || origin === HISTORY_ORIGIN) && !this.guard(id);
+    for (const canEdit of this.editGuards) if (!canEdit(id, origin)) return true;
+    return !!this.guard && (origin === undefined || origin === HISTORY_ORIGIN) && !this.guard(id);
   }
 
   /**
@@ -186,8 +204,10 @@ export class Scene {
       if (snapshot.type === 'connector') {
         this.attach(snapshot);
         this.dirtyRoutes.add(element.id);
+        this.changedConnectors.add(element.id);
       } else {
         this.placeShape(snapshot);
+        this.moves.set(element.id, null);
       }
       const removed = this.pendingRemoved.get(element.id);
       if (removed) {
@@ -204,7 +224,8 @@ export class Scene {
   }
 
   /**
-   * Applies a patch. Unknown ids are ignored and reported via the return value.
+   * Applies a patch. Unknown ids are ignored and reported via the return value. A patch
+   * that changes nothing is no change: no event, no undo step.
    * Throws, changing nothing, if the result would be invalid.
    */
   update(id: string, patch: ElementPatch): boolean {
@@ -212,6 +233,7 @@ export class Scene {
     if (!previous) return false;
     if (this.blocked(id)) return false;
     const next = patchedElement(previous, patch);
+    if (sameFields(previous, next)) return true;
     const problem = validateElement(next);
     if (problem) throw new Error(`Invalid update of ${id}: ${problem}`);
     this.transact(() => {
@@ -227,8 +249,10 @@ export class Scene {
         if (previous.type === 'connector') this.detach(previous);
         this.attach(next);
         this.dirtyRoutes.add(id);
+        this.changedConnectors.add(id);
       } else if (isShape(previous) && shapeGeometryChanged(previous, next)) {
         this.placeShape(next);
+        this.noteMove(id, previous, next);
         this.shapeChanged(id, previousBox);
       }
       this.markUpdated(id);
@@ -259,6 +283,8 @@ export class Scene {
         this.geometry.delete(id);
         this.elbows.delete(id);
         this.dirtyRoutes.delete(id);
+      } else {
+        this.moves.set(id, null);
       }
       const was = this.pending.get(id);
       this.pending.delete(id);
@@ -273,6 +299,7 @@ export class Scene {
   removeWithConnectors(ids: Iterable<string>): void {
     this.transact(() => {
       for (const id of ids) {
+        if (this.blocked(id)) continue;
         for (const connectorId of this.connectorsOf(id)) this.remove(connectorId);
         this.remove(id);
       }
@@ -446,6 +473,37 @@ export class Scene {
     else this.elbows.delete(element.id);
   }
 
+  /** Records how a shape moved (see `moves`). */
+  private noteMove(id: string, previous: ShapeElement, next: ShapeElement): void {
+    const known = this.moves.get(id);
+    if (known === null) return;
+    if (!onlyMoved(previous, next)) {
+      this.moves.set(id, null);
+      return;
+    }
+    const deltaX = next.x - previous.x + (known?.x ?? 0);
+    const deltaY = next.y - previous.y + (known?.y ?? 0);
+    this.moves.set(id, { x: deltaX, y: deltaY });
+  }
+
+  /**
+   * Shifts a connector's geometry with its shapes when both moved by the same offset and the
+   * connector itself didn't change: its route is then the same, only moved. Not for elbows,
+   * whose routes also depend on the shapes around them. False if it must be resolved.
+   */
+  private shiftConnector(connector: ConnectorElement): boolean {
+    if (connector.route === 'elbow' || this.changedConnectors.has(connector.id)) return false;
+    if (connector.start.kind !== 'element' || connector.end.kind !== 'element') return false;
+    const geometry = this.geometry.get(connector.id);
+    const start = this.moves.get(connector.start.id);
+    const end = this.moves.get(connector.end.id);
+    if (!geometry || !start || !end || start.x !== end.x || start.y !== end.y) return false;
+    const shifted = translateGeometry(geometry, start.x, start.y);
+    this.geometry.set(connector.id, shifted);
+    this.index.set(connector.id, shifted.bounds);
+    return true;
+  }
+
   /** A shape was added, moved/resized, or removed (`previousBox`: where it was). */
   private shapeChanged(id: string, previousBox: Box | undefined): void {
     const attached = this.attachments.get(id);
@@ -489,15 +547,17 @@ export class Scene {
         }
       }
     }
-    if (this.dirtyRoutes.size === 0) return;
     const ids = [...this.dirtyRoutes];
     this.dirtyRoutes.clear();
     for (const id of ids) {
       const connector = this.elements.get(id);
       if (!connector || connector.type !== 'connector') continue;
-      this.placeConnector(connector);
+      if (!this.shiftConnector(connector)) this.placeConnector(connector);
       this.markUpdated(id);
     }
+    // Geometry is current: later moves are relative to it.
+    this.moves.clear();
+    this.changedConnectors.clear();
   }
 
   private settle(): void {
@@ -577,6 +637,28 @@ export class Scene {
 
 export function compareZ(first: BoardElement, second: BoardElement): number {
   return first.z - second.z || (first.id < second.id ? -1 : first.id > second.id ? 1 : 0);
+}
+
+/** The shape moved and nothing else about its contour changed. */
+function onlyMoved(first: ShapeElement, second: ShapeElement): boolean {
+  return (
+    first.width === second.width &&
+    first.height === second.height &&
+    first.rotation === second.rotation &&
+    first.strokeWidth === second.strokeWidth &&
+    first.radius === second.radius &&
+    first.sides === second.sides
+  );
+}
+
+/** Same value for every field (an absent field and `undefined` are the same). */
+function sameFields(first: BoardElement, second: BoardElement): boolean {
+  const firstFields = first as unknown as Record<string, unknown>;
+  const secondFields = second as unknown as Record<string, unknown>;
+  for (const key in firstFields) if (!Object.is(firstFields[key], secondFields[key])) return false;
+  for (const key in secondFields)
+    if (!(key in firstFields) && secondFields[key] !== undefined) return false;
+  return true;
 }
 
 /** Only contour changes affect the spatial index and attached/nearby connector routes. */

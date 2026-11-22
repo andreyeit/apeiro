@@ -14,7 +14,7 @@ import {
 
 /**
  * Proposed changes to the board, e.g. what an AI assistant suggests: shown as a preview
- * that only this user sees until it is applied (`BoardEditor.showPreview`).
+ * that only this user sees until it is applied (`preview.show` of `BoardEditor`).
  */
 export interface BoardDraft {
   /**

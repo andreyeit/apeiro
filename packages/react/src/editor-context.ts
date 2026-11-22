@@ -9,11 +9,13 @@ import {
   useSyncExternalStore,
 } from 'react';
 
-/** What `<BoardProvider>` hands down: its editor and where errors of the board go. */
+/** What `<BoardProvider>` hands down: its editor and its callbacks for `<Board>`. */
 export interface BoardContextValue {
   editor: BoardEditor;
   /** The provider's `onError`, or the console. */
   reportError: (error: unknown) => void;
+  /** The provider's latest `onReady`. */
+  ready: (editor: BoardEditor) => void;
 }
 
 export const BoardContext = createContext<BoardContextValue | null>(null);
@@ -57,7 +59,7 @@ function createEditor(
     };
   }
   const editor = new BoardEditor(wrapped as BoardEditorOptions);
-  if (initialElements && initialElements.length > 0) editor.load(initialElements);
+  if (initialElements && initialElements.length > 0) editor.elements.load(initialElements);
   return editor;
 }
 
@@ -117,11 +119,19 @@ function useIgnoredOptionsWarning(options: EditorOptions | null, live: ReadonlyS
 }
 
 /**
- * The low-level `BoardEditor` of the surrounding board: the scene, the camera, the renderer,
- * and everything `useBoard()` doesn't cover. Never re-renders
- * by itself; read changing state with `useBoardState` or the other hooks.
+ * The surrounding board: its `BoardEditor`, with every command grouped by what it works on
+ * (`board.tools`, `board.selection`, `board.elements`, `board.text`, `board.history`,
+ * `board.camera`, `board.clipboard`, `board.preview`). The same object for the board's
+ * lifetime, and so are its commands: pass them to `onClick` directly or put them in effect
+ * dependencies. Never re-renders: read changing state with `useBoardState` or the other hooks.
+ *
+ * ```tsx
+ * const board = useBoard();
+ * <button onClick={board.history.undo}>Undo</button>
+ * <button onClick={() => board.tools.activate('rect')}>Rectangle</button>
+ * ```
  */
-export function useEditor(): BoardEditor {
+export function useBoard(): BoardEditor {
   return useBoardContext().editor;
 }
 

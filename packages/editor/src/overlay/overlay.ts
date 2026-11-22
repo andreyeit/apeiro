@@ -10,8 +10,10 @@ import {
   isShape,
   SIDE_MIDPOINTS,
   type Box,
-  type Frame,
   type Camera,
+  type ConnectorElement,
+  type ConnectorGeometry,
+  type Frame,
   type Scene,
   type ShapeElement,
   type Vec2,
@@ -32,14 +34,18 @@ import {
   radiusHandleShape,
   selectionEdgeFrame,
 } from './handles';
-import { traceCap, traceConnector, traceShape } from './paths';
+import { traceBox, traceCap, traceConnector, traceShape } from './paths';
 
 /** Length of the crop frame's corner brackets (screen px). */
 const CROP_HANDLE_PX = 14;
 /** Smart guides: Figma's red, distinct from the selection blue. */
 const GUIDE = '#f24822';
-/** Beyond this many visible selected elements, draw one bounding box instead of outlines. */
+/** At most this many elements in view are outlined. */
 const MAX_OUTLINES = 2000;
+/** Width of an element's outline (selection, hover), screen px. */
+const OUTLINE_PX = 1.5;
+/** Shapes smaller than this on screen are outlined by their box. */
+const EXACT_OUTLINE_MIN_PX = 32;
 /** Border of the selection frame and its handles (screen px). */
 const HANDLE_BORDER_PX = 1.5;
 
@@ -157,12 +163,14 @@ export class Overlay {
   }
 
   draw(): void {
+    // Drawn now (e.g. after the board's frame): a redraw requested for later is not needed.
+    if (this.frame) cancelAnimationFrame(this.frame);
+    this.frame = 0;
     const { context, camera } = this;
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.clearRect(0, 0, this.canvas.width, this.canvas.height);
     const zoom = camera.zoom;
     this.setWorldTransform();
-    const view = camera.viewportBounds();
 
     // Groups: a dashed frame around the group under the pointer, and around the group
     // the selection is inside of (its elements are being picked one by one).
@@ -174,7 +182,7 @@ export class Overlay {
     if (hoverGroup && !hoverGroup.every((id) => this.selection.has(id)))
       this.groupFrame(hoverGroup, zoom, 0.6);
     else if (hover && !this.selection.has(hover) && hover !== this.editing)
-      this.outline(hover, view, 1.5 / zoom, 0.6, this.accent);
+      this.outlineElements([hover], 0.6, this.accent);
 
     // Transform frame with corner handles, and while resizing or rotating a badge with the
     // size or the angle. None while text is being edited: typing, not transforming.
@@ -184,19 +192,11 @@ export class Overlay {
         : null;
     // Outlines show what a frame around several elements holds; a lone shape has just its
     // frame (an outline on top of it would double the line).
-    if (this.selection.size > 0 && !(frame && this.selection.size === 1)) {
-      let drawn = 0;
-      for (const id of this.selection) {
-        if (drawn >= MAX_OUTLINES) break;
-        const bounds = this.scene.getBounds(id);
-        if (!bounds || !boxIntersects(bounds, view)) continue;
-        this.outline(id, view, 1.5 / zoom, 1, this.accent);
-        drawn++;
-      }
-    }
+    if (this.selection.size > 0 && !(frame && this.selection.size === 1))
+      this.outlineElements(this.selection, 1, this.accent);
     // Text being edited: one outline on its edge, the only focus mark (no DOM outline).
     if (this.editing && !this.selection.has(this.editing))
-      this.outline(this.editing, view, 1.5 / zoom, 1, this.accent);
+      this.outlineElements([this.editing], 1, this.accent);
 
     if (frame) this.drawTransformFrame(frame, zoom);
     if (this.badge && this.selection.size > 0 && !this.editing) this.drawBadge(this.badge, zoom);
@@ -738,15 +738,7 @@ export class Overlay {
     if (ids.size === 0) return;
     const { context, camera } = this;
     const zoom = camera.zoom;
-    const view = camera.viewportBounds();
-    let drawn = 0;
-    for (const id of ids) {
-      if (drawn >= MAX_OUTLINES) break;
-      const bounds = this.scene.getBounds(id);
-      if (!bounds || !boxIntersects(bounds, view)) continue;
-      this.outline(id, view, 1.5 / zoom, 1, color);
-      drawn++;
-    }
+    this.outlineElements(ids, 1, color);
     const frame = selectionEdgeFrame(this.scene, ids);
     if (!frame) return;
     context.save();
@@ -764,75 +756,140 @@ export class Overlay {
     context.restore();
   }
 
-  private outline(id: string, view: Box, width: number, alpha: number, color: string): void {
-    const element = this.scene.get(id);
-    const bounds = this.scene.getBounds(id);
-    if (!element || !bounds || !boxIntersects(bounds, view)) return;
-    const { context } = this;
+  /**
+   * Outlines elements: shapes just outside their outer edge (their border included),
+   * connectors with a halo. Every outline of a kind goes into one path, so a selection of
+   * thousands costs one stroke instead of thousands. At most `MAX_OUTLINES` elements in
+   * view are drawn.
+   */
+  private outlineElements(ids: Iterable<string>, alpha: number, color: string): void {
+    const { context, camera, scene } = this;
+    const width = OUTLINE_PX / camera.zoom;
+    const view = camera.viewportBounds();
+    const shapes: ShapeElement[] = [];
+    const connectors: OutlinedConnector[] = [];
+    for (const id of ids) {
+      if (shapes.length + connectors.length >= MAX_OUTLINES) break;
+      const element = scene.get(id);
+      const bounds = scene.getBounds(id);
+      if (!element || !bounds || !boxIntersects(bounds, view)) continue;
+      if (isShape(element)) {
+        shapes.push(element);
+        continue;
+      }
+      const geometry = scene.connectorGeometry(id);
+      if (geometry) connectors.push({ element, geometry, bounds });
+    }
+    if (shapes.length === 0 && connectors.length === 0) return;
     context.save();
     context.globalAlpha = alpha;
     context.strokeStyle = color;
-    context.lineWidth = width;
-    context.beginPath();
-    if (isShape(element)) {
-      context.translate(element.x + element.width / 2, element.y + element.height / 2);
-      context.rotate(element.rotation);
-      // Just outside the shape's outer edge (its border included), not over it.
-      traceShape(context, element, element.strokeWidth / 2 + width / 2);
-      context.stroke();
-    } else {
-      // A halo along the line, wider than the stroke; narrower on a line small on screen,
-      // like its handles.
-      const geometry = this.scene.connectorGeometry(id);
-      if (geometry) {
-        const scale = handleScale(this.camera.zoom);
-        const halo = element.strokeWidth + width * 4 * scale;
-        context.lineJoin = 'round';
-        context.lineCap = 'round';
-        // Halos of crossing lines merge into one layer: this one first clears its area, so
-        // where it crosses another halo it replaces it instead of darkening it.
-        traceConnector(context, geometry);
-        context.lineWidth = halo;
-        context.globalAlpha = 1;
-        context.globalCompositeOperation = 'destination-out';
-        context.stroke();
-        context.globalAlpha = alpha * 0.35;
-        context.globalCompositeOperation = 'source-over';
-        context.stroke();
-        // The halo lies under the lines: its own and every other line it crosses are cut out
-        // of it (a halo drawn over a dark line reads as a stray stripe). The cut is half a
-        // pixel narrower than the line, so the halo tucks under its antialiased edge instead
-        // of leaving a seam of background between them.
-        context.globalAlpha = 1;
-        context.globalCompositeOperation = 'destination-out';
-        const area = inflateBox(bounds, halo / 2);
-        const tuck = 1 / this.camera.zoom;
-        for (const line of this.scene.queryBox(area)) {
-          if (line.type !== 'connector') continue;
-          const lineGeometry = line.id === id ? geometry : this.scene.connectorGeometry(line.id);
-          if (!lineGeometry || line.strokeWidth <= tuck) continue;
-          traceConnector(context, lineGeometry);
-          context.lineWidth = line.strokeWidth - tuck;
-          context.stroke();
-          traceCap(
-            context,
-            line.startCap,
-            lineGeometry.points[0]!,
-            lineGeometry.startDirection,
-            line.strokeWidth,
-            tuck,
-          );
-          traceCap(
-            context,
-            line.endCap,
-            lineGeometry.points[lineGeometry.points.length - 1]!,
-            lineGeometry.endDirection,
-            line.strokeWidth,
-            tuck,
-          );
-        }
-      }
-    }
+    if (shapes.length > 0) this.outlineShapes(shapes, width);
+    if (connectors.length > 0) this.haloConnectors(connectors, width, alpha);
     context.restore();
   }
+
+  private outlineShapes(shapes: readonly ShapeElement[], width: number): void {
+    const { context } = this;
+    const zoom = this.camera.zoom;
+    const grow = (shape: ShapeElement) => shape.strokeWidth / 2 + width / 2;
+    this.setWorldTransform();
+    context.beginPath();
+    const exact: ShapeElement[] = [];
+    for (const shape of shapes) {
+      // Too small on screen for its exact outline to show: its box, in world coordinates.
+      if (Math.max(shape.width, shape.height) * zoom < EXACT_OUTLINE_MIN_PX)
+        traceBox(context, shape, grow(shape));
+      else exact.push(shape);
+    }
+    for (const shape of exact) {
+      // A path keeps the transform it was built with: each outline is placed with its own,
+      // and all of them are stroked at once.
+      this.setWorldTransform();
+      context.translate(shape.x + shape.width / 2, shape.y + shape.height / 2);
+      context.rotate(shape.rotation);
+      traceShape(context, shape, grow(shape));
+    }
+    this.setWorldTransform();
+    context.lineWidth = width;
+    context.stroke();
+  }
+
+  /**
+   * Halos along connectors, wider than their stroke (narrower on lines small on screen, like
+   * their handles). Halos of one width share a path, so where they cross they merge into one
+   * layer instead of darkening; each width first clears its area for the same reason.
+   */
+  private haloConnectors(connectors: readonly OutlinedConnector[], width: number, alpha: number) {
+    const { context, camera, scene } = this;
+    const scale = handleScale(camera.zoom);
+    const haloOf = (connector: ConnectorElement) => connector.strokeWidth + width * 4 * scale;
+    context.lineJoin = 'round';
+    context.lineCap = 'round';
+    for (const [halo, geometries] of groupBy(connectors, ({ element }) => haloOf(element))) {
+      context.beginPath();
+      for (const { geometry } of geometries) traceConnector(context, geometry);
+      context.lineWidth = halo;
+      context.globalAlpha = 1;
+      context.globalCompositeOperation = 'destination-out';
+      context.stroke();
+      context.globalAlpha = alpha * 0.35;
+      context.globalCompositeOperation = 'source-over';
+      context.stroke();
+    }
+    // The halos lie under the lines: their own and every other line they cross are cut out
+    // of them (a halo drawn over a dark line reads as a stray stripe). The cut is half a
+    // pixel narrower than the line, so the halo tucks under its antialiased edge instead of
+    // leaving a seam of background between them.
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = 'destination-out';
+    const tuck = 1 / camera.zoom;
+    const cut = new Set<string>();
+    const lines: OutlinedConnector[] = [];
+    for (const { element, bounds } of connectors) {
+      for (const line of scene.queryBox(inflateBox(bounds, haloOf(element) / 2))) {
+        if (line.type !== 'connector' || cut.has(line.id) || line.strokeWidth <= tuck) continue;
+        cut.add(line.id);
+        const geometry = scene.connectorGeometry(line.id);
+        if (geometry) lines.push({ element: line, geometry, bounds });
+      }
+    }
+    for (const [strokeWidth, group] of groupBy(lines, ({ element }) => element.strokeWidth)) {
+      context.beginPath();
+      for (const { geometry } of group) traceConnector(context, geometry);
+      context.lineWidth = strokeWidth - tuck;
+      context.stroke();
+    }
+    for (const { element, geometry } of lines) {
+      const last = geometry.points[geometry.points.length - 1]!;
+      traceCap(
+        context,
+        element.startCap,
+        geometry.points[0]!,
+        geometry.startDirection,
+        element.strokeWidth,
+        tuck,
+      );
+      traceCap(context, element.endCap, last, geometry.endDirection, element.strokeWidth, tuck);
+    }
+  }
+}
+
+/** A connector to outline, resolved. */
+interface OutlinedConnector {
+  element: ConnectorElement;
+  geometry: ConnectorGeometry;
+  bounds: Box;
+}
+
+/** `items` grouped by `keyOf`, in the order the keys first appear. */
+function groupBy<Item, Key>(items: readonly Item[], keyOf: (item: Item) => Key): Map<Key, Item[]> {
+  const groups = new Map<Key, Item[]>();
+  for (const item of items) {
+    const key = keyOf(item);
+    const group = groups.get(key);
+    if (group) group.push(item);
+    else groups.set(key, [item]);
+  }
+  return groups;
 }

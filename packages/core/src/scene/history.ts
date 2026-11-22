@@ -11,6 +11,8 @@ interface Entry {
  * What the board editor needs from an undo history. `History` (below) implements it.
  */
 export interface UndoHistory {
+  /** Shared histories handle text undo as operations, rather than local snapshots. */
+  readonly collaborative?: boolean;
   readonly canUndo: boolean;
   readonly canRedo: boolean;
   /** Reverts the last step; returns the ids it touched that still exist. */

@@ -10,5 +10,7 @@ export * from './text-editor/links';
 export * from './tools/shapes';
 export * from './theme/board-theme';
 export * from './board-editor/board-editor';
+export type * from './board-editor/editor-groups';
+export type * from './board-editor/collaboration';
 export type { BoardDraft, NormalizedDraft } from './preview/draft-preview';
 export { exportFrame, type ExportFrame, type ExportImageOptions } from './export/export-image';

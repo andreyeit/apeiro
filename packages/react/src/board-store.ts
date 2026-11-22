@@ -11,85 +11,113 @@ export type Dependency =
 
 type Listener = () => void;
 type SceneListener = (changes: SceneChanges) => void;
+/** What a member reads; `null`: anything (commands, which a selector shouldn't call). */
+type Dependencies = readonly Dependency[] | null;
+
+/** The groups of the editor's API (`editor.selection`…), tracked member by member. */
+type GroupName =
+  | 'tools'
+  | 'selection'
+  | 'elements'
+  | 'text'
+  | 'history'
+  | 'camera'
+  | 'clipboard'
+  | 'preview';
 
 /**
  * Which state each public member of `BoardEditor` reads, for `useBoardState`'s dependency
- * tracking; `null`: anything (commands, which a selector shouldn't call). A member missing
- * here is a type error, so new editor API has to say what it depends on.
+ * tracking. A member missing here is a type error, so new editor API has to say what it
+ * depends on.
  */
-const MEMBER_DEPENDENCIES: Record<keyof BoardEditor, readonly Dependency[] | null> = {
-  scene: ['scene'],
-  getElements: ['scene'],
-  camera: ['camera'],
-  animator: ['camera'],
-  view: ['camera'],
-  viewCenter: ['camera', 'mount'],
-  clientToWorld: ['camera', 'mount'],
-  tools: ['tool'],
-  tool: ['tool'],
-  history: ['history'],
-  canUndo: ['history'],
-  canRedo: ['history'],
-  selection: ['selection'],
-  selectedElements: ['selection', 'selectionScene'],
-  selectionBounds: ['selection', 'selectionScene'],
-  editing: ['editing'],
-  textFormat: ['textFormat'],
-  theme: ['theme'],
-  isInteracting: ['gesture'],
-  pointer: ['pointer'],
-  renderer: ['mount'],
-  overlay: ['mount'],
-  isMounted: ['mount'],
-  isDestroyed: [],
-  clipboard: ['clipboard'],
-  readOnly: ['readOnly'],
-  preview: ['preview'],
-  // Commands.
-  setReadOnly: null,
-  exportImage: null,
-  showPreview: null,
-  applyPreview: null,
-  discardPreview: null,
-  setHistory: null,
-  setTool: null,
-  setConnectorStyle: null,
-  setPenStyle: null,
-  select: null,
-  selectAll: null,
-  clearSelection: null,
-  setTheme: null,
-  on: null,
-  undo: null,
-  redo: null,
-  batch: null,
-  addElements: null,
-  updateElements: null,
-  updateSelection: null,
-  deleteSelection: null,
-  removeElements: null,
-  reorderSelection: null,
-  group: null,
-  ungroup: null,
-  zoomTo: null,
-  place: null,
-  addText: null,
-  editText: null,
-  stopEditing: null,
-  formatText: null,
-  addFiles: null,
-  copy: null,
-  cut: null,
-  paste: null,
-  pasteFromClipboard: null,
-  duplicate: null,
-  pasteText: null,
-  cropImage: null,
-  load: null,
-  mount: null,
-  unmount: null,
-  destroy: null,
+const MEMBER_DEPENDENCIES: { readonly [K in Exclude<keyof BoardEditor, GroupName>]: Dependencies } =
+  {
+    scene: ['scene'],
+    theme: ['theme'],
+    readOnly: ['readOnly'],
+    isElementLocked: ['locks'],
+    setLockedElements: null,
+    isInteracting: ['gesture'],
+    pointer: ['pointer'],
+    renderer: ['mount'],
+    overlay: ['mount'],
+    isMounted: ['mount'],
+    isDestroyed: [],
+    setTheme: null,
+    setReadOnly: null,
+    on: null,
+    exportImage: null,
+    mount: null,
+    unmount: null,
+    destroy: null,
+  };
+
+const GROUP_DEPENDENCIES: {
+  readonly [G in GroupName]: { readonly [K in keyof BoardEditor[G]]: Dependencies };
+} = {
+  tools: {
+    current: ['tool'],
+    getDefaults: ['tool'],
+    activate: null,
+    setDefaults: null,
+    register: null,
+  },
+  selection: {
+    ids: ['selection'],
+    elements: ['selection', 'selectionScene'],
+    bounds: ['selection', 'selectionScene'],
+    set: null,
+    all: null,
+    clear: null,
+    update: null,
+    delete: null,
+    reorder: null,
+    group: null,
+    ungroup: null,
+  },
+  elements: {
+    getAll: ['scene'],
+    create: null,
+    createText: null,
+    add: null,
+    addFiles: null,
+    update: null,
+    remove: null,
+    load: null,
+    crop: null,
+  },
+  text: {
+    editing: ['editing'],
+    format: ['textFormat', 'mount'],
+    edit: null,
+    stop: null,
+    apply: null,
+  },
+  history: {
+    canUndo: ['history', 'readOnly'],
+    canRedo: ['history', 'readOnly'],
+    undo: null,
+    redo: null,
+    batch: null,
+    replace: null,
+  },
+  camera: {
+    x: ['camera'],
+    y: ['camera'],
+    zoom: ['camera'],
+    center: ['camera', 'mount'],
+    clientToWorld: ['camera', 'mount'],
+    worldToScreen: ['camera', 'mount'],
+    screenToWorld: ['camera', 'mount'],
+    set: null,
+    zoomTo: null,
+  },
+  clipboard: { content: ['clipboard'], copy: null, cut: null, paste: null, duplicate: null },
+  preview: { draft: ['preview'], show: null, apply: null, discard: null },
 };
+
+const isGroup = (property: PropertyKey): property is GroupName =>
+  typeof property === 'string' && Object.hasOwn(GROUP_DEPENDENCIES, property);
 
 /** Every dependency there is (a selector that reads something unknown). */
 const ALL: ReadonlySet<Dependency> = new Set<Dependency>([
@@ -99,6 +127,7 @@ const ALL: ReadonlySet<Dependency> = new Set<Dependency>([
   'history',
   'camera',
   'editing',
+  'textFormat',
   'theme',
   'pointer',
   'clipboard',
@@ -116,6 +145,14 @@ let tracking: {
   sceneRead: boolean;
   sceneObserved: boolean;
 } | null = null;
+
+/** Records a read of a member that depends on `dependencies`. */
+function record(dependencies: Dependencies | undefined): void {
+  if (!tracking) return;
+  tracking.reads++;
+  if (dependencies) for (const dependency of dependencies) tracking.dependencies.add(dependency);
+  else tracking.unknown = true;
+}
 
 /**
  * The hooks' view of one editor: a single subscription per editor event and to the scene,
@@ -165,6 +202,24 @@ export class BoardStore {
         return method;
       },
     });
+    // Each group read member by member; its functions are bound already.
+    const groups = new Map<GroupName, object>();
+    const groupOf = (name: GroupName): object => {
+      let tracked = groups.get(name);
+      if (!tracked) {
+        const dependencies = GROUP_DEPENDENCIES[name] as Readonly<
+          Record<PropertyKey, Dependencies>
+        >;
+        tracked = new Proxy(editor[name], {
+          get(target, property) {
+            record(Object.hasOwn(dependencies, property) ? dependencies[property] : null);
+            return Reflect.get(target, property, target) as unknown;
+          },
+        });
+        groups.set(name, tracked);
+      }
+      return tracked;
+    };
     this.tracked = new Proxy(editor, {
       get(target, property) {
         if (property === 'scene') {
@@ -174,16 +229,12 @@ export class BoardStore {
           }
           return scene;
         }
-        if (tracking) {
-          tracking.reads++;
-          const dependencies =
-            typeof property === 'string' && Object.hasOwn(MEMBER_DEPENDENCIES, property)
-              ? MEMBER_DEPENDENCIES[property as keyof BoardEditor]
-              : null;
-          if (dependencies)
-            for (const dependency of dependencies) tracking.dependencies.add(dependency);
-          else tracking.unknown = true;
-        }
+        if (isGroup(property)) return groupOf(property);
+        record(
+          typeof property === 'string' && Object.hasOwn(MEMBER_DEPENDENCIES, property)
+            ? MEMBER_DEPENDENCIES[property as keyof typeof MEMBER_DEPENDENCIES]
+            : null,
+        );
         const value: unknown = Reflect.get(target, property, target);
         if (typeof value !== 'function') return value;
         // Methods run on the editor itself, so their internals aren't tracked.
@@ -194,7 +245,6 @@ export class BoardStore {
       },
     });
   }
-
   /** Listens to an editor event. */
   on(event: BoardEditorEvent, listener: Listener): () => void {
     let set = this.events.get(event);
@@ -253,7 +303,7 @@ export class BoardStore {
       else if (dependency === 'selectionScene')
         unsubscribers.push(
           this.onScene((changes) => {
-            if (touches(changes, idSet(this.editor.selection))) listener();
+            if (touches(changes, idSet(this.editor.selection.ids))) listener();
           }),
         );
       else if (dependency === 'sceneSize')
@@ -279,6 +329,8 @@ export class BoardStore {
   track<T>(select: (editor: BoardEditor) => T): {
     value: T;
     dependencies: ReadonlySet<Dependency>;
+    /** Nothing was read through the argument. */
+    untracked: boolean;
   } {
     const outer = tracking;
     const current = {
@@ -295,6 +347,7 @@ export class BoardStore {
       return {
         value,
         dependencies: current.unknown || current.reads === 0 ? ALL : current.dependencies,
+        untracked: current.reads === 0,
       };
     } finally {
       tracking = outer;
@@ -357,7 +410,7 @@ export function touches(changes: SceneChanges, ids: ReadonlySet<string>): boolea
 
 const idSets = new WeakMap<readonly string[], ReadonlySet<string>>();
 
-/** A set of the ids of an array that is replaced, never mutated (`editor.selection`). */
+/** A set of the ids of an array that is replaced, never mutated (`editor.selection.ids`). */
 export function idSet(ids: readonly string[]): ReadonlySet<string> {
   let set = idSets.get(ids);
   if (!set) idSets.set(ids, (set = new Set(ids)));

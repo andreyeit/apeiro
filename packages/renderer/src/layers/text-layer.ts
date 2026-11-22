@@ -11,6 +11,7 @@ import {
   type Box,
   type FontMeasurer,
   type FontVariant,
+  type LaidOutGlyph,
   type Scene,
   type SceneChanges,
   type ShapeElement,
@@ -19,7 +20,7 @@ import {
 } from '@apeiro/core';
 import { ColorTheme } from '../color-theme';
 import { textDepth } from '../depth';
-import type { GlyphRasterizer } from '../text/font';
+import type { BitmapRasterizer, GlyphRasterizer } from '../text/font';
 import type { AtlasGlyph, GlyphAtlas } from '../text/glyph-atlas';
 import { DirtyRanges, type BufferUpload } from './buffer-upload';
 import {
@@ -55,6 +56,17 @@ export const MODE_SDF = 0;
 export const MODE_COLOR = 1;
 /** Solid rectangle: underline, strike-through, greeking bars. */
 export const MODE_SOLID = 2;
+/**
+ * A glyph rasterized at exactly its size on screen and drawn pixel for pixel (its element's
+ * anchor snapped to the device pixel grid), the way the browser draws text: as crisp as the
+ * page's own text. Used once the zoom has settled; while it changes, glyphs come from the
+ * distance fields, which scale smoothly.
+ */
+export const MODE_BITMAP = 3;
+/** Horizontal glyph positions keep this many steps per pixel (spacing stays even). */
+const SUBPIXEL_STEPS = 4;
+/** Frames the zoom must stay the same before text is drawn from exact-size bitmaps. */
+const SETTLE_FRAMES = 3;
 
 /** Raster sizes. A glyph is drawn from the smallest tier that is at most ~1.5x magnified. */
 export const SDF_TIERS = [32, 64, 128, 256, 512] as const;
@@ -87,11 +99,17 @@ export interface TextLayerOptions {
   budgetUnits?: number;
   /** Max cached layouts (FIFO eviction). */
   layoutCacheSize?: number;
+  /**
+   * Once the zoom settles, draw unrotated text from glyphs rasterized at their exact size on
+   * screen (see `MODE_BITMAP`) instead of distance fields (default true).
+   */
+  crisp?: boolean;
 }
 
 export interface TextRasterizers {
   sdf: GlyphRasterizer;
   color: GlyphRasterizer;
+  bitmap: BitmapRasterizer;
 }
 
 /** A glyph to rasterize ahead of time at the tier above the one it is drawn from. */
@@ -123,6 +141,8 @@ interface LayoutInputs {
 interface Range extends LayoutInputs {
   start: number;
   end: number;
+  /** Drawn from exact-size bitmaps: valid only unrotated and at the built scale. */
+  crisp: boolean;
 }
 
 /**
@@ -138,6 +158,8 @@ interface QuadBlock extends LayoutInputs {
   minPx: number;
   maxPx: number;
   tierCap: number;
+  /** Device px per world unit its bitmap glyphs were made for, null for distance fields. */
+  crispScale: number | null;
   generations: string;
   theme: ColorTheme;
   centerX: number;
@@ -180,6 +202,11 @@ export class TextLayer {
   private builtPixelRatio = 0;
   private builtGenerations = '';
   private builtTierCap = SDF_TIERS.length - 1;
+  /** Device px per world unit of the build's bitmap glyphs, null if it used distance fields. */
+  private builtCrispScale: number | null = null;
+  /** Device px per world unit of the last frame, and for how many frames it stayed so. */
+  private lastScale = 0;
+  private steadyFrames = 0;
   private dirty = true;
   private incomplete = false;
   /** The quad budget ran out in this build: the rest of the text is skipped. */
@@ -223,6 +250,7 @@ export class TextLayer {
       budgetMs: options.budgetMs ?? 6,
       budgetUnits: options.budgetUnits ?? 400,
       layoutCacheSize: options.layoutCacheSize ?? 20_000,
+      crisp: options.crisp ?? true,
     };
   }
 
@@ -234,7 +262,12 @@ export class TextLayer {
   }
   /** True while glyphs or layouts are still being produced over several frames. */
   get needsMoreFrames(): boolean {
-    return this.incomplete || this.prefetch.size > 0;
+    return this.incomplete || this.prefetch.size > 0 || this.awaitingCrisp;
+  }
+
+  /** The zoom stopped, but the text is not drawn from exact-size bitmaps yet. */
+  private get awaitingCrisp(): boolean {
+    return this.options.crisp && this.lastScale > 0 && this.builtCrispScale !== this.lastScale;
   }
 
   /** Returns what changed in the CPU buffer since the last call. */
@@ -306,7 +339,9 @@ export class TextLayer {
         }
         continue;
       }
-      if (!sameLayoutInputs(range, element)) {
+      // Bitmap glyphs can't turn: a rotation (or back to none) needs the other kind.
+      const crispNow = this.builtCrispScale !== null && element.rotation === 0;
+      if (!sameLayoutInputs(range, element) || range.crisp !== crispNow) {
         this.dirty = true;
         return;
       }
@@ -322,6 +357,12 @@ export class TextLayer {
     pixelRatio: number,
     slotOf: (id: string) => number | undefined,
   ): void {
+    // Bitmap glyphs once the zoom has stayed the same for a few frames.
+    const scale = zoom * pixelRatio;
+    this.steadyFrames = scale === this.lastScale ? this.steadyFrames + 1 : 0;
+    this.lastScale = scale;
+    const crispScale = this.options.crisp && this.steadyFrames >= SETTLE_FRAMES ? scale : null;
+    if (crispScale !== this.builtCrispScale) this.dirty = true;
     const zoomChanged = zoom > this.builtZoom * 1.25 || zoom < this.builtZoom / 1.25;
     const sameView =
       !zoomChanged &&
@@ -359,7 +400,7 @@ export class TextLayer {
     for (let attempt = 0; attempt < 3 && !settled; attempt++) {
       const before = this.generations();
       const resets = this.resets();
-      this.build(scene, view, zoom, pixelRatio, slotOf, tierCap);
+      this.build(scene, view, zoom, pixelRatio, slotOf, tierCap, crispScale);
       settled = this.generations() === before;
       if (this.resets() !== resets) tierCap = Math.max(0, tierCap - 1);
     }
@@ -389,6 +430,7 @@ export class TextLayer {
     pixelRatio: number,
     slotOf: (id: string) => number | undefined,
     tierCap: number,
+    crispScale: number | null,
   ): void {
     // The viewport and half of it around: small pans need no rebuild.
     const covered = inflateBox(view, (view.maxX - view.minX) * 0.5, (view.maxY - view.minY) * 0.5);
@@ -402,7 +444,7 @@ export class TextLayer {
     // Zoomed out so far that even the largest text on the board is invisible: nothing to visit.
     if (this.maxTextSize * zoom >= this.options.minGreekPx) {
       for (const element of scene.queryBox(covered)) {
-        this.place(element, zoom, zoom * pixelRatio, tierCap, generations, slotOf);
+        this.place(element, zoom, zoom * pixelRatio, tierCap, crispScale, generations, slotOf);
       }
     }
 
@@ -410,6 +452,7 @@ export class TextLayer {
     this.builtZoom = zoom;
     this.builtPixelRatio = pixelRatio;
     this.builtTierCap = tierCap;
+    this.builtCrispScale = crispScale;
     this.builtGenerations = this.generations();
     this.dirty = false;
     this.changed.markAll();
@@ -444,7 +487,15 @@ export class TextLayer {
       const element = scene.get(id);
       if (!element) continue;
       const start = this.quadCount;
-      this.place(element, zoom, zoom * pixelRatio, this.builtTierCap, generations, slotOf);
+      this.place(
+        element,
+        zoom,
+        zoom * pixelRatio,
+        this.builtTierCap,
+        this.builtCrispScale,
+        generations,
+        slotOf,
+      );
       if (this.quadCount > start) this.changed.mark(start, this.quadCount);
     }
     if (this.generations() !== generations) {
@@ -461,6 +512,8 @@ export class TextLayer {
     zoom: number,
     pixelsPerUnit: number,
     tierCap: number,
+    /** Device px per world unit to draw bitmap glyphs for, null for distance fields. */
+    crispScale: number | null,
     generations: string,
     slotOf: (id: string) => number | undefined,
   ): void {
@@ -476,7 +529,7 @@ export class TextLayer {
       ? Math.max(largestSize(block), AUTO_GROW_SHARE * Math.min(element.width, element.height))
       : largestSize(block);
     if (this.full || (known ? cached.maxFontSize : upperSize) * zoom < minGreekPx) {
-      this.considered.set(element.id, rangeOf(element, start, start));
+      this.considered.set(element.id, rangeOf(element, start, start, false));
       return;
     }
     let layout: TextLayout | undefined;
@@ -490,14 +543,17 @@ export class TextLayer {
     const screenSize = maxFontSize * zoom;
     if (screenSize < minGreekPx) {
       // Remember its size: next builds skip this text without looking up its layout.
-      if (!known) this.rememberBlock(element, maxFontSize, false, 0, null, tierCap, generations);
-      this.considered.set(element.id, rangeOf(element, start, start));
+      if (!known)
+        this.rememberBlock(element, maxFontSize, false, 0, null, tierCap, null, generations);
+      this.considered.set(element.id, rangeOf(element, start, start, false));
       return;
     }
     const slot = slotOf(element.id);
     if (slot === undefined) return;
     const depth = textDepth(slot);
     const greek = screenSize < minGlyphPx;
+    // Bitmap glyphs are drawn upright on the pixel grid: rotated text keeps distance fields.
+    const elementCrisp = !greek && element.rotation === 0 ? crispScale : null;
 
     if (
       known &&
@@ -507,8 +563,9 @@ export class TextLayer {
       (greek ||
         (cached.generations === generations &&
           cached.tierCap === tierCap &&
-          pixelsPerUnit > cached.minPx &&
-          pixelsPerUnit <= cached.maxPx))
+          cached.crispScale === elementCrisp &&
+          (elementCrisp !== null ||
+            (pixelsPerUnit > cached.minPx && pixelsPerUnit <= cached.maxPx))))
     ) {
       if (!this.copyBlock(cached, cached.quads, element, depth)) this.full = true;
     } else {
@@ -519,16 +576,25 @@ export class TextLayer {
       this.maxPx = Infinity;
       const emitted = greek
         ? this.emitGreek(element, layout, depth)
-        : this.emitGlyphs(element, layout, depth, pixelsPerUnit, tierCap);
+        : this.emitGlyphs(element, layout, depth, pixelsPerUnit, tierCap, elementCrisp);
       if (!emitted) this.full = true;
       else if (this.usedFallback) this.defer(element.id); // drawn with borrowed glyphs for now
       else {
         const quads = this.floats.slice(start * FLOATS, this.quadCount * FLOATS);
-        this.rememberBlock(element, layout.maxFontSize, greek, depth, quads, tierCap, generations);
+        this.rememberBlock(
+          element,
+          layout.maxFontSize,
+          greek,
+          depth,
+          quads,
+          tierCap,
+          elementCrisp,
+          generations,
+        );
       }
     }
     if (this.quadCount >= maxQuads) this.full = true;
-    this.considered.set(element.id, rangeOf(element, start, this.quadCount));
+    this.considered.set(element.id, rangeOf(element, start, this.quadCount, elementCrisp !== null));
   }
 
   private defer(id: string): void {
@@ -581,6 +647,7 @@ export class TextLayer {
     depth: number,
     quads: Float32Array | null,
     tierCap: number,
+    crispScale: number | null,
     generations: string,
   ): void {
     this.forgetBlock(element.id);
@@ -596,6 +663,7 @@ export class TextLayer {
       minPx: this.minPx,
       maxPx: this.maxPx,
       tierCap,
+      crispScale,
       generations,
       theme: this.theme,
       centerX: element.x + element.width / 2,
@@ -654,6 +722,8 @@ export class TextLayer {
     /** Device pixels per world unit. */
     pixelsPerUnit: number,
     tierCap: number,
+    /** Device px per world unit to draw bitmap glyphs for, null for distance fields. */
+    crispScale: number | null,
   ): boolean {
     const area = textArea(element);
     const centerX = element.x + element.width / 2;
@@ -664,6 +734,10 @@ export class TextLayer {
     for (const laidOut of layout.glyphs) {
       if (this.quadCount >= this.options.maxQuads) return false;
       const color = isColorGlyph(laidOut.cluster);
+      if (crispScale !== null && !color) {
+        const position = { centerX, centerY, offsetX, offsetY, depth };
+        if (this.emitBitmapGlyph(element, laidOut, position, crispScale)) continue;
+      }
       const atlas = color ? this.colorAtlas : this.sdfAtlas;
       // Each glyph picks its own raster tier: sizes can differ within one text.
       const tiers = color ? COLOR_TIERS : SDF_TIERS;
@@ -714,6 +788,63 @@ export class TextLayer {
         this.theme.of(element.type, decoration.color),
       );
     }
+    return true;
+  }
+
+  /**
+   * Emits a glyph rasterized at exactly its size on screen (`MODE_BITMAP`): whole device
+   * pixels from its element's anchor, a quarter-pixel step across (baked into the bitmap),
+   * the baseline on a whole pixel, as the browser lays out text. False when it can't be
+   * rasterized this frame: the caller draws it from the distance field meanwhile.
+   */
+  private emitBitmapGlyph(
+    element: ShapeElement,
+    laidOut: LaidOutGlyph,
+    position: { centerX: number; centerY: number; offsetX: number; offsetY: number; depth: number },
+    scale: number,
+  ): boolean {
+    // Pen position relative to the element's center, in device pixels.
+    const penX = (position.offsetX + laidOut.x) * scale;
+    const penY = (position.offsetY + laidOut.y) * scale;
+    let pixelX = Math.floor(penX);
+    let subpixel = Math.round((penX - pixelX) * SUBPIXEL_STEPS) / SUBPIXEL_STEPS;
+    if (subpixel === 1) {
+      pixelX += 1;
+      subpixel = 0;
+    }
+    const baseline = Math.round(penY);
+    const size = Math.round(laidOut.size * scale * 4) / 4;
+    const key = `bitmap|${laidOut.variant}|${size}|${subpixel}|${laidOut.cluster}`;
+    let glyph = this.sdfAtlas.peek(key);
+    if (!glyph) {
+      if (!this.canWork()) {
+        this.incomplete = true;
+        this.usedFallback = true;
+        return false;
+      }
+      const startTime = performance.now();
+      const raster = this.rasterizers.bitmap(laidOut.cluster, laidOut.variant, size, subpixel);
+      glyph = this.sdfAtlas.insert(key, raster, size);
+      this.spend(startTime, rasterUnits(size));
+    }
+    if (glyph.width === 0) return true; // nothing to draw (a space)
+    const texel = 1 / this.sdfAtlas.size;
+    this.write(
+      position.centerX,
+      position.centerY,
+      (pixelX + glyph.left) / scale,
+      (baseline - glyph.top) / scale,
+      glyph.width / scale,
+      glyph.height / scale,
+      0,
+      position.depth,
+      glyph.x * texel,
+      glyph.y * texel,
+      (glyph.x + glyph.width) * texel,
+      (glyph.y + glyph.height) * texel,
+      MODE_BITMAP,
+      this.theme.of(element.type, laidOut.color),
+    );
     return true;
   }
 
@@ -973,10 +1104,11 @@ function sameLayoutInputs(inputs: LayoutInputs, element: ShapeElement): boolean 
   );
 }
 
-function rangeOf(element: ShapeElement, start: number, end: number): Range {
+function rangeOf(element: ShapeElement, start: number, end: number, crisp: boolean): Range {
   return {
     start,
     end,
+    crisp,
     text: element.text!,
     width: element.width,
     height: element.height,

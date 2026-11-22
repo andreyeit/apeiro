@@ -157,7 +157,14 @@ class WebGlBackend implements RenderBackend {
     if (frame.drawText) {
       gl.depthFunc(gl.LESS);
       gl.depthMask(false);
-      this.textPass.draw(frame.x, frame.y, frame.zoom, frame.viewportWidth, frame.viewportHeight);
+      this.textPass.draw(
+        frame.x,
+        frame.y,
+        frame.zoom,
+        frame.viewportWidth,
+        frame.viewportHeight,
+        frame.pixelRatio,
+      );
       gl.depthMask(true);
     }
     gl.disable(gl.DEPTH_TEST);

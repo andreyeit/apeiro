@@ -141,6 +141,7 @@ export function hover(context: InputContext, point: Vec2): void {
     select &&
     !arrowSelected &&
     !context.overlay.selection.has(hit.id) && // selected: handles instead of connection dots
+    !context.isLocked(hit.id) &&
     context.showsDots(hit) &&
     !context.readOnly()
       ? hit.id
@@ -149,6 +150,7 @@ export function hover(context: InputContext, point: Vec2): void {
     !anchorsFor &&
     !arrowSelected &&
     overlay.anchorsFor &&
+    !context.isLocked(overlay.anchorsFor) &&
     !overlay.selection.has(overlay.anchorsFor)
   ) {
     // Keep the dots while the pointer travels from the shape out to a dot.
@@ -165,12 +167,14 @@ export function hover(context: InputContext, point: Vec2): void {
     (hitTestAudio(hit, world, context.pixelsToWorld(AUDIO_HIT_PX)) ||
       (select && context.hooks.linkAt?.(hit.id, world)));
   context.setCursor(
-    handle
-      ? 'grab'
-      : onControl
-        ? 'pointer'
-        : hit && select && !context.modifiers.deep && !context.readOnly() // Ctrl/⌘: the plain arrow
-          ? 'move'
-          : idleCursor(context),
+    hit && context.isLocked(hit.id)
+      ? 'not-allowed'
+      : handle
+        ? 'grab'
+        : onControl
+          ? 'pointer'
+          : hit && select && !context.modifiers.deep && !context.readOnly() // Ctrl/⌘: the plain arrow
+            ? 'move'
+            : idleCursor(context),
   );
 }

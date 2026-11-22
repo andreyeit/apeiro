@@ -45,7 +45,7 @@ import {
   type UndoHistory,
 } from '@apeiro/core';
 import type { BoardRenderer } from '@apeiro/renderer';
-import { keyLetter } from '../input/keyboard';
+import { isTypingTarget, keyLetter } from '../input/keyboard';
 import { offsetOf, parse, positionOf, render } from './dom';
 
 const JUSTIFY = { top: 'flex-start', middle: 'center', bottom: 'flex-end' } as const;
@@ -88,7 +88,7 @@ export function offsetMapper(before: string, after: string): (offset: number) =>
   };
 }
 
-/** A formatting change for `BoardEditor.formatText`, applied to the text being edited. */
+/** A formatting change for `text.apply` of `BoardEditor`, applied to the text being edited. */
 export type TextFormatCommand =
   /** Bold, italic, underline or strikethrough on/off (with a caret: for what is typed next). */
   | { type: 'toggle'; style: BooleanStyle }
@@ -141,9 +141,9 @@ export interface TextFormatState {
 
 /**
  * Marks the app's formatting controls (`<div data-ap-text-controls>`): pressing or focusing
- * something inside keeps the text editor open. Buttons should also prevent `mousedown`'s
- * default so the text keeps its selection; fields may take the focus (the selection is
- * remembered and formatting applies to it).
+ * something inside keeps the text editor open. Pressing a button there doesn't take the
+ * focus, so the text keeps its caret and selection; fields (inputs, selects) do take it,
+ * and the selection is remembered for formatting to apply to it.
  */
 export const TEXT_CONTROLS_ATTRIBUTE = 'data-ap-text-controls';
 
@@ -224,7 +224,9 @@ export class TextEditor {
      * Board undo history: one editing session (open → close) becomes one step there.
      * Inside the session Ctrl+Z is handled by the editor's own finer-grained undo.
      */
-    private history?: Pick<UndoHistory, 'beginGroup' | 'endGroup'>,
+    private history?: Pick<UndoHistory, 'beginGroup' | 'endGroup' | 'collaborative'> &
+      Partial<Pick<UndoHistory, 'undo' | 'redo'>>,
+    private canEdit: (id: string) => boolean = () => true,
   ) {
     this.root.className = 'ap-text-editor';
     this.input.className = 'ap-text-editor-input';
@@ -264,6 +266,7 @@ export class TextEditor {
       const selection = getSelection();
       if (
         this.id &&
+        document.activeElement === this.input &&
         selection &&
         selection.rangeCount > 0 &&
         this.input.contains(selection.anchorNode)
@@ -279,12 +282,24 @@ export class TextEditor {
       if (this.id && !this.root.contains(target) && !isTextControl(target)) this.stop();
     };
     window.addEventListener('pointerdown', onOutsidePointer, true);
-    this.disposers.push(() => window.removeEventListener('pointerdown', onOutsidePointer, true));
+    // Buttons of the app's controls don't take the focus away from the text.
+    const onControlPress = (event: MouseEvent) => {
+      if (this.id && isTextControl(event.target) && !isTypingTarget(event.target))
+        event.preventDefault();
+    };
+    window.addEventListener('mousedown', onControlPress, true);
+    this.disposers.push(
+      () => window.removeEventListener('pointerdown', onOutsidePointer, true),
+      () => window.removeEventListener('mousedown', onControlPress, true),
+    );
     this.root.addEventListener('pointerdown', (event) => event.stopPropagation());
     this.disposers.push(
       () => document.removeEventListener('selectionchange', onSelectionChange),
       renderer.onAfterRender(() => this.sync()),
-      scene.subscribe((changes) => this.onSceneChanges(changes.updated)),
+      scene.subscribe((changes) => {
+        if (this.id && changes.removed.includes(this.id)) this.stop();
+        else this.onSceneChanges(changes.updated);
+      }),
     );
   }
 
@@ -326,20 +341,21 @@ export class TextEditor {
    */
   create(element: ShapeElement): void {
     this.stop();
-    this.history?.beginGroup();
+    if (!this.history?.collaborative) this.history?.beginGroup();
     try {
       this.scene.add(element);
       this.start(element.id);
     } finally {
-      this.history?.endGroup(); // the step stays open until `stop` (start nests a group)
+      if (!this.history?.collaborative) this.history?.endGroup(); // the step stays open until `stop` (start nests a group)
     }
   }
 
   start(id: string): void {
+    if (!this.canEdit(id)) return;
     const element = this.scene.get(id);
     if (!element || !isShape(element)) return;
     this.stop();
-    this.history?.beginGroup();
+    if (!this.history?.collaborative) this.history?.beginGroup();
     this.id = id;
     const block = element.text ?? defaultTextBlock(element.type);
     // The editor only writes '\n' line breaks; '\r\n' from elsewhere becomes one.
@@ -370,6 +386,7 @@ export class TextEditor {
     const id = this.id;
     this.renderer.setTextHidden(id, false);
     this.id = null;
+    this.composing = false;
     // A hidden editor must not keep the focus: keys would go to it, not to the board.
     if (this.input.contains(document.activeElement)) this.input.blur();
     this.block = null;
@@ -379,7 +396,7 @@ export class TextEditor {
     const removed =
       !!element && element.type === 'text' && (!element.text || plainText(element.text) === '');
     if (removed) this.scene.remove(id);
-    this.history?.endGroup();
+    if (!this.history?.collaborative) this.history?.endGroup();
     this.onStop(removed || !element ? null : id);
     this.syncFormat();
   }
@@ -560,10 +577,18 @@ export class TextEditor {
   }
 
   undo(): void {
+    if (this.history?.collaborative) {
+      this.history.undo?.();
+      return;
+    }
     this.travel(this.undoStack, this.redoStack);
   }
 
   redo(): void {
+    if (this.history?.collaborative) {
+      this.history.redo?.();
+      return;
+    }
     this.travel(this.redoStack, this.undoStack);
   }
 
@@ -578,7 +603,7 @@ export class TextEditor {
 
   /** Remembers the state before a change. Consecutive typing within a second is one step. */
   private record(kind: 'typing' | 'other'): void {
-    if (!this.block) return;
+    if (!this.block || this.history?.collaborative) return;
     const now = performance.now();
     const merge = kind === 'typing' && now - this.lastTypingAt < 1000;
     this.lastTypingAt = kind === 'typing' ? now : 0;
@@ -602,6 +627,38 @@ export class TextEditor {
     this.pending = null;
     let block = withParagraphs({ ...this.block, runs }, paragraphs);
     let at = caret;
+    // IME leaves the DOM untouched while composing. Rebase its local insertion onto
+    // any shared text received during that interval before committing to the scene.
+    const current = this.id ? this.scene.get(this.id) : undefined;
+    if (
+      this.history?.collaborative &&
+      current &&
+      isShape(current) &&
+      current.text &&
+      current.text !== this.block
+    ) {
+      const before = plainText(this.block);
+      const after = plainText(block);
+      let prefix = 0;
+      while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix])
+        prefix++;
+      if (prefix > 0 && /[\uDC00-\uDFFF]/.test(after[prefix] ?? '')) prefix--;
+      let suffix = 0;
+      while (
+        suffix < before.length - prefix &&
+        suffix < after.length - prefix &&
+        before[before.length - suffix - 1] === after[after.length - suffix - 1]
+      )
+        suffix++;
+      if (suffix > 0 && /[\uDC00-\uDFFF]/.test(after[after.length - suffix]!)) suffix--;
+      const mapOffset = offsetMapper(before, plainText(current.text));
+      const start = mapOffset(prefix);
+      const inserted = after.slice(prefix, after.length - suffix);
+      block = replaceBlockText(current.text, start, mapOffset(before.length - suffix), inserted);
+      at = start + Math.max(0, Math.min(inserted.length, caret - prefix));
+      this.write(block, at, at, 'typing');
+      return;
+    }
     // "- " or "1. " typed at the start of a plain line: make it a list item.
     const text = plainText(block);
     const paragraph = paragraphAt(runs, caret);
@@ -642,7 +699,7 @@ export class TextEditor {
   }
 
   /**
-   * Applies a formatting change to the text being edited and returns the focus to it.
+   * Applies formatting, keeping a focused app field active; otherwise returns to the text.
    * False when nothing is edited, or for a link whose address is not allowed.
    */
   apply(command: TextFormatCommand): boolean {
@@ -942,22 +999,36 @@ export class TextEditor {
 
   /** Back to typing after an app control took the focus, with the selection it had. */
   private refocus(): void {
-    if (!this.id || document.activeElement === this.input) return;
+    if (!this.id || document.activeElement === this.input || this.controlHasFocus()) return;
     const [from, to] = this.lastSelectionOrCurrent();
     this.input.focus();
     this.select(from, to);
   }
 
+  private controlHasFocus(): boolean {
+    return isTextControl(document.activeElement) && isTypingTarget(document.activeElement);
+  }
+
   private lastSelectionOrCurrent(): [number, number] {
     const selection = getSelection();
-    if (selection && selection.rangeCount > 0 && this.input.contains(selection.anchorNode))
+    if (
+      document.activeElement === this.input &&
+      selection &&
+      selection.rangeCount > 0 &&
+      this.input.contains(selection.anchorNode)
+    )
       return this.selection();
     return this.lastSelection ?? this.selection();
   }
 
   private selection(): [number, number] {
     const selection = getSelection();
-    if (!selection || selection.rangeCount === 0 || !this.input.contains(selection.anchorNode)) {
+    if (
+      document.activeElement !== this.input ||
+      !selection ||
+      selection.rangeCount === 0 ||
+      !this.input.contains(selection.anchorNode)
+    ) {
       if (this.lastSelection) return this.lastSelection;
       const end = this.block ? runsLength(this.block.runs) : 0;
       return [end, end];
@@ -969,6 +1040,10 @@ export class TextEditor {
   }
 
   private select(from: number, to: number): void {
+    this.lastSelection = [from, to];
+    // Selecting contenteditable text can focus it in the browser. A formatting field
+    // must keep receiving keystrokes and native number-spinner presses instead.
+    if (this.controlHasFocus()) return;
     const selection = getSelection();
     if (!selection) return;
     const start = positionOf(this.input, from);

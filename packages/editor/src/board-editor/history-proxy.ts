@@ -1,12 +1,15 @@
 import type { UndoHistory } from '@apeiro/core';
 
 /**
- * Forwards to whatever history the editor currently has (see `BoardEditor.setHistory`).
+ * Forwards to whatever history the editor currently has (see `history.replace` of `BoardEditor`).
  * The controls and the text editor keep this one object, so a new history takes effect
  * without remounting.
  */
 export class HistoryProxy implements UndoHistory {
   constructor(private readonly current: () => UndoHistory) {}
+  get collaborative(): boolean {
+    return this.current().collaborative ?? false;
+  }
   get canUndo(): boolean {
     return this.current().canUndo;
   }

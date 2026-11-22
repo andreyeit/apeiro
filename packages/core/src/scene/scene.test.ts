@@ -327,3 +327,71 @@ describe('clipboard', () => {
     expect(clipboardFromHtml('<p>nothing</p>')).toBeNull();
   });
 });
+
+describe('Scene shortcuts', () => {
+  test('a patch that changes nothing is no change', () => {
+    const scene = new Scene();
+    scene.add(makeRectangle('a', { x: 5 }));
+    const history = new History(scene);
+    const batches = record(scene);
+    expect(scene.update('a', { x: 5, groupId: undefined })).toBe(true);
+    expect(batches).toHaveLength(0);
+    expect(history.canUndo).toBe(false);
+  });
+
+  test('connectors between shapes moved together are shifted, not routed again', () => {
+    const scene = new Scene();
+    scene.add(makeRectangle('a'));
+    scene.add(makeRectangle('b', { x: 300, y: 80 }));
+    scene.add(line('straight', 'a', 'b'));
+    scene.add(line('curved', 'a', 'b', { route: 'curve', curve: { along: 0.1, across: 0.3 } }));
+    const before = {
+      straight: scene.connectorGeometry('straight')!,
+      curved: scene.connectorGeometry('curved')!,
+    };
+    const batches = record(scene);
+    scene.transact(() => {
+      scene.update('a', { x: 40, y: 25 });
+      scene.update('b', { x: 340, y: 105 });
+    });
+    expect(batches[0]!.updated.map((element) => element.id).sort()).toEqual([
+      'a',
+      'b',
+      'curved',
+      'straight',
+    ]);
+    for (const id of ['straight', 'curved'] as const) {
+      const moved = scene.connectorGeometry(id)!;
+      // The same as resolving it from scratch.
+      const fresh = new Scene();
+      for (const element of scene.all()) fresh.add(element);
+      const resolved = fresh.connectorGeometry(id)!;
+      expect(moved.points.length).toBe(resolved.points.length);
+      moved.points.forEach((point, index) => {
+        expect(point.x).toBeCloseTo(resolved.points[index]!.x, 6);
+        expect(point.y).toBeCloseTo(resolved.points[index]!.y, 6);
+        expect(point.x).toBeCloseTo(before[id].points[index]!.x + 40, 6);
+      });
+      expect(scene.getBounds(id)!.minX).toBeCloseTo(before[id].bounds.minX + 40, 6);
+    }
+    // Moved apart: routed again.
+    scene.update('b', { x: 600 });
+    expect(scene.connectorGeometry('straight')!.points[1]!.x).toBeCloseTo(599, 0);
+  });
+
+  test('moves within one batch read in between are not counted twice', () => {
+    const scene = new Scene();
+    scene.add(makeRectangle('a'));
+    scene.add(makeRectangle('b', { x: 300 }));
+    scene.add(line('straight', 'a', 'b'));
+    const start = scene.connectorGeometry('straight')!.points[0]!.x;
+    scene.transact(() => {
+      scene.update('a', { x: 10 });
+      scene.update('b', { x: 310 });
+      expect(scene.connectorGeometry('straight')!.points[0]!.x).toBeCloseTo(start + 10);
+      scene.update('a', { x: 20 });
+      scene.update('b', { x: 320 });
+    });
+    expect(scene.connectorGeometry('straight')!.points[0]!.x).toBeCloseTo(start + 20);
+  });
+});

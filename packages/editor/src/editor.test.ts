@@ -1,5 +1,6 @@
-import { Scene, textBlock, type BoardElement, type ShapeElement } from '@apeiro/core';
-import { describe, expect, test } from 'vitest';
+import { hexColor, Scene, textBlock, type BoardElement, type ShapeElement } from '@apeiro/core';
+import { BoardEditor } from './board-editor/board-editor';
+import { describe, expect, test, vi } from 'vitest';
 import { exportFrame, sceneOf } from './export/export-image';
 import { dragStep, resizeStep } from './input/transform-gestures';
 import { DraftScene, normalizeDraft } from './preview/draft-preview';
@@ -169,8 +170,100 @@ describe('ToolState', () => {
     expect(tools.tool).toBe('select');
     tools.setDefaults('connector', { route: 'curve' });
     expect(tools.style.route).toBe('curve');
-    expect(tools.getDefaults('connector')).toEqual({ route: 'curve' });
+    expect(tools.overrides('connector')).toEqual({ route: 'curve' });
     expect(changes).toBe(6);
+  });
+
+  test('defaults are the full style, stable until an override changes', () => {
+    const tools = new ToolState();
+    const pen = tools.getDefaults('pen');
+    expect(pen.stroke).toBe(0x18181bff);
+    expect(tools.getDefaults('pen')).toBe(pen);
+    tools.setDefaults('pen', { stroke: 0xff0000ff });
+    expect(tools.getDefaults('pen')).toEqual({ ...pen, stroke: 0xff0000ff });
+    expect(tools.getDefaults('connector').endCap).toBe('arrow');
+    expect(tools.getDefaults('polygon').sides).toBe(5);
+    expect(tools.getDefaults('sticky').strokeWidth).toBe(0);
+    expect(tools.getDefaults('text')).not.toHaveProperty('runs');
+  });
+});
+
+describe('BoardEditor', () => {
+  test('creates a styled, labelled shape in one undo step, selected or not', () => {
+    const editor = new BoardEditor();
+    const box = { minX: 0, minY: 0, maxX: 300, maxY: 50 };
+    const id = editor.elements.create('rect', {
+      box,
+      style: { fill: hexColor('#ff0000') },
+      text: 'Idea',
+    })!;
+    const element = editor.scene.get(id) as ShapeElement;
+    expect(element).toMatchObject({ x: 0, y: 0, width: 300, height: 50, fill: 0xff0000ff });
+    expect(element.text?.runs).toEqual([{ text: 'Idea' }]);
+    expect(editor.selection.ids).toEqual([id]);
+    editor.history.undo();
+    expect(editor.scene.has(id)).toBe(false);
+    const quiet = editor.elements.create('sticky', { at: { x: 0, y: 0 }, select: false })!;
+    expect(editor.selection.ids).toEqual([]);
+    expect(editor.scene.get(quiet)).toMatchObject({ x: -90, y: -90, fill: 0xfff9b1ff });
+    editor.destroy();
+  });
+
+  test('groups are stable, bound and say what a read-only board allows', async () => {
+    const editor = new BoardEditor({ readOnly: true });
+    const { undo } = editor.history;
+    undo();
+    expect(editor.history).toBe(editor.history);
+    expect(editor.elements.create('rect')).toBeNull();
+    editor.tools.activate('rect');
+    expect(editor.tools.current).toBe('select');
+    editor.setReadOnly(false);
+    editor.elements.create('rect');
+    expect(editor.history.canUndo).toBe(true);
+    editor.setReadOnly(true);
+    expect(editor.history.canUndo).toBe(false);
+    await expect(editor.clipboard.paste()).resolves.toEqual([]);
+    editor.destroy();
+  });
+
+  test('camera.set jumps and stops an animated zoom', () => {
+    vi.stubGlobal('requestAnimationFrame', () => 1);
+    vi.stubGlobal('cancelAnimationFrame', () => undefined);
+    const editor = new BoardEditor();
+    editor.camera.zoomTo(2);
+    editor.camera.set({ x: 10, y: 20, zoom: 0.5 });
+    expect([editor.camera.x, editor.camera.y, editor.camera.zoom]).toEqual([10, 20, 0.5]);
+    editor.destroy();
+    vi.unstubAllGlobals();
+  });
+
+  test('configured zoom steps are reciprocal and respect min/max bounds', () => {
+    const editor = new BoardEditor({
+      smoothCamera: false,
+      camera: { zoomStep: 1.1, minZoom: 0.5, maxZoom: 2 },
+    });
+    editor.camera.zoomTo('in');
+    expect(editor.camera.zoom).toBeCloseTo(1.1);
+    editor.camera.zoomTo('out');
+    expect(editor.camera.zoom).toBeCloseTo(1);
+    editor.camera.set({ zoom: 1.95 });
+    editor.camera.zoomTo('in');
+    expect(editor.camera.zoom).toBe(2);
+    editor.camera.set({ zoom: 0.51 });
+    editor.camera.zoomTo('out');
+    expect(editor.camera.zoom).toBe(0.5);
+    editor.destroy();
+    const defaults = new BoardEditor({ smoothCamera: false });
+    defaults.camera.zoomTo('in');
+    expect(defaults.camera.zoom).toBe(1.25);
+    defaults.camera.zoomTo('out');
+    expect(defaults.camera.zoom).toBe(1);
+    defaults.destroy();
+    const neutral = new BoardEditor({ smoothCamera: false, camera: { zoomStep: 1 } });
+    neutral.camera.zoomTo('in');
+    neutral.camera.zoomTo('out');
+    expect(neutral.camera.zoom).toBe(1);
+    neutral.destroy();
   });
 });
 

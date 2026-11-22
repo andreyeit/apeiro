@@ -411,3 +411,18 @@ describe('element helpers', () => {
     expect(unpackColor(0xff0000ff)).toEqual([1, 0, 0, 1]);
   });
 });
+
+describe('polygon geometry cache', () => {
+  test('gives the same outline for the same polygon, and different ones otherwise', () => {
+    const first = polygonVertices(100, 80, 5);
+    expect(polygonVertices(100, 80, 5)).toBe(first);
+    expect(polygonVertices(100, 80, 6)).not.toBe(first);
+    expect(polygonVertices(100, 80, 6)).toHaveLength(6);
+    const polygon = makeRectangle('p', { type: 'polygon', sides: 5, radius: 10 });
+    const rounded = shapeSdf(polygon, { x: 0, y: -50 });
+    // A rounded corner pulls the outline in at the vertex; a different radius, a different outline.
+    expect(rounded).toBeGreaterThan(0);
+    expect(shapeSdf({ ...polygon, radius: 0 }, { x: 0, y: -50 })).toBeCloseTo(0);
+    expect(shapeSdf(polygon, { x: 0, y: -50 })).toBe(rounded);
+  });
+});

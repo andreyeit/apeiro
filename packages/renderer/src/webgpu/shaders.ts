@@ -356,7 +356,7 @@ struct GlyphIn {
   @location(0) anchorOffset: vec4f, // anchor.xy (element center), offset.xy
   @location(1) sizeRotDepth: vec4f, // w, h, rotation, depth
   @location(2) uv: vec4f,           // u0, v0, u1, v1
-  @location(3) mode: f32,           // 0 sdf, 1 color, 2 solid
+  @location(3) mode: f32,           // 0 sdf, 1 color, 2 solid, 3 bitmap
   @location(4) color: vec4f,
 };
 
@@ -371,7 +371,7 @@ struct GlyphOut {
 fn vs(in: GlyphIn) -> GlyphOut {
   var size = in.sizeRotDepth.xy;
   var offset = in.anchorOffset.zw;
-  if (in.mode > 1.5) {
+  if (in.mode > 1.5 && in.mode < 2.5) {
     // Keep thin solid quads (underlines, far-away bars) at least ~1px tall so they don't shimmer.
     let minH = 1.0 / frame.camera.z;
     if (size.y < minH) {
@@ -380,7 +380,14 @@ fn vs(in: GlyphIn) -> GlyphOut {
     }
   }
   let c = corner(in.vi);
-  let world = in.anchorOffset.xy + rotate(offset + c * size, in.sizeRotDepth.z);
+  var world = in.anchorOffset.xy + rotate(offset + c * size, in.sizeRotDepth.z);
+  if (in.mode > 2.5) {
+    // Bitmap glyphs land on whole device pixels: their element's anchor is snapped to the
+    // pixel grid, so all its glyphs move together and keep their spacing.
+    let scale = frame.camera.z * frame.camera.w;
+    let anchorPixels = (in.anchorOffset.xy - frame.camera.xy) * scale;
+    world += (floor(anchorPixels + 0.5) - anchorPixels) / scale;
+  }
   var out: GlyphOut;
   out.pos = vec4f(toClip(world), in.sizeRotDepth.w, 1.0);
   out.uv = mix(in.uv.xy, in.uv.zw, c);
@@ -409,6 +416,15 @@ fn fs(in: GlyphOut) -> @location(0) vec4f {
   // Keeps edges ~1px wide at any zoom and tier.
   let fw = length(vec2f(dpdx(d), dpdy(d)));
   let w1 = max(fw * 0.5, 1e-4);
+  if (in.mode > 2.5) {
+    // Coverage rasterized at this size, texel for pixel (d is that texel): as the browser
+    // draws it.
+    let coverage = d * in.color.a;
+    if (coverage <= 0.0) {
+      discard;
+    }
+    return vec4f(in.color.rgb * coverage, coverage);
+  }
   if (in.mode > 1.5) {
     return vec4f(in.color.rgb * in.color.a, in.color.a);
   }

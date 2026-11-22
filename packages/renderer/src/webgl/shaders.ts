@@ -303,19 +303,21 @@ void main() {
 `;
 
 /**
- * All visible text in one draw call: SDF glyphs, color glyphs (emoji) and solid
- * quads (underline, strike-through, greeking bars), selected per instance.
+ * All visible text in one draw call: SDF glyphs, color glyphs (emoji), solid quads
+ * (underline, strike-through, greeking bars) and exact-size bitmap glyphs, selected per
+ * instance.
  */
 export const TEXT_VERTEX = /* glsl */ `#version 300 es
 layout(location = 0) in vec2 a_corner;
 layout(location = 1) in vec4 a_anchorOffset; // anchor.xy (element center), offset.xy
 layout(location = 2) in vec4 a_sizeRotDepth; // w, h, rotation, depth
 layout(location = 3) in vec4 a_uv;           // u0, v0, u1, v1
-layout(location = 4) in float a_mode;        // 0 sdf, 1 color, 2 solid
+layout(location = 4) in float a_mode;        // 0 sdf, 1 color, 2 solid, 3 bitmap
 layout(location = 5) in vec4 a_color;
 
 uniform vec3 u_camera;
 uniform vec2 u_viewport;
+uniform float u_pixelRatio;
 
 out vec2 v_uv;
 flat out float v_mode;
@@ -324,7 +326,7 @@ flat out vec4 v_color;
 void main() {
   vec2 size = a_sizeRotDepth.xy;
   vec2 offset = a_anchorOffset.zw;
-  if (a_mode > 1.5) {
+  if (a_mode > 1.5 && a_mode < 2.5) {
     // Keep thin solid quads (underlines, far-away bars) at least ~1px tall so they don't shimmer.
     float minH = 1.0 / u_camera.z;
     if (size.y < minH) {
@@ -336,6 +338,13 @@ void main() {
   float c = cos(a_sizeRotDepth.z);
   float s = sin(a_sizeRotDepth.z);
   vec2 world = a_anchorOffset.xy + vec2(local.x * c - local.y * s, local.x * s + local.y * c);
+  if (a_mode > 2.5) {
+    // Bitmap glyphs land on whole device pixels: their element's anchor is snapped to the
+    // pixel grid, so all its glyphs move together and keep their spacing.
+    float scale = u_camera.z * u_pixelRatio;
+    vec2 anchorPixels = (a_anchorOffset.xy - u_camera.xy) * scale;
+    world += (floor(anchorPixels + 0.5) - anchorPixels) / scale;
+  }
   vec2 clip = (world - u_camera.xy) * u_camera.z / u_viewport * 2.0 - 1.0;
   gl_Position = vec4(clip.x, -clip.y, a_sizeRotDepth.w * 2.0 - 1.0, 1.0);
   v_uv = mix(a_uv.xy, a_uv.zw, a_corner);
@@ -357,6 +366,13 @@ uniform float u_edge;   // SDF value at the glyph outline (1 - cutoff)
 out vec4 outColor;
 
 void main() {
+  if (v_mode > 2.5) {
+    // Coverage rasterized at this size, texel for pixel: as the browser draws it.
+    float coverage = texture(u_sdf, v_uv).r * v_color.a;
+    if (coverage <= 0.0) discard;
+    outColor = vec4(v_color.rgb * coverage, coverage);
+    return;
+  }
   if (v_mode > 1.5) {
     outColor = vec4(v_color.rgb * v_color.a, v_color.a);
     return;
