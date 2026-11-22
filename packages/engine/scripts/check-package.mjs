@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   mkdirSync,
@@ -64,9 +65,15 @@ try {
   cpSync(join(root, 'package.json'), join(installed, 'package.json'));
   cpSync(join(root, 'scripts/consumer.tsx'), join(consumer, 'consumer.tsx'));
   writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
-  for (const dependency of ['react', '@types', '@mapbox']) {
+  for (const dependency of ['react', '@mapbox']) {
     symlinkSync(join(root, 'node_modules', dependency), join(modules, dependency), 'junction');
   }
+  mkdirSync(join(modules, '@types'));
+  symlinkSync(
+    realpathSync(join(root, 'node_modules', '@types', 'react')),
+    join(modules, '@types', 'react'),
+    'junction',
+  );
   // The framework-free entry must work in a consumer without optional Yjs installed.
   execFileSync(
     process.execPath,
