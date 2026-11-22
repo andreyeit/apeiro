@@ -1,9 +1,6 @@
 import {
   Camera,
   CameraAnimator,
-  clipboardFromHtml,
-  clipboardText,
-  clipboardToHtml,
   copyElements,
   createTextElement,
   defaultTextBlock,
@@ -12,6 +9,7 @@ import {
   isShape,
   LINE_HEIGHT,
   measureTextBox,
+  newId,
   pasteElements,
   Scene,
   validateElement,
@@ -24,11 +22,9 @@ import {
   type UndoHistory,
   type Vec2,
 } from '@apeiro/core';
-import { createRenderer, type BoardRenderer, type GridStyle } from '@apeiro/renderer';
+import { createRenderer, type BoardRenderer } from '@apeiro/renderer';
 import { exportFrame, renderImage, sceneOf, type ExportImageOptions } from '../export/export-image';
-import { newId } from '../ids';
 import { attachControls, cropControls, type CropControls } from '../input/controls';
-import { isTypingTarget } from '../input/keyboard';
 import { AudioController } from '../media/audio-controller';
 import {
   importFiles,
@@ -36,24 +32,23 @@ import {
   revokeUnusedObjectUrls,
   type Uploader,
 } from '../media/import-files';
-import {
-  HANDLE_FILL,
-  HANDLE_FILL_DARK,
-  Overlay,
-  SELECTION_COLOR,
-  SELECTION_COLOR_DARK,
-  type OverlayLayer,
-} from '../overlay/overlay';
+import { Overlay, type OverlayLayer } from '../overlay/overlay';
 import {
   DraftScene,
   normalizeDraft,
   type BoardDraft,
   type NormalizedDraft,
 } from '../preview/draft-preview';
+import { PreviewCanvas } from '../preview/preview-canvas';
 import { groupSelection, ungroupSelection } from '../selection/grouping';
 import { linkAtPoint } from '../text-editor/links';
-import { openLink, TextEditor } from '../text-editor/text-editor';
-import { createShape, SHAPE_PRESETS } from '../tools/shapes';
+import {
+  openLink,
+  TextEditor,
+  type TextFormatCommand,
+  type TextFormatState,
+} from '../text-editor/text-editor';
+import { CORNER_RADIUS, createShape, ELEMENT_SIZE, SHAPE_PRESETS } from '../tools/shapes';
 import {
   ToolState,
   VIEW_TOOLS,
@@ -63,26 +58,29 @@ import {
   type Tool,
   type ToolActivation,
 } from '../tools/tool-state';
-import { EN_LABELS, type BoardLabels } from '../ui/labels';
 import {
+  applyRendererTheme,
   boardThemeColors,
-  DARK_BOARD_COLORS,
+  gridBackdrop,
   THEME_KEEP_TYPES,
+  type BoardGrid,
+  type BoardThemeColors,
   type BoardThemeName,
-} from '../ui/theme';
+} from '../theme/board-theme';
 import { activeBoard } from './active-board';
+import { BoardListeners, type BoardListenerHost } from './board-listeners';
 import { createBoardDom, watchPixelRatio } from './dom';
 import { Emitter } from './emitter';
 import { HistoryProxy } from './history-proxy';
-import { NO_LOCKS, NO_PEERS, PeerCursors, type Peer, type PresenceSource } from './presence';
 import { readSystemClipboard, writeSystemClipboard } from './system-clipboard';
 
-export type { Peer, PresenceSource } from './presence';
+/** Edit guard of a read-only board: nothing may change. */
+const refuseEdits = (): boolean => false;
 
 export type ZoomTarget = 'in' | 'out' | 'fit' | 'selection' | 'reset' | number;
 
 export interface BoardEditorOptions {
-  /** Scene to edit; by default a new empty one. Pass one to share it (e.g. bound to Yjs). */
+  /** Scene to edit; by default a new empty one. Pass one to edit an existing scene. */
   scene?: Scene;
   /** Undo history; by default a local `History` of the scene. Can be replaced later with `setHistory`. */
   history?: UndoHistory;
@@ -92,15 +90,11 @@ export interface BoardEditorOptions {
   /** `auto` (default): WebGPU when available, otherwise WebGL2. */
   backend?: 'auto' | 'webgpu' | 'webgl';
   /** Grid of the board: dots, lines (default) or none. */
-  grid?: GridStyle | 'none';
+  grid?: BoardGrid;
   /** Smart guides while moving and resizing (default true). */
   snapping?: boolean;
   /** Animated zoom and pan (default true). */
   smoothCamera?: boolean;
-  /** Formatting toolbar above the text being edited (default true). */
-  textToolbar?: boolean;
-  /** Texts of the built-in UI (default English; `RU_LABELS` for Russian). */
-  labels?: Partial<BoardLabels>;
   /**
    * Where dropped or pasted images and audio are stored; returns their URL. By default
    * object URLs, which only this tab can open: on a shared board pass an upload to your
@@ -120,7 +114,7 @@ export interface BoardEditorOptions {
   /**
    * A viewer's board: it can be panned, zoomed, selected and copied, links open and audio
    * plays, but nothing changes it — no creating tools, handles, moving, typing, deleting,
-   * pasting or undo. Remote changes (collaboration) and `load` still apply. Can change
+   * pasting or undo. `load` still applies. Can change
    * later with `setReadOnly` (e.g. when the user's role changes).
    */
   readOnly?: boolean;
@@ -134,9 +128,9 @@ export type BoardEditorEvent =
   | 'history'
   | 'camera'
   | 'editing'
+  | 'textFormat'
   | 'theme'
   | 'pointer'
-  | 'presence'
   | 'clipboard'
   | 'gesture'
   | 'readOnly'
@@ -146,19 +140,17 @@ export type BoardEditorEvent =
 const PASTE_STEP_PX = 24;
 /** Pasted text wider than this (world units) wraps. */
 const MAX_PASTED_TEXT_WIDTH = 480;
-/** Sticky size of the design (144×144, yellow, small corners). */
-const STICKY_SIZE = 144;
 /** A drag smaller than this (world units) still makes a default-sized element. */
 const MIN_PLACE = 8;
 /** Elements a draft would delete are outlined in this color during the preview. */
 const PREVIEW_REMOVE_COLOR = '#ef4444';
 
+/** A board on the page: what `mount` created, until `unmount`. */
 interface Mounted {
   root: HTMLDivElement;
-  stage: HTMLDivElement;
   renderer: BoardRenderer;
   /** Draws the draft being previewed, over the board (see `showPreview`). */
-  preview: { renderer: BoardRenderer | null; canvas: HTMLCanvasElement; token: number };
+  preview: PreviewCanvas;
   overlay: Overlay;
   text: TextEditor;
   audio: AudioController;
@@ -180,11 +172,14 @@ export class BoardEditor {
   readonly animator: CameraAnimator;
   /** Current tool and the style of new connectors and pen strokes. */
   readonly tools = new ToolState();
-  private historyImpl: UndoHistory;
+  private currentHistory: UndoHistory;
+  private unsubscribeHistory: () => void;
   private ownsHistory: boolean;
   private readonly options: BoardEditorOptions;
   private mounted: Mounted | null = null;
   private mountToken = 0;
+  /** Bumped by each deferred text open and by `stopEditing`, which cancels pending ones. */
+  private editToken = 0;
   private readonly events = new Emitter<BoardEditorEvent>((error) => this.reportError(error));
   /** Selection while unmounted (the overlay owns it while mounted). */
   private pendingSelection = new Set<string>();
@@ -196,14 +191,11 @@ export class BoardEditor {
   private pointerWorld: Vec2 | null = null;
   private clipboardData: BoardClipboard | null = null;
   private interacting = false;
-  private readonly labelsMerged: BoardLabels;
   /** Last paste, so pasting the same data at the same place again steps aside. */
   private lastPaste: { data: BoardClipboard; at: Vec2; count: number } | null = null;
-  private presenceSource: PresenceSource | null = null;
-  private readOnlyFlag: boolean;
-  private readonly peerCursors = new PeerCursors();
+  private readOnlyMode: boolean;
   /** The draft being previewed, its scene and its subscription to the board. */
-  private draft: { scene: DraftScene; off: () => void } | null = null;
+  private draft: { scene: DraftScene; unsubscribe: () => void } | null = null;
   private disposers: Array<() => void> = [];
   private destroyed = false;
   /**
@@ -219,28 +211,23 @@ export class BoardEditor {
     this.animator = new CameraAnimator(this.camera);
     this.animator.enabled = options.smoothCamera ?? true;
     this.themeName = options.theme ?? 'light';
-    this.labelsMerged = { ...EN_LABELS, ...options.labels };
     this.ownsHistory = !options.history;
-    this.historyImpl = options.history ?? new History(this.scene);
+    this.currentHistory = options.history ?? new History(this.scene);
     this.cameraSnapshot = { ...this.camera.getState() };
-    this.historyProxy = new HistoryProxy(() => this.historyImpl);
-    this.readOnlyFlag = options.readOnly ?? false;
-    if (this.readOnlyFlag) this.applyGuard();
-    let unsubscribeHistory = this.historyImpl.subscribe(() => this.emit('history'));
-    this.disposers.push(() => unsubscribeHistory());
-    this.resubscribeHistory = () => {
-      unsubscribeHistory();
-      unsubscribeHistory = this.historyImpl.subscribe(() => this.emit('history'));
-    };
+    this.historyProxy = new HistoryProxy(() => this.currentHistory);
+    this.readOnlyMode = options.readOnly ?? false;
+    if (this.readOnlyMode) this.applyGuard();
+    this.unsubscribeHistory = this.currentHistory.subscribe(() => this.emit('history'));
+    this.disposers.push(() => this.unsubscribeHistory());
     this.disposers.push(
       this.camera.subscribe(() => {
         this.cameraSnapshot = { ...this.camera.getState() };
         this.emit('camera');
       }),
       // Elements removed (also by someone else) leave the selection.
-      this.scene.subscribe((c) => {
-        if (c.removed.length > 0 && !this.mounted) {
-          for (const id of c.removed) this.pendingSelection.delete(id);
+      this.scene.subscribe((changes) => {
+        if (changes.removed.length > 0 && !this.mounted) {
+          for (const id of changes.removed) this.pendingSelection.delete(id);
           this.syncSelection();
         }
       }),
@@ -248,33 +235,32 @@ export class BoardEditor {
     this.tools.onChange = () => this.emit('tool');
   }
 
-  private resubscribeHistory: () => void;
-
   // --- State ---------------------------------------------------------------------
 
   get history(): UndoHistory {
-    return this.historyImpl;
+    return this.currentHistory;
   }
 
   /**
-   * Replaces the undo history (e.g. with a Yjs one that undoes only this user's edits).
+   * Replaces the undo history.
    * The previous history is disposed if the editor created it.
    */
   setHistory(history: UndoHistory): void {
-    if (history === this.historyImpl) return;
-    if (this.ownsHistory) this.historyImpl.dispose();
+    if (history === this.currentHistory) return;
+    if (this.ownsHistory) this.currentHistory.dispose();
     this.ownsHistory = false;
-    this.historyImpl = history;
-    this.resubscribeHistory();
+    this.currentHistory = history;
+    this.unsubscribeHistory();
+    this.unsubscribeHistory = history.subscribe(() => this.emit('history'));
     this.emit('history');
   }
 
   get canUndo(): boolean {
-    return this.historyImpl.canUndo;
+    return this.currentHistory.canUndo;
   }
 
   get canRedo(): boolean {
-    return this.historyImpl.canRedo;
+    return this.currentHistory.canRedo;
   }
 
   get tool(): Tool {
@@ -283,7 +269,7 @@ export class BoardEditor {
 
   /** Picks a tool; on a read-only board only `select`, `hand` and `comment` (see `VIEW_TOOLS`). */
   setTool(tool: Tool, options: ToolActivation = {}): void {
-    if (this.readOnlyFlag && !VIEW_TOOLS.has(tool)) return;
+    if (this.readOnlyMode && !VIEW_TOOLS.has(tool)) return;
     this.mounted?.text.stop();
     this.tools.setTool(tool, options);
   }
@@ -297,7 +283,7 @@ export class BoardEditor {
 
   /** The board can't be changed here (a viewer). See the `readOnly` option. */
   get readOnly(): boolean {
-    return this.readOnlyFlag;
+    return this.readOnlyMode;
   }
 
   /**
@@ -305,15 +291,13 @@ export class BoardEditor {
    * changes. Going read-only ends text editing, crop mode and any creating tool.
    */
   setReadOnly(readOnly: boolean): void {
-    if (readOnly === this.readOnlyFlag) return;
+    if (readOnly === this.readOnlyMode) return;
     if (readOnly) {
       this.mounted?.text.stop();
       this.mounted?.crop.stop();
       if (!VIEW_TOOLS.has(this.tools.tool)) this.tools.setTool('select');
     }
-    // Cancel an in-flight custom gesture before the existing collaboration guard starts
-    // refusing its inverse edits. Otherwise a half-created element could be stranded.
-    this.readOnlyFlag = readOnly;
+    this.readOnlyMode = readOnly;
     if (this.mounted) {
       this.mounted.overlay.readOnly = readOnly;
       this.mounted.overlay.anchorsFor = null;
@@ -324,17 +308,12 @@ export class BoardEditor {
   }
 
   /**
-   * The scene refuses local edits of what this user may not change: everything when
-   * read-only, elements others hold on a shared board. A last line of defence: the board
-   * already doesn't offer those edits.
+   * A read-only scene refuses local edits. A last line of defence: the board already
+   * doesn't offer them.
    */
   private applyGuard(): void {
-    const guarded = this.readOnlyFlag || !!this.presenceSource?.getLocks;
-    this.scene.setEditGuard(guarded ? this.canChange : null);
+    this.scene.setEditGuard(this.readOnlyMode ? refuseEdits : null);
   }
-
-  /** May this user change element `id` now (not read-only, nobody else holds it)? */
-  private readonly canChange = (id: string): boolean => !this.readOnlyFlag && this.canEdit(id);
 
   setPenStyle(style: Partial<PenStyle>): void {
     this.tools.setDefaults('pen', style);
@@ -352,7 +331,7 @@ export class BoardEditor {
 
   select(ids: Iterable<string>): void {
     const next = new Set<string>();
-    for (const id of ids) if (this.scene.has(id) && this.canEdit(id)) next.add(id);
+    for (const id of ids) if (this.scene.has(id)) next.add(id);
     if (this.mounted) {
       this.mounted.overlay.selection = next;
       this.mounted.overlay.request();
@@ -361,7 +340,7 @@ export class BoardEditor {
   }
 
   selectAll(): void {
-    this.select([...this.scene.all()].map((el) => el.id));
+    this.select([...this.scene.all()].map((element) => element.id));
   }
 
   clearSelection(): void {
@@ -372,8 +351,8 @@ export class BoardEditor {
   selectedElements(): BoardElement[] {
     const out: BoardElement[] = [];
     for (const id of this.selection) {
-      const el = this.scene.get(id);
-      if (el) out.push(el);
+      const element = this.scene.get(id);
+      if (element) out.push(element);
     }
     return out;
   }
@@ -404,11 +383,6 @@ export class BoardEditor {
     this.emit('theme');
   }
 
-  /** Texts of the built-in UI (the `labels` option over English). */
-  get labels(): BoardLabels {
-    return this.labelsMerged;
-  }
-
   /** A pointer gesture on the board is in progress (pressed, not yet released). */
   get isInteracting(): boolean {
     return this.interacting;
@@ -423,57 +397,6 @@ export class BoardEditor {
   /** Pointer position in world coordinates while it is over the board. */
   get pointer(): Vec2 | null {
     return this.pointerWorld;
-  }
-
-  /** Other participants, when a collaboration adapter is attached. */
-  get peers(): readonly Peer[] {
-    return this.presenceSource?.getPeers() ?? NO_PEERS;
-  }
-
-  /** Attaches a presence source (done by `apeiro/yjs`); null detaches it. */
-  setPresence(source: PresenceSource | null): () => void {
-    this.presenceSource = source;
-    this.applyGuard();
-    this.applyLocks();
-    this.emit('presence');
-    const off = source?.subscribe(() => {
-      this.applyLocks();
-      this.emit('presence');
-      this.mounted?.overlay.request();
-    });
-    return () => {
-      off?.();
-      if (this.presenceSource === source) {
-        this.presenceSource = null;
-        this.applyGuard();
-        this.emit('presence');
-      }
-    };
-  }
-
-  /** Elements other participants hold (they can't be selected or edited here), with who holds each. */
-  get locks(): ReadonlyMap<string, Peer> {
-    return this.presenceSource?.getLocks?.() ?? NO_LOCKS;
-  }
-
-  /** Who holds element `id`, if someone else does. */
-  lockedBy(id: string): Peer | null {
-    return this.locks.get(id) ?? null;
-  }
-
-  private readonly canEdit = (id: string): boolean => !this.locks.has(id);
-
-  /** Lets go of elements someone else took: out of the selection and the text editor. */
-  private applyLocks(): void {
-    const locks = this.locks;
-    if (this.mounted) {
-      const m = this.mounted;
-      if (m.text.editing && locks.has(m.text.editing)) m.text.stop();
-      m.overlay.releaseLocked();
-    } else {
-      for (const id of this.pendingSelection) if (locks.has(id)) this.pendingSelection.delete(id);
-    }
-    this.syncSelection();
   }
 
   /** The renderer while mounted (advanced: stats, text layout, color theme). */
@@ -506,13 +429,14 @@ export class BoardEditor {
 
   private syncSelection(): void {
     const set = this.selectionSet;
-    const prev = this.selectionSnapshot;
-    let changed = set !== this.lastSelectionSet || set.size !== prev.length;
-    if (!changed) for (const id of prev) if (!set.has(id) || !this.scene.has(id)) changed = true;
+    const previous = this.selectionSnapshot;
+    let changed = set !== this.lastSelectionSet || set.size !== previous.length;
+    if (!changed)
+      for (const id of previous) if (!set.has(id) || !this.scene.has(id)) changed = true;
     this.lastSelectionSet = set;
     if (!changed) return;
     const next = [...set].filter((id) => this.scene.has(id));
-    if (next.length === prev.length && next.every((id, i) => id === prev[i])) return;
+    if (next.length === previous.length && next.every((id, i) => id === previous[i])) return;
     this.selectionSnapshot = next;
     this.emit('selection');
   }
@@ -529,56 +453,56 @@ export class BoardEditor {
   // Commands that change the board do nothing on a read-only one (see `readOnly`).
 
   undo(): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     this.mounted?.text.stop();
-    this.select(this.historyImpl.undo());
+    this.select(this.currentHistory.undo());
   }
 
   redo(): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     this.mounted?.text.stop();
-    this.select(this.historyImpl.redo());
+    this.select(this.currentHistory.redo());
   }
 
   /** Runs `fn` as one undo step (all scene changes inside merge). */
-  batch<T>(fn: () => T): T {
-    return this.historyImpl.batch(fn);
+  batch<T>(run: () => T): T {
+    return this.currentHistory.batch(run);
   }
 
   /** Adds elements (one undo step) and selects them. */
   addElements(elements: readonly BoardElement[], options: { select?: boolean } = {}): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     this.scene.transact(() => {
-      for (const el of elements) this.scene.add(el);
+      for (const element of elements) this.scene.add(element);
     });
-    if (options.select ?? true) this.select(elements.map((el) => el.id));
+    if (options.select ?? true) this.select(elements.map((element) => element.id));
   }
 
   /** Patches elements, one undo step. A function patch is called per element. */
   updateElements(
     ids: Iterable<string>,
-    patch: ElementPatch | ((el: BoardElement) => ElementPatch | null),
+    patch: ElementPatch | ((element: BoardElement) => ElementPatch | null),
   ): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     this.scene.transact(() => {
       for (const id of ids) {
-        const el = this.scene.get(id);
-        if (!el) continue;
-        const p = typeof patch === 'function' ? patch(el) : patch;
-        if (p) this.scene.update(id, p);
+        const element = this.scene.get(id);
+        if (!element) continue;
+        const resolvedPatch = typeof patch === 'function' ? patch(element) : patch;
+        if (resolvedPatch) this.scene.update(id, resolvedPatch);
       }
     });
     this.mounted?.overlay.request();
   }
 
   /** Patches every selected element, one undo step. */
-  updateSelection(patch: ElementPatch | ((el: BoardElement) => ElementPatch | null)): void {
+  updateSelection(patch: ElementPatch | ((element: BoardElement) => ElementPatch | null)): void {
     this.updateElements(this.selection, patch);
   }
 
   /** Deletes the selection with the connectors attached to it. */
   deleteSelection(): void {
-    if (this.selection.length === 0 || this.readOnlyFlag) return;
+    if (this.selection.length === 0 || this.readOnlyMode) return;
     this.mounted?.text.stop();
     this.scene.removeWithConnectors(this.selection);
     this.select([]);
@@ -586,7 +510,7 @@ export class BoardEditor {
 
   /** Deletes elements with the connectors attached to them, one undo step; they leave the selection. */
   removeElements(ids: Iterable<string>): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     const gone = new Set(ids);
     if (gone.size === 0) return;
     this.mounted?.text.stop();
@@ -596,31 +520,31 @@ export class BoardEditor {
 
   /** Moves the selection above (`front`) or below (`back`) everything else. */
   reorderSelection(where: 'front' | 'back'): void {
-    const els = this.selectedElements().sort((a, b) => a.z - b.z);
-    if (els.length === 0 || this.readOnlyFlag) return;
-    let min = Infinity;
-    let max = -Infinity;
-    for (const el of this.scene.all()) {
-      min = Math.min(min, el.z);
-      max = Math.max(max, el.z);
+    const elements = this.selectedElements().sort((first, second) => first.z - second.z);
+    if (elements.length === 0 || this.readOnlyMode) return;
+    let minimum = Infinity;
+    let maximum = -Infinity;
+    for (const element of this.scene.all()) {
+      minimum = Math.min(minimum, element.z);
+      maximum = Math.max(maximum, element.z);
     }
     this.scene.transact(() => {
-      els.forEach((el, i) => {
-        const z = where === 'front' ? max + 1 + i : min - els.length + i;
-        this.scene.update(el.id, { z });
+      elements.forEach((element, i) => {
+        const z = where === 'front' ? maximum + 1 + i : minimum - elements.length + i;
+        this.scene.update(element.id, { z });
       });
     });
     this.mounted?.overlay.request();
   }
 
   group(): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     const next = groupSelection(this.scene, new Set(this.selection));
     if (next) this.select(next);
   }
 
   ungroup(): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     const next = ungroupSelection(this.scene, new Set(this.selection));
     if (next) this.select(next);
   }
@@ -635,8 +559,11 @@ export class BoardEditor {
 
   /** A point given in page client coordinates (e.g. a mouse event) in world coordinates. */
   clientToWorld(clientX: number, clientY: number): Vec2 {
-    const r = this.mounted?.root.getBoundingClientRect();
-    return this.camera.screenToWorld({ x: clientX - (r?.left ?? 0), y: clientY - (r?.top ?? 0) });
+    const rectangle = this.mounted?.root.getBoundingClientRect();
+    return this.camera.screenToWorld({
+      x: clientX - (rectangle?.left ?? 0),
+      y: clientY - (rectangle?.top ?? 0),
+    });
   }
 
   zoomTo(to: ZoomTarget): void {
@@ -644,8 +571,8 @@ export class BoardEditor {
     if (to === 'in') this.animator.zoomAt(center, 1.25);
     else if (to === 'out') this.animator.zoomAt(center, 0.8);
     else if (to === 'fit' || to === 'selection') {
-      const b = to === 'fit' ? this.scene.bounds() : this.selectionBounds();
-      if (b) this.animator.fitBox(b, 96);
+      const bounds = to === 'fit' ? this.scene.bounds() : this.selectionBounds();
+      if (bounds) this.animator.fitBox(bounds, 96);
     } else this.animator.zoomAt(center, (to === 'reset' ? 1 : to) / this.camera.zoom);
   }
 
@@ -654,47 +581,47 @@ export class BoardEditor {
    * and selects it. A new sticky opens for typing. Null on a read-only board.
    */
   place(kind: PlaceKind, at: Vec2 = this.viewCenter(), box: Box | null = null): string | null {
-    if (this.readOnlyFlag) return null;
+    if (this.readOnlyMode) return null;
     this.mounted?.text.stop();
     const sized = box && box.maxX - box.minX >= MIN_PLACE && box.maxY - box.minY >= MIN_PLACE;
     let id: string;
     if (kind === 'sticky') {
       const defaults = this.tools.getDefaults('sticky');
-      const w = sized ? box.maxX - box.minX : (defaults.w ?? STICKY_SIZE);
-      const h = sized ? box.maxY - box.minY : (defaults.h ?? STICKY_SIZE);
-      const el: ShapeElement = {
+      const width = sized ? box.maxX - box.minX : (defaults.width ?? ELEMENT_SIZE);
+      const height = sized ? box.maxY - box.minY : (defaults.height ?? ELEMENT_SIZE);
+      const element: ShapeElement = {
         id: newId('s'),
         type: 'sticky',
-        x: sized ? box.minX : at.x - w / 2,
-        y: sized ? box.minY : at.y - h / 2,
+        x: sized ? box.minX : at.x - width / 2,
+        y: sized ? box.minY : at.y - height / 2,
         rotation: 0,
         z: this.scene.maxZ() + 1,
-        fill: hexColor('#fef3c7'),
+        fill: hexColor('#fff9b1'), // Miro's classic light yellow
         stroke: 0,
         strokeWidth: 0,
-        radius: 4,
+        radius: CORNER_RADIUS,
         ...defaults,
-        w,
-        h,
+        width: width,
+        height: height,
       };
-      this.scene.add(el);
-      id = el.id;
+      this.scene.add(element);
+      id = element.id;
     } else {
       id = this.scene.transact(() => {
         const center = sized ? { x: (box.minX + box.maxX) / 2, y: (box.minY + box.maxY) / 2 } : at;
-        const el = createShape(
+        const element = createShape(
           this.scene,
           { ...SHAPE_PRESETS[kind], ...this.tools.getDefaults(kind) },
           center,
         );
         if (sized)
-          this.scene.update(el.id, {
+          this.scene.update(element.id, {
             x: box.minX,
             y: box.minY,
-            w: box.maxX - box.minX,
-            h: box.maxY - box.minY,
+            width: box.maxX - box.minX,
+            height: box.maxY - box.minY,
           });
-        return el.id;
+        return element.id;
       });
     }
     this.select([id]);
@@ -704,41 +631,80 @@ export class BoardEditor {
 
   /** Adds an empty text box at `at` and opens it for typing; null on a read-only board. */
   addText(at: Vec2 = this.viewCenter(), width?: number): string | null {
-    if (this.readOnlyFlag) return null;
+    if (this.readOnlyMode) return null;
     const defaults = this.tools.getDefaults('text');
     const block = { ...defaultTextBlock('text'), ...defaults };
     const size = block.fontSize;
     const y = width === undefined ? at.y - (size * LINE_HEIGHT) / 2 : at.y;
-    const el = createTextElement(newId('t'), { x: at.x, y }, this.scene.maxZ() + 1, width, block);
-    if (defaults.sizing !== undefined) el.text!.sizing = defaults.sizing;
+    const element = createTextElement(
+      newId('t'),
+      { x: at.x, y },
+      this.scene.maxZ() + 1,
+      width,
+      block,
+    );
+    if (defaults.sizing !== undefined) element.text!.sizing = defaults.sizing;
     this.select([]);
     if (this.mounted) {
-      const m = this.mounted;
+      const mounted = this.mounted;
+      const token = ++this.editToken;
       requestAnimationFrame(() => {
-        if (this.mounted !== m) return;
-        m.text.create(el);
-        this.select([el.id]);
+        // `stopEditing` before then: an empty text box that was never opened leaves no trace.
+        if (this.mounted !== mounted || token !== this.editToken) return;
+        mounted.text.create(element);
+        this.select([element.id]);
       });
-    } else this.scene.add(el);
-    return el.id;
+    } else this.scene.add(element);
+    return element.id;
   }
 
-  /** Opens the text of a shape for editing (next frame, after the current pointer event). */
+  /**
+   * Opens the text of a shape for editing (next frame, after the current pointer event;
+   * `stopEditing` before then cancels it).
+   */
   editText(id: string): void {
-    const m = this.mounted;
-    if (!m) return;
+    const mounted = this.mounted;
+    if (!mounted) return;
+    const token = ++this.editToken;
     requestAnimationFrame(() => {
-      if (this.mounted === m && this.scene.has(id) && this.canChange(id)) m.text.start(id);
+      if (
+        this.mounted === mounted &&
+        token === this.editToken &&
+        this.scene.has(id) &&
+        !this.readOnlyMode
+      )
+        mounted.text.start(id);
     });
   }
 
+  /** Closes the text being edited, and cancels an `editText` or `addText` not opened yet. */
   stopEditing(): void {
+    this.editToken++;
     this.mounted?.text.stop();
+  }
+
+  /**
+   * Formatting at the selection of the text being edited (null when nothing is), for your
+   * formatting controls. Same object until it changes (event `textFormat`).
+   */
+  get textFormat(): TextFormatState | null {
+    return this.mounted?.text.format ?? null;
+  }
+
+  /**
+   * Changes the formatting of the text being edited (bold, color, size, list, link…) and
+   * returns the focus to it. Wrap your controls in an element with `data-ap-text-controls`
+   * so pressing them keeps the editor open. False when nothing is edited or the link is
+   * not allowed.
+   */
+  formatText(command: TextFormatCommand): boolean {
+    if (this.readOnlyMode) return false;
+    return this.mounted?.text.apply(command) ?? false;
   }
 
   /** Adds image and audio files around `at` (default: the view center) and selects them. */
   async addFiles(files: Iterable<File>, at: Vec2 = this.viewCenter()): Promise<string[]> {
-    if (this.readOnlyFlag) return [];
+    if (this.readOnlyMode) return [];
     const ids = await importFiles(
       [...files],
       at,
@@ -772,7 +738,7 @@ export class BoardEditor {
 
   /** Copies the selection and deletes it (Ctrl/⌘+X). */
   cut(): BoardClipboard | null {
-    if (this.readOnlyFlag) return null;
+    if (this.readOnlyMode) return null;
     const data = this.copy();
     if (data) this.deleteSelection();
     return data;
@@ -785,7 +751,7 @@ export class BoardEditor {
    * Ctrl/⌘+V does this on the board (also with data copied in another tab or board).
    */
   paste(data: BoardClipboard | null = this.clipboardData, at?: Vec2): string[] {
-    if (!data || this.readOnlyFlag) return [];
+    if (!data || this.readOnlyMode) return [];
     this.mounted?.text.stop();
     const target = at ?? this.pointerWorld ?? this.viewCenter();
     const last = this.lastPaste;
@@ -796,7 +762,7 @@ export class BoardEditor {
     const step = (PASTE_STEP_PX / this.camera.zoom) * count;
     const ids = pasteElements(this.scene, data, {
       at: { x: target.x + step, y: target.y + step },
-      newId: (el) => newId(el.type === 'connector' ? 'c' : 's'),
+      newId: (element) => newId(element.type === 'connector' ? 'c' : 's'),
     });
     this.select(ids);
     return ids;
@@ -808,7 +774,7 @@ export class BoardEditor {
    * clipboard. For a "Paste" button; Ctrl/⌘+V on the board doesn't need it.
    */
   async pasteFromClipboard(at?: Vec2): Promise<string[]> {
-    if (this.readOnlyFlag) return [];
+    if (this.readOnlyMode) return [];
     const content = await readSystemClipboard();
     if (content?.kind === 'image') return this.addFiles([content.file], at);
     if (content?.kind === 'board') return this.paste(content.data, at);
@@ -825,14 +791,14 @@ export class BoardEditor {
    * (Ctrl/⌘+D). Lines between selected shapes are duplicated with them.
    */
   duplicate(): string[] {
-    if (this.selection.length === 0 || this.readOnlyFlag) return [];
+    if (this.selection.length === 0 || this.readOnlyMode) return [];
     this.mounted?.text.stop();
     const step = PASTE_STEP_PX / this.camera.zoom;
     const data = copyElements(this.scene, this.selection);
     if (!data) return [];
     const ids = pasteElements(this.scene, data, {
       offset: { x: step, y: step },
-      newId: (el) => newId(el.type === 'connector' ? 'c' : 's'),
+      newId: (element) => newId(element.type === 'connector' ? 'c' : 's'),
     });
     this.select(ids);
     return ids;
@@ -843,25 +809,29 @@ export class BoardEditor {
    * its id, or null on a read-only board.
    */
   pasteText(text: string, at?: Vec2): string | null {
-    if (this.readOnlyFlag) return null;
+    if (this.readOnlyMode) return null;
     this.mounted?.text.stop();
     const target = at ?? this.pointerWorld ?? this.viewCenter();
     const block = { ...defaultTextBlock('text'), runs: [{ text: text.replace(/\r\n?/g, '\n') }] };
-    let el = createTextElement(newId('t'), target, this.scene.maxZ() + 1, undefined, block);
+    let element = createTextElement(newId('t'), target, this.scene.maxZ() + 1, undefined, block);
     const measurer = this.mounted?.renderer.measurer;
     if (measurer) {
-      let size = measureTextBox(el, measurer);
+      let size = measureTextBox(element, measurer);
       // Long text wraps in a column instead of running off in one line.
-      if (size && size.w > MAX_PASTED_TEXT_WIDTH) {
-        el = { ...el, w: MAX_PASTED_TEXT_WIDTH, text: { ...block, sizing: 'auto-height' } };
-        size = measureTextBox(el, measurer);
+      if (size && size.width > MAX_PASTED_TEXT_WIDTH) {
+        element = {
+          ...element,
+          width: MAX_PASTED_TEXT_WIDTH,
+          text: { ...block, sizing: 'auto-height' },
+        };
+        size = measureTextBox(element, measurer);
       }
-      if (size) el = { ...el, w: size.w, h: size.h };
+      if (size) element = { ...element, width: size.width, height: size.height };
     }
-    el = { ...el, x: target.x - el.w / 2, y: target.y - el.h / 2 };
-    this.scene.add(el);
-    this.select([el.id]);
-    return el.id;
+    element = { ...element, x: target.x - element.width / 2, y: target.y - element.height / 2 };
+    this.scene.add(element);
+    this.select([element.id]);
+    return element.id;
   }
 
   /** Copies the selection without touching the system clipboard. */
@@ -876,7 +846,7 @@ export class BoardEditor {
 
   /** Starts crop mode for a selected image (Enter or double click do it on the board). */
   cropImage(id: string): void {
-    if (this.readOnlyFlag) return;
+    if (this.readOnlyMode) return;
     this.mounted?.crop.start(id);
   }
 
@@ -886,18 +856,18 @@ export class BoardEditor {
    */
   load(elements: readonly BoardElement[]): void {
     const ids = new Set<string>();
-    for (const el of elements) {
-      const problem = validateElement(el);
-      if (problem) throw new Error(`Invalid element ${el?.id}: ${problem}`);
-      if (ids.has(el.id)) throw new Error(`Element ${el.id} already exists`);
-      ids.add(el.id);
+    for (const element of elements) {
+      const problem = validateElement(element);
+      if (problem) throw new Error(`Invalid element ${element?.id}: ${problem}`);
+      if (ids.has(element.id)) throw new Error(`Element ${element.id} already exists`);
+      ids.add(element.id);
     }
     this.mounted?.text.stop();
     this.scene.transact(() => {
       this.scene.clear();
-      for (const el of elements) this.scene.add(el);
+      for (const element of elements) this.scene.add(element);
     }, 'load');
-    this.historyImpl.clear();
+    this.currentHistory.clear();
     this.select([]);
   }
 
@@ -928,19 +898,19 @@ export class BoardEditor {
       options.padding ?? (options.area ? 0 : 24),
       options.maxSize ?? 8192,
     );
-    const colors = boardThemeColors(this.themeName);
-    const dark = this.themeName === 'dark';
-    const grid = this.options.grid ?? 'lines';
+    const colors = this.themeColors();
+    // The grid only when asked for.
+    const grid = gridBackdrop(options.grid ? this.grid : 'none', colors);
     return renderImage(
       ids ? sceneOf(this.scene, ids) : this.scene,
       frame,
       {
         background:
           options.background === 'transparent' ? 0 : (options.background ?? colors.background),
-        gridColor: options.grid && grid !== 'none' ? colors.gridColor : 0,
-        gridStyle: grid === 'none' ? 'dots' : grid,
+        gridColor: grid.gridColor,
+        gridStyle: this.grid === 'none' ? 'dots' : this.grid,
         ...(this.options.mediaOrigins ? { mediaOrigins: this.options.mediaOrigins } : {}),
-        colorTheme: dark ? DARK_BOARD_COLORS : [],
+        colorTheme: colors.colorTheme,
         keepTypes: THEME_KEEP_TYPES,
         audio: colors.audio,
       },
@@ -953,16 +923,16 @@ export class BoardEditor {
   /**
    * Shows proposed changes (e.g. an AI assistant's) over the board for this user only:
    * new and changed elements drawn see-through on top, elements to delete outlined in red.
-   * Nothing changes on the board (or for collaborators) until `applyPreview`;
+   * Nothing changes on the board until `applyPreview`;
    * `discardPreview` drops it. A new preview replaces the current one. Throws, showing
    * nothing, if an element of the draft is invalid.
    */
   showPreview(draft: BoardDraft): void {
     const scene = new DraftScene(this.scene, normalizeDraft(this.scene, draft));
     this.endPreview();
-    const off = this.scene.subscribe((c) => scene.boardChanged(c));
-    this.draft = { scene, off };
-    if (this.mounted) this.startPreviewRenderer(this.mounted);
+    const unsubscribe = this.scene.subscribe((changes) => scene.boardChanged(changes));
+    this.draft = { scene, unsubscribe };
+    if (this.mounted) this.showDraft(this.mounted);
     this.emit('preview');
   }
 
@@ -977,20 +947,20 @@ export class BoardEditor {
    * skipped. Nothing on a read-only board (the preview stays).
    */
   applyPreview(): string[] {
-    const d = this.draft?.scene.draft;
-    if (!d || this.readOnlyFlag) return [];
+    const draft = this.draft?.scene.draft;
+    if (!draft || this.readOnlyMode) return [];
     this.endPreview();
     this.mounted?.text.stop();
     const ids: string[] = [];
     this.batch(() =>
       this.scene.transact(() => {
-        for (const el of d.add) {
-          if (this.scene.has(el.id)) continue;
-          this.scene.add(el);
-          ids.push(el.id);
+        for (const element of draft.add) {
+          if (this.scene.has(element.id)) continue;
+          this.scene.add(element);
+          ids.push(element.id);
         }
-        for (const { id, ...patch } of d.update) if (this.scene.update(id, patch)) ids.push(id);
-        this.scene.removeWithConnectors(d.remove.filter((id) => this.scene.has(id)));
+        for (const { id, ...patch } of draft.update) if (this.scene.update(id, patch)) ids.push(id);
+        this.scene.removeWithConnectors(draft.remove.filter((id) => this.scene.has(id)));
       }),
     );
     this.select(ids);
@@ -1007,62 +977,26 @@ export class BoardEditor {
 
   private endPreview(): void {
     if (!this.draft) return;
-    this.draft.off();
+    this.draft.unsubscribe();
     this.draft = null;
-    if (this.mounted) this.stopPreviewRenderer(this.mounted);
+    if (this.mounted) {
+      this.mounted.preview.hide();
+      this.mounted.overlay.request();
+    }
   }
 
-  /** Draws the draft on its own see-through canvas over the board, with the same camera. */
-  private startPreviewRenderer(m: Mounted): void {
-    this.stopPreviewRenderer(m);
-    const draft = this.draft;
-    if (!draft) return;
-    const token = ++m.preview.token;
-    m.preview.canvas.hidden = false;
-    m.overlay.request();
-    const colors = boardThemeColors(this.themeName);
-    void createRenderer({
-      backend: m.renderer.backend,
-      canvas: m.preview.canvas,
-      scene: draft.scene.scene,
-      camera: this.camera,
-      transparent: true,
-      background: 0,
-      gridColor: 0,
-      ...(this.options.mediaOrigins
-        ? { media: { allowedOrigins: this.options.mediaOrigins } }
-        : {}),
-    }).then(
-      (renderer) => {
-        if (this.mounted !== m || m.preview.token !== token || this.draft !== draft) {
-          renderer.destroy();
-          return;
-        }
-        m.preview.renderer = renderer;
-        renderer.setColorTheme(
-          this.themeName === 'dark' ? DARK_BOARD_COLORS : [],
-          THEME_KEEP_TYPES,
-        );
-        renderer.setAudioStyle(colors.audio);
-        renderer.resize();
-      },
-      (error: unknown) => this.options.onError?.(error),
-    );
-  }
-
-  private stopPreviewRenderer(m: Mounted): void {
-    m.preview.token++;
-    m.preview.renderer?.destroy();
-    m.preview.renderer = null;
-    m.preview.canvas.hidden = true;
-    if (this.mounted === m) m.overlay.request();
+  /** Draws the draft on the preview canvas of a mounted board. */
+  private showDraft(mounted: Mounted): void {
+    if (!this.draft) return;
+    mounted.preview.show(this.draft.scene.scene);
+    mounted.overlay.request();
   }
 
   /** Elements the previewed draft would delete: outlined in red. */
   private readonly drawPreview: OverlayLayer = () => {
     const remove = this.draft?.scene.draft.remove;
     if (remove && remove.length > 0)
-      this.mounted?.overlay.drawForeignSelection(new Set(remove), PREVIEW_REMOVE_COLOR);
+      this.mounted?.overlay.drawTintedSelection(new Set(remove), PREVIEW_REMOVE_COLOR);
   };
 
   // --- Mounting --------------------------------------------------------------------
@@ -1077,22 +1011,19 @@ export class BoardEditor {
     const token = ++this.mountToken;
     const { root, stage, canvas, previewCanvas, overlayCanvas, editorLayer } = createBoardDom(
       container,
-      { theme: this.themeName, textToolbar: this.options.textToolbar !== false },
+      { theme: this.themeName },
     );
 
     let renderer: BoardRenderer;
     try {
-      const colors = boardThemeColors(this.themeName);
-      const grid = this.options.grid ?? 'lines';
       renderer = await createRenderer({
         backend: this.options.backend ?? 'auto',
         canvas,
         scene: this.scene,
         camera: this.camera,
         preserveDrawingBuffer: this.options.preserveDrawingBuffer ?? false,
-        gridStyle: grid === 'none' ? 'dots' : grid,
-        background: colors.background,
-        gridColor: grid === 'none' ? 0 : colors.gridColor,
+        background: this.themeColors().background,
+        ...gridBackdrop(this.grid, this.themeColors()),
         ...(this.options.mediaOrigins
           ? { media: { allowedOrigins: this.options.mediaOrigins } }
           : {}),
@@ -1109,41 +1040,35 @@ export class BoardEditor {
     }
 
     const disposers: Array<() => void> = [activeBoard.mounted(this)];
-    /** The pointer is over the board (shortcuts go to it before any board was pressed). */
-    let pointerInside = false;
     const overlay = new Overlay(overlayCanvas, this.scene, this.camera);
-    overlay.isLocked = (id) => !this.canEdit(id);
-    overlay.readOnly = this.readOnlyFlag;
+    overlay.readOnly = this.readOnlyMode;
     overlay.selection = this.pendingSelection;
     disposers.push(renderer.onAfterRender(() => overlay.draw()));
-    const text = new TextEditor(
-      editorLayer,
-      this.scene,
-      this.camera,
-      renderer,
-      this.historyProxy,
-      this.labelsMerged,
-    );
+    const text = new TextEditor(editorLayer, this.scene, this.camera, renderer, this.historyProxy);
     const audio = new AudioController(
       this.scene,
       renderer,
       undefined,
       this.options.mediaOrigins ?? [],
     );
+    const preview = new PreviewCanvas(previewCanvas, this.camera, this.themeColors(), {
+      backend: renderer.backend,
+      ...(this.options.mediaOrigins ? { mediaOrigins: this.options.mediaOrigins } : {}),
+      onError: (error) => this.options.onError?.(error),
+    });
     const crop = cropControls();
-    const m: Mounted = {
+    const mounted: Mounted = {
       root,
-      stage,
       renderer,
-      preview: { renderer: null, canvas: previewCanvas, token: 0 },
+      preview,
       overlay,
       text,
       audio,
       crop,
       dispose: () => undefined,
     };
-    this.mounted = m;
-    disposers.push(overlay.addLayer(this.drawPreview), overlay.addLayer(this.drawPeers));
+    this.mounted = mounted;
+    disposers.push(overlay.addLayer(this.drawPreview));
     overlay.onDraw = () => {
       this.syncSelection();
       this.syncEditing();
@@ -1154,12 +1079,15 @@ export class BoardEditor {
       overlay.request();
       this.syncEditing();
     };
+    text.onFormat = () => this.emit('textFormat');
     text.onStop = (id) => {
       overlay.editing = null;
       overlay.selection = id ? new Set([id]) : new Set();
       overlay.request();
       this.syncEditing();
     };
+    // Created after the controls: their double click on a handle must stop the text editing one.
+    let listeners: BoardListeners | null = null;
     disposers.push(
       attachControls(stage, this.scene, this.camera, overlay, this.tools, this.animator, {
         crop,
@@ -1168,9 +1096,9 @@ export class BoardEditor {
         createText: (at, width) => void this.addText(at, width),
         editText: (id) => this.editText(id),
         linkAt: (id, world) => {
-          const el = this.scene.get(id);
-          return el && isShape(el)
-            ? linkAtPoint(el, renderer.textLayout(el), world, 2 / this.camera.zoom)
+          const element = this.scene.get(id);
+          return element && isShape(element)
+            ? linkAtPoint(element, renderer.textLayout(element), world, 2 / this.camera.zoom)
             : null;
         },
         openLink: this.options.openLink ?? openLink,
@@ -1180,118 +1108,18 @@ export class BoardEditor {
         addComment: (at) => this.options.onComment?.(at),
         zoom: (to) => this.zoomTo(to),
         snapping: this.options.snapping ?? true,
-        isLocked: (id) => !this.canEdit(id),
-        readOnly: () => this.readOnlyFlag,
-        acceptsKeys: () => activeBoard.acceptsKeys(this, pointerInside),
+        readOnly: () => this.readOnlyMode,
+        acceptsKeys: () => activeBoard.acceptsKeys(this, listeners?.pointerInside ?? false),
         onToolError: (error) => this.reportError(error),
       }),
     );
+    listeners = new BoardListeners(stage, this, this.listenerHost(mounted));
+    disposers.push(() => listeners.dispose());
     disposers.push(revokeUnusedObjectUrls(this.scene));
-
-    const listen = <K extends keyof HTMLElementEventMap>(
-      target: HTMLElement | Window,
-      type: K,
-      fn: (e: HTMLElementEventMap[K]) => void,
-    ) => {
-      target.addEventListener(type, fn as EventListener);
-      disposers.push(() => target.removeEventListener(type, fn as EventListener));
-    };
-    // Double click on a shape edits its text (images, audio and pen strokes have none).
-    listen(stage, 'dblclick', (e) => {
-      const hit = this.scene.hitTest(this.clientToWorld(e.clientX, e.clientY));
-      const editable =
-        hit && isShape(hit) && hit.type !== 'image' && hit.type !== 'audio' && hit.type !== 'ink';
-      if (editable && this.canChange(hit.id)) text.start(hit.id);
-    });
-    // Files dropped on the board or pasted while the pointer is over it.
-    listen(stage, 'pointermove', (e) => {
-      pointerInside = true;
-      this.pointerWorld = this.clientToWorld(e.clientX, e.clientY);
-      this.emit('pointer');
-    });
-    listen(stage, 'pointerleave', () => {
-      pointerInside = false;
-      this.pointerWorld = null;
-      this.emit('pointer');
-    });
-    listen(stage, 'dragover', (e) => {
-      if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
-    });
-    listen(stage, 'drop', (e) => {
-      const files = [...(e.dataTransfer?.files ?? [])];
-      if (files.length === 0) return;
-      e.preventDefault();
-      void this.addFiles(files, this.clientToWorld(e.clientX, e.clientY));
-    });
-    // Keyboard and clipboard shortcuts go to the board in use: the one pressed last or, before
-    // any press, the one under the pointer. Never while typing in a field or in board text.
-    listen(stage, 'pointerdown', () => {
-      activeBoard.pressed(this);
-      this.setInteracting(true);
-    });
-    const release = () => this.setInteracting(false);
-    listen(window, 'pointerup', release);
-    listen(window, 'pointercancel', release);
-    disposers.push(release);
-    const active = (t: EventTarget | null) =>
-      !isTypingTarget(t) && activeBoard.accepts(this, pointerInside);
-
-    // Native clipboard events carry the data both ways without asking for permission, and
-    // work between tabs and boards. `fired`: the browser sent one for the last shortcut.
-    let fired = false;
-    const onCopy = (e: ClipboardEvent, cut: boolean) => {
-      fired = true;
-      if (!active(e.target) || this.selection.length === 0) return;
-      // Text selected on the page is copied as usual.
-      const textSelection = getSelection();
-      if (textSelection && !textSelection.isCollapsed) return;
-      const data = this.takeCopy();
-      if (!data || !e.clipboardData) return;
-      e.preventDefault();
-      e.clipboardData.setData('text/html', clipboardToHtml(data));
-      e.clipboardData.setData('text/plain', clipboardText(data));
-      if (cut) this.deleteSelection();
-    };
-    listen(window, 'copy', (e) => onCopy(e, false));
-    listen(window, 'cut', (e) => onCopy(e, true));
-    listen(window, 'paste', (e) => {
-      fired = true;
-      if (!active(e.target)) return;
-      const dt = e.clipboardData;
-      const files = [...(dt?.files ?? [])];
-      const data = clipboardFromHtml(dt?.getData('text/html') ?? '');
-      const text = dt?.getData('text/plain') ?? '';
-      if (files.length > 0) void this.addFiles(files);
-      else if (data) this.paste(data);
-      else if (text.trim()) this.pasteText(text);
-      // Nothing usable on the system clipboard: what was copied on this board.
-      else if (this.clipboardData) this.paste();
-      else return;
-      e.preventDefault();
-    });
-    listen(window, 'keydown', (e) => {
-      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || !active(e.target)) return;
-      if (e.code === 'KeyD') {
-        e.preventDefault(); // not the browser's bookmark
-        this.duplicate();
-        return;
-      }
-      const code = e.code;
-      if (code !== 'KeyC' && code !== 'KeyX' && code !== 'KeyV') return;
-      // Some browsers (Safari) send no clipboard event without a text selection or a field:
-      // then copy and paste through the async clipboard API instead.
-      fired = false;
-      setTimeout(() => {
-        if (fired || this.mounted?.root !== root) return;
-        if (code === 'KeyC') this.copy();
-        else if (code === 'KeyX') this.cut();
-        else void this.pasteFromClipboard();
-      }, 0);
-    });
 
     const resize = () => {
       renderer.resize();
-      m.preview.renderer?.resize();
+      preview.resize();
       overlay.resize();
     };
     const observer = new ResizeObserver(resize);
@@ -1299,31 +1127,58 @@ export class BoardEditor {
     disposers.push(() => observer.disconnect());
     disposers.push(watchPixelRatio(resize));
 
-    m.dispose = () => {
-      this.stopPreviewRenderer(m);
-      for (const d of disposers.reverse()) d();
+    mounted.dispose = () => {
+      preview.hide();
+      for (const dispose of disposers.reverse()) dispose();
       overlay.dispose();
       text.destroy();
       audio.dispose();
       renderer.destroy();
       root.remove();
     };
-    this.applyTheme(m);
+    this.applyTheme(mounted);
     resize();
-    if (this.draft) this.startPreviewRenderer(m);
+    this.showDraft(mounted);
     this.syncSelection();
     this.emit('mount');
+  }
+
+  /** What the page listeners of a mount do on this editor. */
+  private listenerHost(mounted: Mounted): BoardListenerHost {
+    return {
+      scene: this.scene,
+      isReadOnly: () => this.readOnlyMode,
+      hasSelection: () => this.selection.length > 0,
+      hasCopy: () => this.clipboardData !== null,
+      isCurrentMount: () => this.mounted === mounted,
+      clientToWorld: (clientX, clientY) => this.clientToWorld(clientX, clientY),
+      startEditing: (id) => mounted.text.start(id),
+      setPointer: (world) => {
+        this.pointerWorld = world;
+        this.emit('pointer');
+      },
+      setInteracting: (interacting) => this.setInteracting(interacting),
+      takeCopy: () => this.takeCopy(),
+      copy: () => void this.copy(),
+      cut: () => void this.cut(),
+      deleteSelection: () => this.deleteSelection(),
+      duplicate: () => void this.duplicate(),
+      paste: (data) => void this.paste(data),
+      pasteText: (text) => void this.pasteText(text),
+      pasteFromClipboard: () => this.pasteFromClipboard(),
+      addFiles: (files, at) => this.addFiles(files, at),
+    };
   }
 
   /** Removes the board from the page; the scene, camera, selection and history stay. */
   unmount(): void {
     this.mountToken++;
-    const m = this.mounted;
-    if (!m) return;
-    m.text.stop();
-    this.pendingSelection = new Set(m.overlay.selection);
+    const mounted = this.mounted;
+    if (!mounted) return;
+    mounted.text.stop();
+    this.pendingSelection = new Set(mounted.overlay.selection);
     this.mounted = null;
-    m.dispose();
+    mounted.dispose();
     this.pointerWorld = null;
     this.syncSelection();
     this.syncEditing();
@@ -1336,9 +1191,9 @@ export class BoardEditor {
     this.unmount();
     this.endPreview();
     this.destroyed = true;
-    for (const d of this.disposers) d();
+    for (const dispose of this.disposers) dispose();
     this.disposers = [];
-    if (this.ownsHistory) this.historyImpl.dispose();
+    if (this.ownsHistory) this.currentHistory.dispose();
     this.animator.stop();
     this.events.clear();
   }
@@ -1347,25 +1202,27 @@ export class BoardEditor {
     return this.destroyed;
   }
 
-  private applyTheme(m: Mounted): void {
-    const dark = this.themeName === 'dark';
-    m.overlay.accent = dark ? SELECTION_COLOR_DARK : SELECTION_COLOR;
-    m.overlay.handleFill = dark ? HANDLE_FILL_DARK : HANDLE_FILL;
-    m.overlay.request();
-    const colors = boardThemeColors(this.themeName);
-    m.root.dataset.apTheme = this.themeName;
-    const grid = this.options.grid ?? 'lines';
-    m.renderer.setBackdrop({
-      background: colors.background,
-      gridColor: grid === 'none' ? 0 : colors.gridColor,
-    });
-    m.renderer.setColorTheme(dark ? DARK_BOARD_COLORS : [], THEME_KEEP_TYPES);
-    m.renderer.setAudioStyle(colors.audio);
-    m.preview.renderer?.setColorTheme(dark ? DARK_BOARD_COLORS : [], THEME_KEEP_TYPES);
-    m.preview.renderer?.setAudioStyle(colors.audio);
+  /** The board's grid option. */
+  private get grid(): BoardGrid {
+    return this.options.grid ?? 'lines';
   }
 
-  /** Other participants' selections and cursors, on top of the overlay. */
-  private readonly drawPeers: OverlayLayer = (ctx, zoom) =>
-    this.peerCursors.draw(ctx, zoom, this.presenceSource?.getPeers(), this.mounted?.overlay);
+  private themeColors(): BoardThemeColors {
+    return boardThemeColors(this.themeName);
+  }
+
+  private applyTheme(mounted: Mounted): void {
+    const colors = this.themeColors();
+    mounted.overlay.accent = colors.accent;
+    mounted.overlay.handleFill = colors.handleFill;
+    mounted.overlay.request();
+    mounted.root.dataset.apTheme = this.themeName;
+    mounted.renderer.setBackdrop({
+      background: colors.background,
+      gridColor: gridBackdrop(this.grid, colors).gridColor,
+    });
+    applyRendererTheme(mounted.renderer, colors);
+    mounted.preview.restyle(colors);
+    mounted.text.restyle(); // the edited text is shown by the DOM, in the board's colors
+  }
 }

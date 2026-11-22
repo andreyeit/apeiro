@@ -1,4 +1,4 @@
-import type { Box } from './math';
+import type { Box } from './box';
 
 /**
  * Snapping while moving and resizing, like Figma's smart guides: edges and centers of
@@ -16,9 +16,13 @@ export const GRID_MIN_PX = 12;
 export function gridStep(zoom: number): number {
   let spacing = GRID_BASE;
   if (!(zoom > 0) || !Number.isFinite(zoom)) return spacing;
-  for (let i = 0; i < 64 && spacing * zoom < GRID_MIN_PX; i++) spacing *= 4;
+  for (let level = 0; level < 64 && spacing * zoom < GRID_MIN_PX; level++) spacing *= 4;
   return spacing;
 }
+
+export type SnapAxis = 'x' | 'y';
+/** Which line of a box along an axis: its start, its middle or its end. */
+export type SnapEdge = 'min' | 'center' | 'max';
 
 /**
  * A guide line: vertical (`axis: 'x'`, the line x = `at` from y = `from` to `to`) or
@@ -26,22 +30,28 @@ export function gridStep(zoom: number): number {
  * points along it (drawn as small crosses).
  */
 export interface SnapGuide {
-  axis: 'x' | 'y';
+  axis: SnapAxis;
   at: number;
   from: number;
   to: number;
   marks: number[];
 }
 
+/** One gap of a `SpacingGuide`: across the gap from `from` to `to`, at `at` on the other axis. */
+export interface SpacingSegment {
+  from: number;
+  to: number;
+  at: number;
+}
+
 /**
  * Equal spacing (Figma's distance guides): the gaps along `axis` that are all
- * `distance` wide. Each segment runs across a gap from `from` to `to` (along the axis)
- * at `at` on the other axis.
+ * `distance` wide.
  */
 export interface SpacingGuide {
-  axis: 'x' | 'y';
+  axis: SnapAxis;
   distance: number;
-  segments: { from: number; to: number; at: number }[];
+  segments: SpacingSegment[];
 }
 
 export interface SnapOptions {
@@ -50,7 +60,7 @@ export interface SnapOptions {
   /** Grid step to fall back to (world units); 0 or absent: no grid snapping. */
   grid?: number;
   /** Which edges of the box move: all (a move), or the dragged sides of a resize. */
-  edges?: { x: readonly ('min' | 'center' | 'max')[]; y: readonly ('min' | 'center' | 'max')[] };
+  edges?: { x: readonly SnapEdge[]; y: readonly SnapEdge[] };
   /** Axes that must not change (Shift's axis lock, a resize along one side). */
   lockX?: boolean;
   lockY?: boolean;
@@ -58,202 +68,245 @@ export interface SnapOptions {
 
 export interface SnapResult {
   /** Correction to add to the box's position (or to the dragged edges). */
-  dx: number;
-  dy: number;
+  deltaX: number;
+  deltaY: number;
   guides: SnapGuide[];
   /** Equal gaps the box now forms with its neighbours (moves only). */
   spacing: SpacingGuide[];
 }
 
 const ALL_EDGES = ['min', 'center', 'max'] as const;
-const EPS = 1e-6;
+const EPSILON = 1e-6;
 /** Gaps that differ by less than this count as equal (world units). */
-const GAP_EPS = 0.01;
+const GAP_EPSILON = 0.01;
 
-type Edge = 'min' | 'center' | 'max';
-const lineOf = (b: Box, axis: 'x' | 'y', edge: Edge): number => {
-  const min = axis === 'x' ? b.minX : b.minY;
-  const max = axis === 'x' ? b.maxX : b.maxY;
-  return edge === 'min' ? min : edge === 'max' ? max : (min + max) / 2;
+const minimumOf = (box: Box, axis: SnapAxis) => (axis === 'x' ? box.minX : box.minY);
+const maximumOf = (box: Box, axis: SnapAxis) => (axis === 'x' ? box.maxX : box.maxY);
+const crossAxisOf = (axis: SnapAxis): SnapAxis => (axis === 'x' ? 'y' : 'x');
+
+const lineOf = (box: Box, axis: SnapAxis, edge: SnapEdge): number => {
+  const minimum = minimumOf(box, axis);
+  const maximum = maximumOf(box, axis);
+  return edge === 'min' ? minimum : edge === 'max' ? maximum : (minimum + maximum) / 2;
 };
-
-const minOf = (b: Box, axis: 'x' | 'y') => (axis === 'x' ? b.minX : b.minY);
-const maxOf = (b: Box, axis: 'x' | 'y') => (axis === 'x' ? b.maxX : b.maxY);
-const other = (axis: 'x' | 'y'): 'x' | 'y' => (axis === 'x' ? 'y' : 'x');
 
 /** Boxes in the same row (`axis` x) or column (y) as `box`: they overlap it across the axis. */
-const rowOf = (box: Box, targets: readonly Box[], axis: 'x' | 'y'): Box[] => {
-  const c = other(axis);
-  return targets.filter((t) => minOf(t, c) < maxOf(box, c) && maxOf(t, c) > minOf(box, c));
+const rowOf = (box: Box, targets: readonly Box[], axis: SnapAxis): Box[] => {
+  const crossAxis = crossAxisOf(axis);
+  return targets.filter(
+    (target) =>
+      minimumOf(target, crossAxis) < maximumOf(box, crossAxis) &&
+      maximumOf(target, crossAxis) > minimumOf(box, crossAxis),
+  );
 };
 
-/** Nearest box of `row` entirely before `box` along the axis (largest end), or null. */
-const before = (box: Box, row: readonly Box[], axis: 'x' | 'y'): Box | null => {
-  let out: Box | null = null;
-  for (const t of row) {
-    if (t === box || maxOf(t, axis) > minOf(box, axis) + EPS) continue;
-    if (!out || maxOf(t, axis) > maxOf(out, axis)) out = t;
+/** Nearest of `neighbours` entirely before `box` along the axis (largest end), or null. */
+const nearestBefore = (box: Box, neighbours: readonly Box[], axis: SnapAxis): Box | null => {
+  let nearest: Box | null = null;
+  for (const target of neighbours) {
+    if (target === box || maximumOf(target, axis) > minimumOf(box, axis) + EPSILON) continue;
+    if (!nearest || maximumOf(target, axis) > maximumOf(nearest, axis)) nearest = target;
   }
-  return out;
+  return nearest;
 };
-/** Nearest box of `row` entirely after `box` along the axis (smallest start), or null. */
-const after = (box: Box, row: readonly Box[], axis: 'x' | 'y'): Box | null => {
-  let out: Box | null = null;
-  for (const t of row) {
-    if (t === box || minOf(t, axis) < maxOf(box, axis) - EPS) continue;
-    if (!out || minOf(t, axis) < minOf(out, axis)) out = t;
+
+/** Nearest of `neighbours` entirely after `box` along the axis (smallest start), or null. */
+const nearestAfter = (box: Box, neighbours: readonly Box[], axis: SnapAxis): Box | null => {
+  let nearest: Box | null = null;
+  for (const target of neighbours) {
+    if (target === box || minimumOf(target, axis) < maximumOf(box, axis) - EPSILON) continue;
+    if (!nearest || minimumOf(target, axis) < minimumOf(nearest, axis)) nearest = target;
   }
-  return out;
+  return nearest;
 };
 
 /**
  * Positions (the box's start along the axis) where it would make equal gaps, as in
  * Figma: centered between its two neighbours, or continuing the gap of the pair next to it.
  */
-function spacingCandidates(moving: Box, targets: readonly Box[], axis: 'x' | 'y'): number[] {
-  const row = rowOf(moving, targets, axis);
-  if (row.length === 0) return [];
-  const size = maxOf(moving, axis) - minOf(moving, axis);
+function spacingCandidates(moving: Box, targets: readonly Box[], axis: SnapAxis): number[] {
+  const neighbours = rowOf(moving, targets, axis);
+  if (neighbours.length === 0) return [];
+  const size = maximumOf(moving, axis) - minimumOf(moving, axis);
   // Neighbours relative to the box's center, so they don't flip while it is snapped.
-  const mid = (minOf(moving, axis) + maxOf(moving, axis)) / 2;
+  const middle = (minimumOf(moving, axis) + maximumOf(moving, axis)) / 2;
   const probe: Box =
     axis === 'x'
-      ? { minX: mid, maxX: mid, minY: moving.minY, maxY: moving.maxY }
-      : { minY: mid, maxY: mid, minX: moving.minX, maxX: moving.maxX };
-  const left = before(probe, row, axis);
-  const right = after(probe, row, axis);
-  const out: number[] = [];
+      ? { minX: middle, maxX: middle, minY: moving.minY, maxY: moving.maxY }
+      : { minY: middle, maxY: middle, minX: moving.minX, maxX: moving.maxX };
+  const left = nearestBefore(probe, neighbours, axis);
+  const right = nearestAfter(probe, neighbours, axis);
+  const candidates: number[] = [];
   if (left && right) {
-    const room = minOf(right, axis) - maxOf(left, axis) - size;
-    if (room > 0) out.push(maxOf(left, axis) + room / 2);
+    const room = minimumOf(right, axis) - maximumOf(left, axis) - size;
+    if (room > 0) candidates.push(maximumOf(left, axis) + room / 2);
   }
   if (left) {
-    const prev = before(left, row, axis);
-    const gap = prev ? minOf(left, axis) - maxOf(prev, axis) : 0;
-    if (gap > 0) out.push(maxOf(left, axis) + gap);
+    const previous = nearestBefore(left, neighbours, axis);
+    const gap = previous ? minimumOf(left, axis) - maximumOf(previous, axis) : 0;
+    if (gap > 0) candidates.push(maximumOf(left, axis) + gap);
   }
   if (right) {
-    const next = after(right, row, axis);
-    const gap = next ? minOf(next, axis) - maxOf(right, axis) : 0;
-    if (gap > 0) out.push(minOf(right, axis) - gap - size);
+    const next = nearestAfter(right, neighbours, axis);
+    const gap = next ? minimumOf(next, axis) - maximumOf(right, axis) : 0;
+    if (gap > 0) candidates.push(minimumOf(right, axis) - gap - size);
   }
-  return out;
+  return candidates;
 }
 
-/** Segment across the gap between `a` and `b` (a before b), in the middle of their overlap. */
-const segment = (a: Box, b: Box, axis: 'x' | 'y') => {
-  const c = other(axis);
-  const lo = Math.max(minOf(a, c), minOf(b, c));
-  const hi = Math.min(maxOf(a, c), maxOf(b, c));
-  return { from: maxOf(a, axis), to: minOf(b, axis), at: (lo + hi) / 2 };
+/** Segment across the gap between `first` and `second` (first before second), in the middle of their overlap. */
+const gapSegment = (first: Box, second: Box, axis: SnapAxis): SpacingSegment => {
+  const crossAxis = crossAxisOf(axis);
+  const low = Math.max(minimumOf(first, crossAxis), minimumOf(second, crossAxis));
+  const high = Math.min(maximumOf(first, crossAxis), maximumOf(second, crossAxis));
+  return { from: maximumOf(first, axis), to: minimumOf(second, axis), at: (low + high) / 2 };
 };
 
 /** Equal gaps around the (snapped) box: chains of neighbours spaced like its own gaps. */
-function spacingGuides(box: Box, targets: readonly Box[], axis: 'x' | 'y'): SpacingGuide[] {
-  const row = [...rowOf(box, targets, axis), box];
-  const chain = (gap: number, dir: 'before' | 'after') => {
-    const segs = [];
-    let cur = box;
-    for (let i = 0; i < 64; i++) {
-      const nb = dir === 'before' ? before(cur, row, axis) : after(cur, row, axis);
-      if (!nb) break;
-      const g =
-        dir === 'before' ? minOf(cur, axis) - maxOf(nb, axis) : minOf(nb, axis) - maxOf(cur, axis);
-      if (Math.abs(g - gap) > GAP_EPS) break;
-      segs.push(dir === 'before' ? segment(nb, cur, axis) : segment(cur, nb, axis));
-      cur = nb;
+function spacingGuides(box: Box, targets: readonly Box[], axis: SnapAxis): SpacingGuide[] {
+  const neighbours = [...rowOf(box, targets, axis), box];
+  const chain = (gap: number, direction: 'before' | 'after'): SpacingSegment[] => {
+    const segments: SpacingSegment[] = [];
+    let current = box;
+    for (let link = 0; link < 64; link++) {
+      const before = direction === 'before';
+      const neighbour = before
+        ? nearestBefore(current, neighbours, axis)
+        : nearestAfter(current, neighbours, axis);
+      if (!neighbour) break;
+      const gapSize = before
+        ? minimumOf(current, axis) - maximumOf(neighbour, axis)
+        : minimumOf(neighbour, axis) - maximumOf(current, axis);
+      if (Math.abs(gapSize - gap) > GAP_EPSILON) break;
+      segments.push(
+        before ? gapSegment(neighbour, current, axis) : gapSegment(current, neighbour, axis),
+      );
+      current = neighbour;
     }
-    return segs;
+    return segments;
   };
-  const left = before(box, row, axis);
-  const right = after(box, row, axis);
-  const gapL = left ? minOf(box, axis) - maxOf(left, axis) : -1;
-  const gapR = right ? minOf(right, axis) - maxOf(box, axis) : -1;
-  const out: SpacingGuide[] = [];
-  if (gapL > 0 && gapR > 0 && Math.abs(gapL - gapR) <= GAP_EPS) {
-    out.push({
-      axis,
-      distance: gapL,
-      segments: [...chain(gapL, 'before'), ...chain(gapR, 'after')],
-    });
-    return out;
+  const left = nearestBefore(box, neighbours, axis);
+  const right = nearestAfter(box, neighbours, axis);
+  const gapLeft = left ? minimumOf(box, axis) - maximumOf(left, axis) : -1;
+  const gapRight = right ? minimumOf(right, axis) - maximumOf(box, axis) : -1;
+  if (gapLeft > 0 && gapRight > 0 && Math.abs(gapLeft - gapRight) <= GAP_EPSILON) {
+    return [
+      {
+        axis,
+        distance: gapLeft,
+        segments: [...chain(gapLeft, 'before'), ...chain(gapRight, 'after')],
+      },
+    ];
   }
-  for (const [gap, dir] of [
-    [gapL, 'before'],
-    [gapR, 'after'],
+  const guides: SpacingGuide[] = [];
+  for (const [gap, direction] of [
+    [gapLeft, 'before'],
+    [gapRight, 'after'],
   ] as const) {
     if (gap <= 0) continue;
-    const segs = chain(gap, dir);
-    if (segs.length >= 2) out.push({ axis, distance: gap, segments: segs });
+    const segments = chain(gap, direction);
+    if (segments.length >= 2) guides.push({ axis, distance: gap, segments });
   }
-  return out;
+  return guides;
 }
+
+interface AxisSnap {
+  delta: number;
+  /** Snapped to an element line (not the grid): guides are drawn. */
+  matched: boolean;
+}
+
+const NO_SNAP: AxisSnap = { delta: 0, matched: false };
 
 /** Best correction along one axis: to an element line within the threshold, else the grid. */
 function snapAxis(
   moving: Box,
   targets: readonly Box[],
-  axis: 'x' | 'y',
-  edges: readonly Edge[],
+  axis: SnapAxis,
+  edges: readonly SnapEdge[],
   threshold: number,
   grid: number,
   spacing: boolean,
-): { delta: number; matched: boolean } {
+): AxisSnap {
   let best = Infinity;
+  const consider = (distance: number) => {
+    if (Math.abs(distance) <= threshold && Math.abs(distance) < Math.abs(best)) best = distance;
+  };
   if (spacing) {
-    const lo = lineOf(moving, axis, 'min');
-    for (const pos of spacingCandidates(moving, targets, axis)) {
-      const d = pos - lo;
-      if (Math.abs(d) <= threshold && Math.abs(d) < Math.abs(best)) best = d;
-    }
+    const low = lineOf(moving, axis, 'min');
+    for (const position of spacingCandidates(moving, targets, axis)) consider(position - low);
   }
   for (const edge of edges) {
-    const m = lineOf(moving, axis, edge);
-    for (const t of targets) {
-      for (const te of ALL_EDGES) {
-        const d = lineOf(t, axis, te) - m;
-        if (Math.abs(d) <= threshold && Math.abs(d) < Math.abs(best)) best = d;
-      }
-    }
+    const movingLine = lineOf(moving, axis, edge);
+    for (const target of targets)
+      for (const targetEdge of ALL_EDGES) consider(lineOf(target, axis, targetEdge) - movingLine);
   }
   if (best !== Infinity) return { delta: best, matched: true };
   if (grid > 0) {
     // The first moving edge (the box's corner for a move, the dragged side for a resize).
-    const m = lineOf(moving, axis, edges[0]!);
-    return { delta: Math.round(m / grid) * grid - m, matched: false };
+    const movingLine = lineOf(moving, axis, edges[0]!);
+    return { delta: Math.round(movingLine / grid) * grid - movingLine, matched: false };
   }
-  return { delta: 0, matched: false };
+  return NO_SNAP;
 }
 
 /** Guide lines for the element lines the (already snapped) box now lines up with. */
 function guidesFor(
   box: Box,
   targets: readonly Box[],
-  axis: 'x' | 'y',
-  edges: readonly Edge[],
+  axis: SnapAxis,
+  edges: readonly SnapEdge[],
 ): SnapGuide[] {
-  const cross = axis === 'x' ? 'y' : 'x';
+  const crossAxis = crossAxisOf(axis);
   const byLine = new Map<number, SnapGuide>();
   for (const edge of edges) {
     const at = lineOf(box, axis, edge);
-    for (const t of targets) {
-      if (!ALL_EDGES.some((te) => Math.abs(lineOf(t, axis, te) - at) < EPS)) continue;
+    for (const target of targets) {
+      const aligned = ALL_EDGES.some(
+        (targetEdge) => Math.abs(lineOf(target, axis, targetEdge) - at) < EPSILON,
+      );
+      if (!aligned) continue;
       const key = Math.round(at * 1e4) / 1e4;
-      let g = byLine.get(key);
-      if (!g) {
-        const lo = lineOf(box, cross, 'min');
-        const hi = lineOf(box, cross, 'max');
-        g = { axis, at, from: lo, to: hi, marks: [lo, hi] };
-        byLine.set(key, g);
+      let guide = byLine.get(key);
+      if (!guide) {
+        const low = lineOf(box, crossAxis, 'min');
+        const high = lineOf(box, crossAxis, 'max');
+        guide = { axis, at, from: low, to: high, marks: [low, high] };
+        byLine.set(key, guide);
       }
-      const lo = lineOf(t, cross, 'min');
-      const hi = lineOf(t, cross, 'max');
-      g.from = Math.min(g.from, lo);
-      g.to = Math.max(g.to, hi);
-      g.marks.push(lo, hi);
+      const low = lineOf(target, crossAxis, 'min');
+      const high = lineOf(target, crossAxis, 'max');
+      guide.from = Math.min(guide.from, low);
+      guide.to = Math.max(guide.to, high);
+      guide.marks.push(low, high);
     }
   }
   return [...byLine.values()];
+}
+
+/** The box after the corrections: a move shifts it, a resize moves only the dragged edges. */
+function snappedBox(
+  moving: Box,
+  x: AxisSnap,
+  y: AxisSnap,
+  edges: SnapOptions['edges'] | undefined,
+): Box {
+  if (!edges) {
+    return {
+      minX: moving.minX + x.delta,
+      maxX: moving.maxX + x.delta,
+      minY: moving.minY + y.delta,
+      maxY: moving.maxY + y.delta,
+    };
+  }
+  const moved = (value: number, delta: number, axisEdges: readonly SnapEdge[], edge: SnapEdge) =>
+    axisEdges.includes(edge) ? value + delta : value;
+  return {
+    minX: moved(moving.minX, x.delta, edges.x, 'min'),
+    maxX: moved(moving.maxX, x.delta, edges.x, 'max'),
+    minY: moved(moving.minY, y.delta, edges.y, 'min'),
+    maxY: moved(moving.maxY, y.delta, edges.y, 'max'),
+  };
 }
 
 /**
@@ -263,36 +316,22 @@ function guidesFor(
  */
 export function snapBox(moving: Box, targets: readonly Box[], options: SnapOptions): SnapResult {
   const grid = options.grid ?? 0;
-  const ex = options.edges?.x ?? ALL_EDGES;
-  const ey = options.edges?.y ?? ALL_EDGES;
-  const x =
-    options.lockX || ex.length === 0
-      ? { delta: 0, matched: false }
-      : snapAxis(moving, targets, 'x', ex, options.threshold, grid, !options.edges);
-  const y =
-    options.lockY || ey.length === 0
-      ? { delta: 0, matched: false }
-      : snapAxis(moving, targets, 'y', ey, options.threshold, grid, !options.edges);
-  // Guides are computed on the box after both corrections, so their extents are final.
-  const shift = (lo: number, hi: number, d: number, edges: readonly Edge[], edge: Edge) =>
-    edges.includes(edge) ? (edge === 'min' ? lo + d : hi + d) : edge === 'min' ? lo : hi;
   const resize = !!options.edges;
-  const snapped: Box = resize
-    ? {
-        minX: shift(moving.minX, moving.maxX, x.delta, ex, 'min'),
-        maxX: shift(moving.minX, moving.maxX, x.delta, ex, 'max'),
-        minY: shift(moving.minY, moving.maxY, y.delta, ey, 'min'),
-        maxY: shift(moving.minY, moving.maxY, y.delta, ey, 'max'),
-      }
-    : {
-        minX: moving.minX + x.delta,
-        maxX: moving.maxX + x.delta,
-        minY: moving.minY + y.delta,
-        maxY: moving.maxY + y.delta,
-      };
+  const edgesX = options.edges?.x ?? ALL_EDGES;
+  const edgesY = options.edges?.y ?? ALL_EDGES;
+  const x =
+    options.lockX || edgesX.length === 0
+      ? NO_SNAP
+      : snapAxis(moving, targets, 'x', edgesX, options.threshold, grid, !resize);
+  const y =
+    options.lockY || edgesY.length === 0
+      ? NO_SNAP
+      : snapAxis(moving, targets, 'y', edgesY, options.threshold, grid, !resize);
+  // Guides are computed on the box after both corrections, so their extents are final.
+  const snapped = snappedBox(moving, x, y, options.edges);
   const guides = [
-    ...(x.matched ? guidesFor(snapped, targets, 'x', ex) : []),
-    ...(y.matched ? guidesFor(snapped, targets, 'y', ey) : []),
+    ...(x.matched ? guidesFor(snapped, targets, 'x', edgesX) : []),
+    ...(y.matched ? guidesFor(snapped, targets, 'y', edgesY) : []),
   ];
   const spacing = resize
     ? []
@@ -300,5 +339,5 @@ export function snapBox(moving: Box, targets: readonly Box[], options: SnapOptio
         ...(x.matched ? spacingGuides(snapped, targets, 'x') : []),
         ...(y.matched ? spacingGuides(snapped, targets, 'y') : []),
       ];
-  return { dx: x.delta, dy: y.delta, guides, spacing };
+  return { deltaX: x.delta, deltaY: y.delta, guides, spacing };
 }

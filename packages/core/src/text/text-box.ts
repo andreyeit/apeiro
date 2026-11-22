@@ -1,13 +1,17 @@
 import type { ElementPatch, ShapeElement, ShapeKind } from '../elements/element';
+import { rotateVector } from '../geometry/vector';
 import { fontIndex } from './fonts';
 import { layoutText, type FontMeasurer } from './layout';
-import { textBlock, type TextBlock, type TextSizing } from './text-block';
+import { normalizeRuns } from './rich-text';
+import { LINE_HEIGHT, textBlock, type TextBlock, type TextSizing } from './text-block';
 
 /** Color of new text (the design's color/foreground). */
 const TEXT_COLOR = 0x18181bff;
 
-/** Font size of new free text boxes. */
-export const DEFAULT_TEXT_SIZE = 24;
+/** Font size of new free text boxes and of new shapes' labels. */
+export const DEFAULT_TEXT_SIZE = 16;
+/** Text of a new sticky: large, as in Miro; longer text shrinks to fit the note. */
+export const STICKY_TEXT_SIZE = 28;
 export const MIN_FONT_SIZE = 1;
 export const MAX_FONT_SIZE = 1000;
 /** Font sizes offered in pickers (Figma/Miro-like steps). */
@@ -25,8 +29,11 @@ const UNBOUNDED = 1e7;
  * `auto-width` grows sideways and never wraps, `auto-height` keeps the width and grows
  * down, `fixed` never changes. Other shapes keep their size (stickies shrink the font).
  */
-export function textSizing(el: ShapeElement): TextSizing {
-  return el.type === 'text' ? (el.text?.sizing ?? 'fixed') : 'fixed';
+export function textSizing(
+  element: ShapeElement,
+  block: TextBlock | undefined = element.text,
+): TextSizing {
+  return element.type === 'text' ? (block?.sizing ?? 'fixed') : 'fixed';
 }
 
 /** Text of a shape that has none yet, styled for its kind (what typing into it starts with). */
@@ -39,13 +46,13 @@ export function defaultTextBlock(type: ShapeKind): TextBlock {
       verticalAlign: 'top',
       sizing: 'auto-width',
     });
-  // Like the design's Sticky and Canvas Block: 14px text in color/foreground; a sticky is
-  // written from its top-left corner, a shape is labelled in the middle.
+  // A shape is labelled in the middle, as big as free text. A sticky, as in Miro, has an
+  // automatic size: a few words fill the note, longer text gets smaller (autoFit + autoGrow).
   return textBlock('', {
-    fontSize: 14,
+    fontSize: type === 'sticky' ? STICKY_TEXT_SIZE : DEFAULT_TEXT_SIZE,
     color: TEXT_COLOR,
     autoFit: true,
-    ...(type === 'sticky' ? { align: 'left', verticalAlign: 'top' } : {}),
+    ...(type === 'sticky' ? { autoGrow: true } : {}),
   });
 }
 
@@ -58,14 +65,13 @@ export function createTextElement(
   block: TextBlock = defaultTextBlock('text'),
 ): ShapeElement {
   const text: TextBlock = { ...block, sizing: width === undefined ? 'auto-width' : 'auto-height' };
-  const h = text.fontSize * 1.3;
   return {
     id,
     type: 'text',
     x: at.x,
     y: at.y,
-    w: width ?? text.fontSize * MIN_WIDTH_EM,
-    h,
+    width: width ?? text.fontSize * MIN_WIDTH_EM,
+    height: text.fontSize * LINE_HEIGHT,
     rotation: 0,
     z,
     fill: 0xffffff00,
@@ -78,19 +84,19 @@ export function createTextElement(
 
 /** Size a text element's box should have for its text (border inset included). */
 export function measureTextBox(
-  el: ShapeElement,
+  element: ShapeElement,
   measurer: FontMeasurer,
-  block: TextBlock | undefined = el.text,
-): { w: number; h: number } | null {
-  const sizing = el.type === 'text' ? (block?.sizing ?? 'fixed') : 'fixed';
+  block: TextBlock | undefined = element.text,
+): { width: number; height: number } | null {
+  const sizing = textSizing(element, block);
   if (!block || sizing === 'fixed') return null;
-  const inset = el.strokeWidth; // half a border on each side, as in `textArea`
-  const width = sizing === 'auto-width' ? UNBOUNDED : Math.max(0, el.w - inset);
+  const inset = element.strokeWidth; // half a border on each side, as in `textArea`
+  const width = sizing === 'auto-width' ? UNBOUNDED : Math.max(0, element.width - inset);
   const layout = layoutText({ ...block, autoFit: false }, width, UNBOUNDED, measurer);
-  const minW = block.fontSize * MIN_WIDTH_EM;
+  const minimumWidth = block.fontSize * MIN_WIDTH_EM;
   return {
-    w: sizing === 'auto-width' ? Math.max(minW, layout.width) + inset : el.w,
-    h: layout.height + inset,
+    width: sizing === 'auto-width' ? Math.max(minimumWidth, layout.width) + inset : element.width,
+    height: layout.height + inset,
   };
 }
 
@@ -100,25 +106,30 @@ export function measureTextBox(
  * aligned text grows to the right, centered both ways, bottom aligned upward; rotation kept.
  */
 export function fitTextPatch(
-  el: ShapeElement,
+  element: ShapeElement,
   measurer: FontMeasurer,
-  block: TextBlock | undefined = el.text,
+  block: TextBlock | undefined = element.text,
 ): ElementPatch | null {
-  const size = measureTextBox(el, measurer, block);
-  if (!size) return null;
-  const { w, h } = size;
-  if (Math.abs(w - el.w) < 1e-3 && Math.abs(h - el.h) < 1e-3) return null;
-  const ax = block!.align === 'left' ? 0 : block!.align === 'right' ? 1 : 0.5;
-  const ay = block!.verticalAlign === 'top' ? 0 : block!.verticalAlign === 'bottom' ? 1 : 0.5;
+  const size = block && measureTextBox(element, measurer, block);
+  if (!block || !size) return null;
+  const { width: boxWidth, height: boxHeight } = size;
+  if (Math.abs(boxWidth - element.width) < 1e-3 && Math.abs(boxHeight - element.height) < 1e-3)
+    return null;
+  const alignX = block.align === 'left' ? 0 : block.align === 'right' ? 1 : 0.5;
+  const alignY = block.verticalAlign === 'top' ? 0 : block.verticalAlign === 'bottom' ? 1 : 0.5;
   // The anchor point (in the rotated box) stays where it is.
-  const c = Math.cos(el.rotation);
-  const s = Math.sin(el.rotation);
-  const rot = (x: number, y: number) => ({ x: x * c - y * s, y: x * s + y * c });
-  const before = rot((ax - 0.5) * el.w, (ay - 0.5) * el.h);
-  const after = rot((ax - 0.5) * w, (ay - 0.5) * h);
-  const cx = el.x + el.w / 2 + before.x - after.x;
-  const cy = el.y + el.h / 2 + before.y - after.y;
-  return { x: cx - w / 2, y: cy - h / 2, w, h };
+  const anchorAt = (width: number, height: number) =>
+    rotateVector({ x: (alignX - 0.5) * width, y: (alignY - 0.5) * height }, element.rotation);
+  const before = anchorAt(element.width, element.height);
+  const after = anchorAt(boxWidth, boxHeight);
+  const centerX = element.x + element.width / 2 + before.x - after.x;
+  const centerY = element.y + element.height / 2 + before.y - after.y;
+  return {
+    x: centerX - boxWidth / 2,
+    y: centerY - boxHeight / 2,
+    width: boxWidth,
+    height: boxHeight,
+  };
 }
 
 /**
@@ -127,13 +138,13 @@ export function fitTextPatch(
  * patch (sizing and the fitted box), or null for other elements.
  */
 export function hugTextPatch(
-  el: ShapeElement,
+  element: ShapeElement,
   measurer: FontMeasurer,
   sizing: Exclude<TextSizing, 'fixed'>,
 ): ElementPatch | null {
-  if (el.type !== 'text') return null;
-  const block: TextBlock = { ...(el.text ?? textBlock('')), sizing };
-  const fit = fitTextPatch({ ...el, text: block }, measurer, block);
+  if (element.type !== 'text') return null;
+  const block: TextBlock = { ...(element.text ?? textBlock('')), sizing };
+  const fit = fitTextPatch({ ...element, text: block }, measurer, block);
   return { text: block, ...fit };
 }
 
@@ -143,21 +154,21 @@ export function clampFontSize(size: number): number {
   return Math.round(Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, size)) * 10) / 10;
 }
 
-/** Next preset size up (`dir` 1) or down (-1) from `size`, for "A+ / A−" buttons. */
-export function stepFontSize(size: number, dir: 1 | -1): number {
-  if (dir > 0) {
-    const next = FONT_SIZES.find((s) => s > size + 1e-6);
+/** Next preset size up (`direction` 1) or down (-1) from `size`, for "A+ / A−" buttons. */
+export function stepFontSize(size: number, direction: 1 | -1): number {
+  if (direction > 0) {
+    const next = FONT_SIZES.find((candidate) => candidate > size + 1e-6);
     return clampFontSize(next ?? size * 1.25);
   }
-  const prev = [...FONT_SIZES].reverse().find((s) => s < size - 1e-6);
-  return clampFontSize(prev ?? size / 1.25);
+  const previous = [...FONT_SIZES].reverse().find((candidate) => candidate < size - 1e-6);
+  return clampFontSize(previous ?? size / 1.25);
 }
 
 /** The whole text at one size: the block's, with every run's own size dropped. */
 export function withFontSize(block: TextBlock, size: number): TextBlock {
   const fontSize = clampFontSize(size);
-  const runs = block.runs.some((r) => r.size !== undefined)
-    ? block.runs.map(({ size: _drop, ...r }) => r)
+  const runs = block.runs.some((run) => run.size !== undefined)
+    ? normalizeRuns(block.runs.map(({ size: _size, ...run }) => run))
     : block.runs;
   return { ...block, fontSize, runs };
 }
@@ -166,19 +177,19 @@ export function withFontSize(block: TextBlock, size: number): TextBlock {
  * Steps the text's size up or down ("A+ / A−"): the block's size moves to the next preset
  * and every run's own size by the same ratio, so a bigger heading stays bigger.
  */
-export function stepTextSize(block: TextBlock, dir: 1 | -1, scale = 1): TextBlock {
-  const next = clampFontSize(stepFontSize(block.fontSize * scale, dir) / scale);
+export function stepTextSize(block: TextBlock, direction: 1 | -1, scale = 1): TextBlock {
+  const next = clampFontSize(stepFontSize(block.fontSize * scale, direction) / scale);
   const ratio = next / block.fontSize;
-  const runs = block.runs.map((r) =>
-    r.size === undefined ? r : { ...r, size: clampFontSize(r.size * ratio) },
+  const runs = block.runs.map((run) =>
+    run.size === undefined ? run : { ...run, size: clampFontSize(run.size * ratio) },
   );
   return { ...block, fontSize: next, runs };
 }
 
 /** The whole text in one font family (the default one is stored as no `font`). */
 export function withFont(block: TextBlock, id: string): TextBlock {
-  const runs = block.runs.some((r) => r.font !== undefined)
-    ? block.runs.map(({ font: _drop, ...r }) => r)
+  const runs = block.runs.some((run) => run.font !== undefined)
+    ? normalizeRuns(block.runs.map(({ font: _font, ...run }) => run))
     : block.runs;
   const next: TextBlock = { ...block, runs, font: id };
   if (fontIndex(id) === 0) delete next.font;
@@ -187,4 +198,6 @@ export function withFont(block: TextBlock, id: string): TextBlock {
 
 /** True if some run has its own size (the block's `fontSize` is not the only one). */
 export const hasMixedSizes = (block: TextBlock): boolean =>
-  block.runs.some((r) => r.size !== undefined && r.size !== block.fontSize && r.text !== '');
+  block.runs.some(
+    (run) => run.size !== undefined && run.size !== block.fontSize && run.text !== '',
+  );

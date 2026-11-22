@@ -4,11 +4,11 @@ import type {
   ConnectorElement,
   ConnectorEnd,
   Frame,
-  ResizeHandle,
   ShapeElement,
   Vec2,
 } from '@apeiro/core';
 import type { CustomTool, PlaceKind } from '../tools/tool-state';
+import type { ResizeStart } from './transform-gestures';
 
 /** Where a dragged element started: a shape's corner, or a connector's two ends. */
 export type DragOrigin =
@@ -27,9 +27,9 @@ export type Mode =
       definition: CustomTool;
       /** Elements the tool changed, as they were before it: restored on cancel. */
       before: Map<string, BoardElement | undefined>;
-      off: () => void;
+      unsubscribe: () => void;
     }
-  | { kind: 'pan'; last: Vec2; lastTime: number; vx: number; vy: number }
+  | { kind: 'pan'; last: Vec2; lastTime: number; velocityX: number; velocityY: number }
   | {
       kind: 'drag';
       start: Vec2;
@@ -61,8 +61,22 @@ export type Mode =
   | { kind: 'textbox'; down: Vec2; start: Vec2 }
   /** Sticky / shape tool: a click drops a default element, a drag draws its box. */
   | { kind: 'place'; shape: PlaceKind; down: Vec2; start: Vec2 }
-  /** Pen: the stroke being drawn (world points, before simplification). */
-  | { kind: 'ink'; id: string; points: Vec2[]; last: Vec2 }
+  /**
+   * Pen: the stroke being drawn (world points, before simplification). `drawn`: the
+   * stabilized pen tip and `pointer`: the real one (screen points); `last`: the last point
+   * added. The string between them shortens as the pointer slows down (`speed`).
+   */
+  | {
+      kind: 'ink';
+      id: string;
+      points: Vec2[];
+      last: Vec2;
+      drawn: Vec2;
+      pointer: Vec2;
+      /** Pointer speed (screen px per ms, smoothed) and when the pointer was last seen. */
+      speed: number;
+      time: number;
+    }
   /** Eraser: removes pen strokes the pointer passes over. */
   | { kind: 'erase'; last: Vec2 }
   | { kind: 'volume'; id: string; original: number | undefined }
@@ -90,21 +104,7 @@ export type Mode =
       startRadius: number;
       startAlong: number;
     }
-  | {
-      kind: 'resize';
-      handle: ResizeHandle;
-      /** The selection's frame and the elements when the drag started. */
-      frame: Frame;
-      originals: BoardElement[];
-      /** Pointer at the start, frame-local. */
-      start: Vec2;
-      /** Corners keep the aspect ratio by default (images, like in Miro); Shift inverts it. */
-      lockAspect: boolean;
-      /** Corners scale the font of text boxes (Miro); sides rewrap it. */
-      scaleText: boolean;
-      /** Boxes of the other elements, for snapping the dragged sides. */
-      targets: Box[];
-    }
+  | ({ kind: 'resize' } & ResizeStart)
   | {
       kind: 'rotate';
       center: Vec2;
@@ -132,7 +132,7 @@ const MOVING_MODES: ReadonlySet<ModeKind> = new Set([
 ]);
 
 /** Gestures that follow the pointer to the viewport edge, so the board auto-pans for them. */
-export const isMovingMode = (m: Mode): boolean => MOVING_MODES.has(m.kind);
+export const isMovingMode = (mode: Mode): boolean => MOVING_MODES.has(mode.kind);
 
 /** Gestures after which a one-shot tool returns to select. */
 const COMPLETING_MODES: ReadonlySet<ModeKind> = new Set(['custom', 'ink', 'erase', 'connect']);

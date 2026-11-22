@@ -1,11 +1,15 @@
 import {
-  MAX_LIST_INDENT,
+  clampListIndent,
   paragraphAt,
   paragraphCount,
+  type ListKind,
   type ParagraphStyle,
   type TextBlock,
   type TextRun,
 } from './text-block';
+
+// Editing rich text: styling ranges of runs, links, and the paragraph styles (lists) that
+// follow the text through edits. Offsets are UTF-16 code units, the same as DOM selections.
 
 /** Style attributes of a run (everything except the text). */
 export type TextStyle = Omit<TextRun, 'text'>;
@@ -24,42 +28,41 @@ const STYLE_KEYS: StyleKey[] = [
 /** On/off attributes, toggled by B/I/U/S. */
 export type BooleanStyle = 'bold' | 'italic' | 'underline' | 'strike';
 
+/** `false` and absent mean the same. */
+const valueOf = (style: TextStyle, key: StyleKey) =>
+  style[key] === false ? undefined : style[key];
+
 function styleOf(run: TextRun): TextStyle {
-  const s: TextStyle = {};
-  for (const k of STYLE_KEYS) {
-    const v = run[k];
-    if (v !== undefined && v !== false) (s as Record<string, unknown>)[k] = v;
+  const style: TextStyle = {};
+  for (const key of STYLE_KEYS) {
+    const value = valueOf(run, key);
+    if (value !== undefined) (style as Record<string, unknown>)[key] = value;
   }
-  return s;
+  return style;
 }
 
-export function sameStyle(a: TextStyle, b: TextStyle): boolean {
-  for (const k of STYLE_KEYS) {
-    const va = a[k] === false ? undefined : a[k];
-    const vb = b[k] === false ? undefined : b[k];
-    if (va !== vb) return false;
-  }
-  return true;
+export function sameStyle(first: TextStyle, second: TextStyle): boolean {
+  return STYLE_KEYS.every((key) => valueOf(first, key) === valueOf(second, key));
 }
 
 export const runsLength = (runs: readonly TextRun[]): number =>
-  runs.reduce((n, r) => n + r.text.length, 0);
+  runs.reduce((total, run) => total + run.text.length, 0);
 
 /** Drops empty runs and merges neighbours with equal style. Always returns at least one run. */
 export function normalizeRuns(runs: readonly TextRun[]): TextRun[] {
-  const out: TextRun[] = [];
+  const normalized: TextRun[] = [];
   for (const run of runs) {
     if (run.text.length === 0) continue;
-    const prev = out[out.length - 1];
-    if (prev && sameStyle(prev, run)) prev.text += run.text;
-    else out.push({ ...styleOf(run), text: run.text });
+    const previous = normalized[normalized.length - 1];
+    if (previous && sameStyle(previous, run)) previous.text += run.text;
+    else normalized.push({ ...styleOf(run), text: run.text });
   }
-  if (out.length === 0) out.push({ ...(runs[0] ? styleOf(runs[0]) : {}), text: '' });
-  return out;
+  if (normalized.length === 0) normalized.push({ ...(runs[0] ? styleOf(runs[0]) : {}), text: '' });
+  return normalized;
 }
 
 /**
- * Applies `patch` to the range [from, to) (UTF-16 offsets, same as DOM selections).
+ * Applies `patch` to the range [from, to).
  * `undefined`/`false` values remove the attribute.
  */
 export function applyStyle(
@@ -69,29 +72,92 @@ export function applyStyle(
   patch: TextStyle,
 ): TextRun[] {
   if (to <= from) return normalizeRuns(runs);
-  const out: TextRun[] = [];
-  let pos = 0;
+  const styled: TextRun[] = [];
+  let position = 0;
   for (const run of runs) {
-    const start = pos;
-    const end = pos + run.text.length;
-    pos = end;
-    const a = Math.max(from, start);
-    const b = Math.min(to, end);
-    if (a >= b) {
-      out.push({ ...run });
+    const start = position;
+    const end = position + run.text.length;
+    position = end;
+    const overlapStart = Math.max(from, start);
+    const overlapEnd = Math.min(to, end);
+    if (overlapStart >= overlapEnd) {
+      styled.push({ ...run });
       continue;
     }
-    if (a > start) out.push({ ...run, text: run.text.slice(0, a - start) });
-    const styled: TextRun = { ...run, text: run.text.slice(a - start, b - start) };
-    for (const k of Object.keys(patch) as StyleKey[]) {
-      const v = patch[k];
-      if (v === undefined || v === false) delete styled[k];
-      else (styled as unknown as Record<string, unknown>)[k] = v;
+    if (overlapStart > start)
+      styled.push({ ...run, text: run.text.slice(0, overlapStart - start) });
+    const piece: TextRun = {
+      ...run,
+      text: run.text.slice(overlapStart - start, overlapEnd - start),
+    };
+    for (const key of Object.keys(patch) as StyleKey[]) {
+      const value = patch[key];
+      if (value === undefined || value === false) delete piece[key];
+      else (piece as unknown as Record<string, unknown>)[key] = value;
     }
-    out.push(styled);
-    if (b < end) out.push({ ...run, text: run.text.slice(b - start) });
+    styled.push(piece);
+    if (overlapEnd < end) styled.push({ ...run, text: run.text.slice(overlapEnd - start) });
   }
-  return normalizeRuns(out);
+  return normalizeRuns(styled);
+}
+
+/**
+ * Replaces [from, to) with `text`, styled like the run it lands in plus `style` (e.g. what
+ * the user toggled with a collapsed caret, or a link).
+ */
+export function replaceText(
+  runs: readonly TextRun[],
+  from: number,
+  to: number,
+  text: string,
+  style: TextStyle | null = null,
+): TextRun[] {
+  const replaced: TextRun[] = [];
+  let position = 0;
+  let inserted = false;
+  for (const run of runs) {
+    const start = position;
+    const end = position + run.text.length;
+    position = end;
+    if (end <= from || start >= to) {
+      replaced.push(run);
+      if (!inserted && end === from) {
+        replaced.push({ ...run, ...style, text });
+        inserted = true;
+      }
+      continue;
+    }
+    replaced.push({ ...run, text: run.text.slice(0, Math.max(0, from - start)) });
+    if (!inserted) {
+      replaced.push({ ...run, ...style, text });
+      inserted = true;
+    }
+    replaced.push({ ...run, text: run.text.slice(Math.max(0, to - start)) });
+  }
+  if (!inserted) replaced.unshift({ ...style, text });
+  return normalizeRuns(replaced);
+}
+
+/** The run a collapsed caret at `offset` types into: the one with the character before it. */
+function runBeforeCaret(runs: readonly TextRun[], offset: number): TextRun | undefined {
+  let position = 0;
+  let found: TextRun | undefined = runs[0];
+  for (const run of runs) {
+    if (position < offset) found = run;
+    position += run.text.length;
+  }
+  return found;
+}
+
+/** Runs with text that overlap [from, to). */
+function* runsIn(runs: readonly TextRun[], from: number, to: number): Generator<TextRun> {
+  let position = 0;
+  for (const run of runs) {
+    const start = position;
+    position += run.text.length;
+    if (position <= from || start >= to || run.text.length === 0) continue;
+    yield run;
+  }
 }
 
 /**
@@ -104,21 +170,9 @@ export function hasStyle(
   to: number,
   key: BooleanStyle,
 ): boolean {
-  if (to <= from) {
-    let pos = 0;
-    let found: TextRun | undefined = runs[0];
-    for (const run of runs) {
-      if (pos < from) found = run;
-      pos += run.text.length;
-    }
-    return !!found?.[key];
-  }
-  let pos = 0;
+  if (to <= from) return !!runBeforeCaret(runs, from)?.[key];
   let any = false;
-  for (const run of runs) {
-    const start = pos;
-    pos += run.text.length;
-    if (pos <= from || start >= to || run.text.length === 0) continue;
+  for (const run of runsIn(runs, from, to)) {
     any = true;
     if (!run[key]) return false;
   }
@@ -148,22 +202,10 @@ export function commonStyle<K extends StyleKey>(
   to: number,
   key: K,
 ): TextRun[K] | typeof MIXED {
-  if (to <= from) {
-    let pos = 0;
-    let found: TextRun | undefined = runs[0];
-    for (const run of runs) {
-      if (pos < from) found = run;
-      pos += run.text.length;
-    }
-    return found?.[key];
-  }
-  let pos = 0;
+  if (to <= from) return runBeforeCaret(runs, from)?.[key];
   let seen = false;
   let value: TextRun[K] | undefined;
-  for (const run of runs) {
-    const start = pos;
-    pos += run.text.length;
-    if (pos <= from || start >= to || run.text.length === 0) continue;
+  for (const run of runsIn(runs, from, to)) {
     if (!seen) {
       seen = true;
       value = run[key];
@@ -177,21 +219,21 @@ export function linkAt(
   runs: readonly TextRun[],
   offset: number,
 ): { from: number; to: number; href: string } | null {
-  let pos = 0;
+  let position = 0;
   const spans: Array<{ from: number; to: number; href: string | undefined }> = [];
   for (const run of runs) {
-    spans.push({ from: pos, to: pos + run.text.length, href: run.link });
-    pos += run.text.length;
+    spans.push({ from: position, to: position + run.text.length, href: run.link });
+    position += run.text.length;
   }
   // Inside a link, or right after its last character (caret at its end).
-  const i = spans.findIndex((s) => s.href && offset > s.from && offset <= s.to);
-  if (i < 0) return null;
-  const href = spans[i]!.href!;
-  let a = i;
-  let b = i;
-  while (a > 0 && spans[a - 1]!.href === href) a--;
-  while (b + 1 < spans.length && spans[b + 1]!.href === href) b++;
-  return { from: spans[a]!.from, to: spans[b]!.to, href };
+  const index = spans.findIndex((span) => span.href && offset > span.from && offset <= span.to);
+  if (index < 0) return null;
+  const href = spans[index]!.href!;
+  let first = index;
+  let last = index;
+  while (first > 0 && spans[first - 1]!.href === href) first--;
+  while (last + 1 < spans.length && spans[last + 1]!.href === href) last++;
+  return { from: spans[first]!.from, to: spans[last]!.to, href };
 }
 
 const LINK_SCHEMES = /^(https?:|mailto:)/i;
@@ -212,13 +254,13 @@ export function isAllowedLink(href: string): boolean {
  * `mailto:` to e-mail addresses. Null if it isn't a usable link.
  */
 export function normalizeLink(input: string): string | null {
-  const s = input.trim();
-  if (s === '' || /\s/.test(s)) return null;
-  let href = s;
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(s)) {
-    if (/^[^@/]+@[^@/]+\.[^@/]+$/.test(s)) href = `mailto:${s}`;
-    else if (/^[^/]+\.[a-z]{2,}([/?#:].*)?$/i.test(s) || s.startsWith('//'))
-      href = `https://${s.replace(/^\/\//, '')}`;
+  const trimmed = input.trim();
+  if (trimmed === '' || /\s/.test(trimmed)) return null;
+  let href = trimmed;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) {
+    if (/^[^@/]+@[^@/]+\.[^@/]+$/.test(trimmed)) href = `mailto:${trimmed}`;
+    else if (/^[^/]+\.[a-z]{2,}([/?#:].*)?$/i.test(trimmed) || trimmed.startsWith('//'))
+      href = `https://${trimmed.replace(/^\/\//, '')}`;
     else return null;
   }
   return isAllowedLink(href) ? href : null;
@@ -226,7 +268,7 @@ export function normalizeLink(input: string): string | null {
 
 // --- Paragraphs (lists) ------------------------------------------------------
 
-const isPlain = (p: ParagraphStyle | undefined) => !p || (!p.list && !p.indent);
+const isPlain = (style: ParagraphStyle | undefined) => !style || (!style.list && !style.indent);
 
 /** Paragraph styles trimmed to `count` paragraphs; undefined when all are plain. */
 export function normalizeParagraphs(
@@ -234,17 +276,28 @@ export function normalizeParagraphs(
   count: number,
 ): ParagraphStyle[] | undefined {
   if (!paragraphs) return undefined;
-  const out: ParagraphStyle[] = [];
-  for (let i = 0; i < count; i++) {
-    const p = paragraphs[i];
-    if (isPlain(p) || !p!.list) out.push({});
-    else {
-      const indent = Math.max(0, Math.min(MAX_LIST_INDENT, Math.floor(p!.indent ?? 0)));
-      out.push(indent > 0 ? { list: p!.list, indent } : { list: p!.list });
+  const normalized: ParagraphStyle[] = [];
+  for (let index = 0; index < count; index++) {
+    const style = paragraphs[index];
+    if (!style?.list) {
+      normalized.push({});
+      continue;
     }
+    const indent = clampListIndent(style.indent);
+    normalized.push(indent > 0 ? { list: style.list, indent } : { list: style.list });
   }
-  while (out.length > 0 && isPlain(out[out.length - 1])) out.pop();
-  return out.length > 0 ? out : undefined;
+  while (normalized.length > 0 && isPlain(normalized[normalized.length - 1])) normalized.pop();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+/** `block` with these paragraph styles (the field is dropped when all are plain). */
+export function withParagraphs(
+  block: TextBlock,
+  paragraphs: ParagraphStyle[] | undefined,
+): TextBlock {
+  const next: TextBlock = { ...block, paragraphs };
+  if (!paragraphs) delete next.paragraphs;
+  return next;
 }
 
 /**
@@ -265,12 +318,28 @@ export function remapParagraphs(
   const removed = paragraphAt(runs, to) - first;
   const added = paragraphCount([{ text: inserted }]) - 1;
   const style = paragraphs[first] ?? {};
-  const out = [
-    ...Array.from({ length: first }, (_, i) => paragraphs[i] ?? {}),
+  const remapped = [
+    ...Array.from({ length: first }, (_, index) => paragraphs[index] ?? {}),
     ...Array.from({ length: added + 1 }, () => ({ ...style })),
     ...paragraphs.slice(first + removed + 1),
   ];
-  return normalizeParagraphs(out, paragraphCount(runs) - removed + added);
+  return normalizeParagraphs(remapped, paragraphCount(runs) - removed + added);
+}
+
+/**
+ * The block with [from, to) replaced by `text` (see `replaceText`), its paragraph styles
+ * following the edit (see `remapParagraphs`).
+ */
+export function replaceBlockText(
+  block: TextBlock,
+  from: number,
+  to: number,
+  text: string,
+  style: TextStyle | null = null,
+): TextBlock {
+  const runs = replaceText(block.runs, from, to, text, style);
+  const paragraphs = remapParagraphs(block.runs, block.paragraphs, from, to, text);
+  return withParagraphs({ ...block, runs }, paragraphs);
 }
 
 /** Paragraph indices [first, last] touched by the range [from, to]. */
@@ -290,15 +359,12 @@ export function updateParagraphs(
   change: (style: ParagraphStyle, index: number) => ParagraphStyle,
 ): TextBlock {
   const count = paragraphCount(block.runs);
-  const out: ParagraphStyle[] = [];
-  for (let i = 0; i < count; i++) {
-    const style = block.paragraphs?.[i] ?? {};
-    out.push(i >= first && i <= last ? change(style, i) : style);
+  const styles: ParagraphStyle[] = [];
+  for (let index = 0; index < count; index++) {
+    const style = block.paragraphs?.[index] ?? {};
+    styles.push(index >= first && index <= last ? change(style, index) : style);
   }
-  const paragraphs = normalizeParagraphs(out, count);
-  const next: TextBlock = { ...block, paragraphs };
-  if (!paragraphs) delete next.paragraphs;
-  return next;
+  return withParagraphs(block, normalizeParagraphs(styles, count));
 }
 
 /**
@@ -309,16 +375,22 @@ export function toggleList(
   block: TextBlock,
   first: number,
   last: number,
-  kind: 'bullet' | 'ordered',
+  kind: ListKind,
 ): TextBlock {
   let all = true;
-  for (let i = first; i <= last; i++) if (block.paragraphs?.[i]?.list !== kind) all = false;
-  return updateParagraphs(block, first, last, (s) => (all ? {} : { ...s, list: kind }));
+  for (let index = first; index <= last; index++)
+    if (block.paragraphs?.[index]?.list !== kind) all = false;
+  return updateParagraphs(block, first, last, (style) => (all ? {} : { ...style, list: kind }));
 }
 
 /** Moves list items first..last one level deeper (+1) or shallower (-1). */
-export function indentList(block: TextBlock, first: number, last: number, dir: 1 | -1): TextBlock {
-  return updateParagraphs(block, first, last, (s) =>
-    s.list ? { ...s, indent: Math.max(0, Math.min(MAX_LIST_INDENT, (s.indent ?? 0) + dir)) } : s,
+export function indentList(
+  block: TextBlock,
+  first: number,
+  last: number,
+  direction: 1 | -1,
+): TextBlock {
+  return updateParagraphs(block, first, last, (style) =>
+    style.list ? { ...style, indent: clampListIndent((style.indent ?? 0) + direction) } : style,
   );
 }

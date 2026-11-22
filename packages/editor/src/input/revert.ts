@@ -5,62 +5,69 @@ import type { InputContext } from './context';
  * Puts back what the current gesture changed (Esc, or the system took the pointer away).
  * Returns false when there is nothing to revert (idle, or a custom tool: see `controls.ts`).
  */
-export function revertGesture(c: InputContext): boolean {
-  const { mode: m, scene } = c;
-  switch (m.kind) {
+export function revertGesture(context: InputContext): boolean {
+  const { mode, scene } = context;
+  switch (mode.kind) {
     case 'connect':
-      if (m.original === null) scene.remove(m.id);
-      else scene.update(m.id, { [m.which]: m.original } as ElementPatch);
+      if (mode.original === null) scene.remove(mode.id);
+      else scene.update(mode.id, { [mode.which]: mode.original } as ElementPatch);
       return true;
     case 'drag':
       scene.transact(() => {
-        for (const [id, o] of m.origin) {
-          if (o.kind === 'shape') scene.update(id, { x: o.x, y: o.y });
-          else scene.update(id, { start: o.start, end: o.end });
+        for (const [id, origin] of mode.origin) {
+          if (origin.kind === 'shape') scene.update(id, { x: origin.x, y: origin.y });
+          else scene.update(id, { start: origin.start, end: origin.end });
         }
       });
       return true;
     case 'bend':
-      scene.update(m.id, m.original);
+      scene.update(mode.id, mode.original);
       return true;
     case 'volume':
-      scene.update(m.id, { volume: m.original });
+      scene.update(mode.id, { volume: mode.original });
       return true;
     case 'radius':
-      scene.update(m.id, { radius: m.original });
+      scene.update(mode.id, { radius: mode.original });
       return true;
     case 'count':
-      scene.update(m.id, { sides: m.original });
+      scene.update(mode.id, { sides: mode.original });
       return true;
     case 'crop': {
-      const o = m.original;
-      scene.update(o.id, { x: o.x, y: o.y, w: o.w, h: o.h, imageFit: o.imageFit, crop: o.crop });
+      const original = mode.original;
+      scene.update(original.id, {
+        x: original.x,
+        y: original.y,
+        width: original.width,
+        height: original.height,
+        imageFit: original.imageFit,
+        crop: original.crop,
+      });
       return true;
     }
     case 'resize':
     case 'rotate':
       scene.transact(() => {
-        for (const o of m.originals) {
-          if (isShape(o)) {
-            scene.update(o.id, {
-              x: o.x,
-              y: o.y,
-              w: o.w,
-              h: o.h,
-              rotation: o.rotation,
-              ...(o.text ? { text: o.text } : {}),
+        for (const original of mode.originals) {
+          if (isShape(original)) {
+            scene.update(original.id, {
+              x: original.x,
+              y: original.y,
+              width: original.width,
+              height: original.height,
+              rotation: original.rotation,
+              ...(original.text ? { text: original.text } : {}),
             });
           } else {
-            scene.update(o.id, { start: o.start, end: o.end });
+            scene.update(original.id, { start: original.start, end: original.end });
           }
         }
       });
       return true;
     case 'ink':
-      scene.remove(m.id);
+      scene.remove(mode.id);
       return true;
     case 'marquee':
-      c.overlay.selection = new Set(m.base);
+      context.overlay.selection = new Set(mode.base);
       return true;
     case 'seek':
     case 'textbox':

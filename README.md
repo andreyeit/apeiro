@@ -1,14 +1,13 @@
 # Apeiro
 
 An infinite canvas whiteboard for the web on WebGPU/WebGL2: sticky notes, shapes,
-connectors, text, pen, images, undo/redo. React bindings and collaboration over Yjs or
-Socket.IO.
+connectors, text, pen, images, undo/redo, with React bindings. Drawing and editing only: storing and sharing
+boards is up to you (`onChange` gives every change).
 
 ## Install
 
 ```sh
 npm install apeiro
-npm install yjs y-protocols   # only for collaboration
 ```
 
 ## Quick start
@@ -35,7 +34,7 @@ import { Board, useBoard, useHistory, useTool } from 'apeiro/react';
 
 export function Whiteboard({ saved }) {
   return (
-    <Board style={{ height: '100vh' }} initialElements={saved} onChange={save}>
+    <Board style={{ height: '100vh' }} config={{ initialElements: saved, onChange: save }}>
       <Toolbar />
     </Board>
   );
@@ -66,15 +65,35 @@ Children of `<Board>` are drawn over the canvas.
 - `<BoardProvider>` — for UI outside the canvas:
 
 ```tsx
-<BoardProvider initialElements={saved} onChange={save}>
+<BoardProvider config={{ initialElements: saved, onChange: save }}>
   <Sidebar />
   <Board style={{ flex: 1 }} />
 </BoardProvider>
 ```
 
-Settings (`<Board>` or `<BoardProvider>`):
+The board is configured by one object, `config` (`<Board>` or `<BoardProvider>`). Define
+it once with `boardOptions` (typed, like `queryOptions` of TanStack Query) and reuse or
+extend it:
 
-| Setting           | Default         |                                   |
+```tsx
+// board-config.ts
+import { boardOptions } from 'apeiro/react';
+
+export const boardConfig = boardOptions({
+  theme: 'system',
+  grid: 'dots',
+  onChange: (elements) => save(elements),
+});
+
+// page.tsx
+<Board config={boardConfig} style={{ height: '100vh' }} />
+<Board config={{ ...boardConfig, readOnly: true }} />
+```
+
+`theme`, `readOnly` and the callbacks can change at any time; the other options are read
+once, when the board is created (give the component a new `key` to start over).
+
+| Option            | Default         |                                   |
 | ----------------- | --------------- | --------------------------------- |
 | `initialElements` |                 | Initial content                   |
 | `onChange`        |                 | `(elements, changes) => void`     |
@@ -82,9 +101,7 @@ Settings (`<Board>` or `<BoardProvider>`):
 | `readOnly`        | `false`         | View only                         |
 | `onError`         | `console.error` | No WebGPU/WebGL2, or a file error |
 | `grid`            | `'lines'`       | `'lines'`, `'dots'`, `'none'`     |
-| `labels`          | English         | UI texts, e.g. `RU_LABELS`        |
 | `upload`          | object URLs     | `(file) => Promise<url>`          |
-| `sync`            |                 | Shared board, see Collaboration   |
 
 ## Commands
 
@@ -95,7 +112,7 @@ Settings (`<Board>` or `<BoardProvider>`):
 | `tools`     | `activate(tool, { repeat })`, `setDefaults(kind, style)`, `register(name, customTool)`        |
 | `selection` | `set`, `clear`, `all`, `update(patch)`, `delete`, `reorder('front')`, `group`, `ungroup`      |
 | `elements`  | `create(kind, { at })`, `createText`, `add`, `addFiles`, `update`, `remove`, `load`, `getAll` |
-| `text`      | `edit(id)`, `stop()`                                                                          |
+| `text`      | `edit(id)`, `stop()`, `format(command)`                                                       |
 | `history`   | `undo`, `redo`, `batch(fn)`                                                                   |
 | `camera`    | `zoomTo('in' \| 'out' \| 'fit' \| 'selection' \| 'reset' \| zoom)`                            |
 | `clipboard` | `copy`, `cut`, `paste`, `duplicate`                                                           |
@@ -106,17 +123,45 @@ Settings (`<Board>` or `<BoardProvider>`):
 
 | Hook                                                       | Returns                    |
 | ---------------------------------------------------------- | -------------------------- |
-| `useBoardState((b) => …)`                                  | Any state                  |
+| `useBoardState((board) => …)`                              | Any state                  |
 | `useTool()`, `useBoardTheme()`                             | `[value, setValue]`        |
 | `useSelectedIds()`, `useSelectedElements()`                | Selection                  |
-| `useElement(id)`, `useElementCount()`                      | Content                    |
+| `useElement(id)`                                           | Content                    |
 | `useHistory()`, `useClipboard()`, `usePreview()`           | State and actions          |
-| `useZoom()`, `useCamera()`                                 | Zoom and camera            |
+| `useZoom()`                                                | Zoom                       |
 | `useSelectionScreenBounds()`, `useElementScreenBounds(id)` | Boxes on screen            |
-| `usePeers()`, `useLockedBy(id)`                            | Participants               |
-| `useSyncState()`                                           | Sync status                |
+| `useTextFormat()`                                          | Text being edited          |
 | `useBoardChange(fn)`, `useBoardEvent(event, fn)`           | Callbacks, no re-rendering |
 | `useEditor()`                                              | `BoardEditor`              |
+
+## Text formatting
+
+The board has no formatting toolbar: show your own while a text is edited. Put it inside
+`data-ap-text-controls` so pressing it keeps the text open, and keep buttons from taking
+the focus:
+
+```tsx
+function TextToolbar() {
+  const format = useTextFormat();
+  const board = useBoard();
+  if (!format) return null;
+  return (
+    <div data-ap-text-controls onMouseDown={(event) => event.preventDefault()}>
+      <button
+        aria-pressed={format.bold}
+        onClick={() => board.text.format({ type: 'toggle', style: 'bold' })}
+      >
+        B
+      </button>
+    </div>
+  );
+}
+```
+
+Commands: `toggle` (bold, italic, underline, strike), `color`, `font`, `fontSize` (a number, or
+`'auto'`: the text fills its box, the default of stickies),
+`stepSize`, `list`, `indent`, `align`, `link` (`href: null` removes it). Keyboard
+shortcuts (Ctrl+B/I/U, Ctrl+Shift+X/7/8, Ctrl+Shift+< />, Tab) still work.
 
 ## Without React
 
@@ -131,117 +176,11 @@ editor.on('selection', () => console.log(editor.selection));
 // editor.getElements() to save, editor.destroy() to remove
 ```
 
-## Collaboration
-
-The sync is logic, the board is UI. Create a sync with `createSync` from `apeiro/sync`
-(no React), and show it with `<Board sync={sync}>`.
-
-```ts
-// board-sync.ts
-import { io } from 'socket.io-client';
-import { createSync } from 'apeiro/sync';
-
-const socket = io({ transports: ['websocket'] }); // one per tab
-
-export const openBoard = (boardId: string, user: { name: string; color: string }) =>
-  createSync({ socket, boardId, user });
-```
-
-```tsx
-// Whiteboard.tsx
-'use client';
-import { useEffect, useState } from 'react';
-import { Board, useSyncState } from 'apeiro/react';
-import { openBoard } from './board-sync';
-
-export function Whiteboard({ boardId, me }) {
-  const [sync, setSync] = useState(null);
-  useEffect(() => {
-    const s = openBoard(boardId, me);
-    setSync(s);
-    return () => s.destroy();
-  }, [boardId]);
-  return (
-    <Board style={{ height: '100vh' }} sync={sync}>
-      <SyncStatus />
-    </Board>
-  );
-}
-
-function SyncStatus() {
-  const state = useSyncState(); // { status, saving, readOnly, role, loaded, error }
-  if (!state) return null;
-  return <span>{state.status === 'offline' ? 'Offline' : state.saving ? 'Saving…' : 'Saved'}</span>;
-}
-```
-
-The board is read-only until it arrives, and for viewers. Undo touches only this user's
-edits; others' cursors and selections show on the board. Without React:
-`const detach = sync.attach(editor)`.
-
-Any Yjs provider (y-websocket, Hocuspocus…) instead of socket.io:
-
-```ts
-createSync({ doc, awareness: provider.awareness, user });
-```
-
-### Server
-
-Events (payloads are Yjs bytes, `BOARD_EVENTS` in `apeiro/sync`):
-
-| Event             | Payload                | Reply                                          |
-| ----------------- | ---------------------- | ---------------------------------------------- |
-| `board:join`      | `boardId, stateVector` | `{ update, stateVector, role }` or `{ error }` |
-| `board:update`    | `boardId, update`      | `{ ok: true }` or `{ error }`                  |
-| `board:awareness` | `boardId, update`      | Forward to the room                            |
-| `board:leave`     | `boardId`              | Leave the room                                 |
-
-```ts
-import { Server } from 'socket.io';
-import * as Y from 'yjs';
-
-const io = new Server(3001);
-const docs = new Map<string, Y.Doc>(); // load from and save to your database
-
-const docOf = (id: string) => {
-  if (!docs.has(id)) docs.set(id, new Y.Doc());
-  return docs.get(id)!;
-};
-
-io.on('connection', (socket) => {
-  socket.on('board:join', (boardId, stateVector, ack) => {
-    // check access: ack({ error: "forbidden" })
-    const doc = docOf(boardId);
-    socket.join(boardId);
-    ack({
-      update: Y.encodeStateAsUpdate(doc, new Uint8Array(stateVector)),
-      stateVector: Y.encodeStateVector(doc),
-      role: 'edit', // "view": read-only
-    });
-  });
-  socket.on('board:update', (boardId, update, ack) => {
-    if (!socket.rooms.has(boardId)) return ack({ error: 'not joined' });
-    const bytes = new Uint8Array(update);
-    try {
-      Y.applyUpdate(docOf(boardId), bytes);
-    } catch {
-      return ack({ error: 'invalid update' }); // the client loads the board anew
-    }
-    socket.to(boardId).emit('board:update', boardId, bytes);
-    ack({ ok: true });
-  });
-  socket.on('board:awareness', (boardId, update) => {
-    if (socket.rooms.has(boardId)) socket.to(boardId).emit('board:awareness', boardId, update);
-  });
-  socket.on('board:leave', (boardId) => socket.leave(boardId));
-});
-```
-
 ## Data
 
 A board is an array of `BoardElement`: shapes (`rect`, `ellipse`, `polygon`, `sticky`,
-`text`, `image`, `audio`, `ink`) and `connector`. Fields: `x, y, w, h, rotation, z`; colors
-are `0xRRGGBBAA` (`hexColor('#ff0000')`).
+`text`, `image`, `audio`, `ink`) and `connector`. Fields: `x, y, width, height, rotation, z`;
+colors are `0xRRGGBBAA` (`hexColor('#ff0000')`).
 
 ## Styling
 
@@ -251,6 +190,6 @@ CSS custom properties on `.ap-board`: `--ap-accent`, `--ap-surface`, `--ap-foreg
 ## Fonts
 
 Board text can use Geist (the default), Inter, PT Serif, JetBrains Mono and Caveat
-(`FONT_FAMILIES`); the text toolbar offers all of them. Load the font files yourself
+(`FONT_FAMILIES`); offer them in your own text toolbar. Load the font files yourself
 (`@font-face`, e.g. from Google Fonts), otherwise the system fallbacks are drawn.
 `--ap-font` is the font of the board's own UI, not of its text.

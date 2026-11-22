@@ -1,14 +1,14 @@
 import { test, describe } from 'vitest';
 import { Scene } from './scene';
 import { elementBounds } from '../elements/element';
-import { makeRect } from '../test-utils';
+import { makeRectangle } from '../test-utils';
 
 /** Stable workload: a thousand rotated shapes and their attached straight connectors. */
 function board(): Scene {
   const scene = new Scene();
   scene.transact(() => {
     for (let i = 0; i < 1000; i++) {
-      scene.add(makeRect(`shape-${i}`, { x: i * 200, rotation: 0.3 }));
+      scene.add(makeRectangle(`shape-${i}`, { x: i * 200, rotation: 0.3 }));
       if (i === 0) continue;
       scene.add({
         id: `line-${i}`,
@@ -51,7 +51,9 @@ describe('Scene CPU workloads (one operation = 1000 shapes)', () => {
     }).run();
   });
 
-  const shapes = Array.from({ length: 1000 }, (_, i) => makeRect(String(i), { rotation: i / 100 }));
+  const shapes = Array.from({ length: 1000 }, (_, i) =>
+    makeRectangle(String(i), { rotation: i / 100 }),
+  );
   test('calculate rotated bounds', async ({ bench }) => {
     await bench('1000 shapes', () => {
       let checksum = 0;

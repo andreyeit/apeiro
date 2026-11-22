@@ -42,8 +42,8 @@ export const FONT_FAMILIES: readonly FontFamily[] = [
 /** Index of a family in `FONT_FAMILIES`; unknown or missing ids are the default (0). */
 export function fontIndex(id: string | undefined): number {
   if (id === undefined) return 0;
-  const i = FONT_FAMILIES.findIndex((f) => f.id === id);
-  return i < 0 ? 0 : i;
+  const index = FONT_FAMILIES.findIndex((family) => family.id === id);
+  return index < 0 ? 0 : index;
 }
 
 export const fontFamily = (id: string | undefined): FontFamily => FONT_FAMILIES[fontIndex(id)]!;

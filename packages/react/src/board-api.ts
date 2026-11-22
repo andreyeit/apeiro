@@ -5,6 +5,7 @@ import type {
   CustomTool,
   ExportImageOptions,
   PlaceKind,
+  TextFormatCommand,
   Tool,
   ToolActivation,
   ToolStyles,
@@ -65,12 +66,18 @@ export interface BoardApi {
     edit(id: string): void;
     /** Closes the text being edited. */
     stop(): void;
+    /**
+     * Formatting of the text being edited, for your own controls (read it with
+     * `useTextFormat`). Put the controls inside `data-ap-text-controls` so pressing them
+     * keeps the text open. False when nothing is edited or the link is not allowed.
+     */
+    format(command: TextFormatCommand): boolean;
   };
   readonly history: {
     undo(): void;
     redo(): void;
     /** Runs `fn` as one undo step. */
-    batch<T>(fn: () => T): T;
+    batch<T>(action: () => T): T;
   };
   readonly camera: {
     /** `'in'`, `'out'`, `'fit'` (everything), `'selection'`, `'reset'` (100%) or a zoom factor. */
@@ -145,11 +152,12 @@ export function boardApi(editor: BoardEditor): BoardApi {
     text: Object.freeze({
       edit: (id: string) => editor.editText(id),
       stop: () => editor.stopEditing(),
+      format: (command: TextFormatCommand) => editor.formatText(command),
     }),
     history: Object.freeze({
       undo: () => editor.undo(),
       redo: () => editor.redo(),
-      batch: <T>(fn: () => T) => editor.batch(fn),
+      batch: <T>(action: () => T) => editor.batch(action),
     }),
     camera: Object.freeze({
       zoomTo: (to: ZoomTarget) => editor.zoomTo(to),

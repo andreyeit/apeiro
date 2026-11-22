@@ -16,9 +16,8 @@ export interface BoardChanges {
   removed: string[];
   /**
    * Where the changes come from: `undefined` for this user's edits, `'history'` for undo
-   * and redo, `'load'` for `editor.load()`, `'yjs'` for changes received from a
-   * `sync`, or the tag you passed to `scene.transact(fn, tag)` (e.g. `'remote'` when
-   * applying changes from your own server: don't send those back).
+   * and redo, `'load'` for `editor.load()`, or the tag you passed to
+   * `scene.transact(fn, tag)`.
    */
   origin: string | undefined;
 }
@@ -44,9 +43,10 @@ export class ChangeLog {
       this.groups.push(group);
     }
     const kinds = group.kinds;
-    for (const el of changes.added)
-      kinds.set(el.id, kinds.get(el.id) === 'removed' ? 'updated' : 'added');
-    for (const el of changes.updated) if (kinds.get(el.id) !== 'added') kinds.set(el.id, 'updated');
+    for (const element of changes.added)
+      kinds.set(element.id, kinds.get(element.id) === 'removed' ? 'updated' : 'added');
+    for (const element of changes.updated)
+      if (kinds.get(element.id) !== 'added') kinds.set(element.id, 'updated');
     for (const id of changes.removed) {
       if (kinds.get(id) === 'added') kinds.delete(id);
       else kinds.set(id, 'removed');
@@ -64,8 +64,8 @@ export class ChangeLog {
           continue;
         }
         // Gone by now: a later group reports the deletion.
-        const el = scene.get(id);
-        if (el) changes[kind].push(el);
+        const element = scene.get(id);
+        if (element) changes[kind].push(element);
       }
       return changes;
     });
@@ -85,8 +85,8 @@ export function useChangeListener(
   editor: BoardEditor,
   onChange: BoardChangeListener | undefined,
 ): void {
-  const ref = useRef(onChange);
-  ref.current = onChange;
+  const reference = useRef(onChange);
+  reference.current = onChange;
   const listening = onChange !== undefined;
   useEffect(() => {
     if (!listening) return;
@@ -100,7 +100,7 @@ export function useChangeListener(
       const groups = log.take(editor.scene);
       // One copy of the elements per flush (not per origin group).
       const elements = editor.getElements();
-      for (const changes of groups) ref.current?.(elements, changes);
+      for (const changes of groups) reference.current?.(elements, changes);
     };
     const schedule = () => {
       if (queued) return;

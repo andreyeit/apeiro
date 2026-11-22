@@ -8,8 +8,7 @@ interface Entry {
 }
 
 /**
- * What the board editor needs from an undo history. `History` (local, below) implements it;
- * so does the Yjs history of `apeiro/yjs`, which undoes only this user's changes.
+ * What the board editor needs from an undo history. `History` (below) implements it.
  */
 export interface UndoHistory {
   readonly canUndo: boolean;
@@ -21,8 +20,8 @@ export interface UndoHistory {
   /** Merges everything until the matching `endGroup` into one step. Nestable. */
   beginGroup(): void;
   endGroup(): void;
-  /** Runs `fn` as one step. */
-  batch<T>(fn: () => T): T;
+  /** Runs `action` as one step. */
+  batch<T>(action: () => T): T;
   /** Forgets all steps. */
   clear(): void;
   /** Called whenever canUndo/canRedo may have changed. */
@@ -35,7 +34,7 @@ export interface HistoryOptions {
   limit?: number;
   /**
    * Which batches are user edits worth undoing. By default only untagged ones
-   * (`scene.transact(fn)` without an origin): remote changes, loading a board,
+   * (`scene.transact(action)` without an origin): remote changes, loading a board,
    * animations etc. pass an origin and stay out of the history.
    */
   record?: (origin: string | undefined) => boolean;
@@ -69,7 +68,7 @@ export class History implements UndoHistory {
   ) {
     this.limit = options.limit ?? 200;
     this.shouldRecord = options.record ?? ((origin) => origin === undefined);
-    this.unsubscribe = scene.subscribe((c) => this.onChanges(c));
+    this.unsubscribe = scene.subscribe((changes) => this.onChanges(changes));
   }
 
   get canUndo(): boolean {
@@ -99,11 +98,11 @@ export class History implements UndoHistory {
     if (entry) this.push(entry);
   }
 
-  /** Runs `fn` as one undo step. */
-  batch<T>(fn: () => T): T {
+  /** Runs `action` as one undo step. */
+  batch<T>(action: () => T): T {
     this.beginGroup();
     try {
-      return this.scene.transact(fn);
+      return this.scene.transact(action);
     } finally {
       this.endGroup();
     }
@@ -132,11 +131,11 @@ export class History implements UndoHistory {
     this.listeners.clear();
   }
 
-  private onChanges(c: SceneChanges): void {
-    if (c.origin === HISTORY_ORIGIN || !this.shouldRecord(c.origin)) return;
-    if (c.previous.size === 0) return;
+  private onChanges(changes: SceneChanges): void {
+    if (changes.origin === HISTORY_ORIGIN || !this.shouldRecord(changes.origin)) return;
+    if (changes.previous.size === 0) return;
     const entry = this.group ?? { before: new Map(), after: new Map() };
-    for (const [id, was] of c.previous) {
+    for (const [id, was] of changes.previous) {
       // In a group the first "before" wins; "after" is always the latest state.
       if (!entry.before.has(id)) entry.before.set(id, was);
       entry.after.set(id, this.scene.get(id));
@@ -165,10 +164,11 @@ export class History implements UndoHistory {
     const scene = this.scene;
     scene.transact(() => {
       // Remove first, then (re)create: an element may come back with a different z or type.
-      for (const [id, el] of target) {
-        if (scene.has(id) && el !== scene.get(id)) scene.remove(id);
+      for (const [id, element] of target) {
+        if (scene.has(id) && element !== scene.get(id)) scene.remove(id);
       }
-      for (const el of target.values()) if (el && !scene.has(el.id)) scene.add(el);
+      for (const element of target.values())
+        if (element && !scene.has(element.id)) scene.add(element);
     }, HISTORY_ORIGIN);
     to.push(entry);
     this.emit();
@@ -176,26 +176,33 @@ export class History implements UndoHistory {
   }
 
   private emit(): void {
-    for (const l of this.listeners) l();
+    for (const listener of this.listeners) listener();
   }
 }
 
 /** Structural equality of two element snapshots (plain JSON-like data). */
-function sameElement(a: BoardElement | undefined, b: BoardElement | undefined): boolean {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  return deepEqual(a, b);
+function sameElement(first: BoardElement | undefined, second: BoardElement | undefined): boolean {
+  if (first === second) return true;
+  if (!first || !second) return false;
+  return deepEqual(first, second);
 }
 
-function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  const ka = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
-  const kb = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
-  if (ka.length !== kb.length) return false;
-  for (const k of ka) {
-    if (!deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]))
+function deepEqual(first: unknown, second: unknown): boolean {
+  if (first === second) return true;
+  if (typeof first !== 'object' || typeof second !== 'object' || first === null || second === null)
+    return false;
+  if (Array.isArray(first) !== Array.isArray(second)) return false;
+  const firstKeys = Object.keys(first).filter(
+    (key) => (first as Record<string, unknown>)[key] !== undefined,
+  );
+  const secondKeys = Object.keys(second).filter(
+    (key) => (second as Record<string, unknown>)[key] !== undefined,
+  );
+  if (firstKeys.length !== secondKeys.length) return false;
+  for (const key of firstKeys) {
+    if (
+      !deepEqual((first as Record<string, unknown>)[key], (second as Record<string, unknown>)[key])
+    )
       return false;
   }
   return true;

@@ -1,48 +1,52 @@
 import {
-  LINE_HEIGHT,
-  fontFamily,
-  fontIndex,
-  LIST_GAP_EM,
-  MIXED,
   applyStyle,
   clampFontSize,
   commonStyle,
+  cssColor,
   defaultTextBlock,
   fitTextPatch,
+  fontFamily,
   hasStyle,
   indentList,
   isAllowedLink,
   isShape,
+  LINE_HEIGHT,
   linkAt,
+  LIST_GAP_EM,
+  MIXED,
   normalizeLink,
-  normalizeRuns,
   paragraphAt,
   paragraphRange,
   paragraphStyle,
   plainText,
   remapParagraphs,
+  replaceBlockText,
+  replaceText,
   runsLength,
   stepFontSize,
+  stepTextSize,
   textArea,
   toggleList,
   toggleStyle,
   updateParagraphs,
+  withFont,
+  withFontSize,
+  withParagraphs,
   type BoardElement,
   type BooleanStyle,
   type Camera,
-  type History,
   type ListKind,
-  type ParagraphStyle,
   type Scene,
   type ShapeElement,
+  type TextAlign,
   type TextBlock,
   type TextRun,
   type TextStyle,
+  type UndoHistory,
 } from '@apeiro/core';
 import type { BoardRenderer } from '@apeiro/renderer';
-import { offsetOf, parse, positionOf, render, toCss } from './dom';
-import { TextToolbar } from './toolbar';
-import { EN_LABELS, type BoardLabels } from '../ui/labels';
+import { keyLetter } from '../input/keyboard';
+import { offsetOf, parse, positionOf, render } from './dom';
 
 const JUSTIFY = { top: 'flex-start', middle: 'center', bottom: 'flex-end' } as const;
 
@@ -66,12 +70,12 @@ const LIST_SHORTCUTS: Array<[RegExp, ListKind]> = [
  * shift by the change in length, offsets inside it move to the end of the new text.
  */
 export function offsetMapper(before: string, after: string): (offset: number) => number {
-  const max = Math.min(before.length, after.length);
+  const maximum = Math.min(before.length, after.length);
   let prefix = 0;
-  while (prefix < max && before.charCodeAt(prefix) === after.charCodeAt(prefix)) prefix++;
+  while (prefix < maximum && before.charCodeAt(prefix) === after.charCodeAt(prefix)) prefix++;
   let suffix = 0;
   while (
-    suffix < max - prefix &&
+    suffix < maximum - prefix &&
     before.charCodeAt(before.length - 1 - suffix) === after.charCodeAt(after.length - 1 - suffix)
   )
     suffix++;
@@ -84,70 +88,117 @@ export function offsetMapper(before: string, after: string): (offset: number) =>
   };
 }
 
+/** A formatting change for `BoardEditor.formatText`, applied to the text being edited. */
+export type TextFormatCommand =
+  /** Bold, italic, underline or strikethrough on/off (with a caret: for what is typed next). */
+  | { type: 'toggle'; style: BooleanStyle }
+  /** Text color (with a caret: for what is typed next). */
+  | { type: 'color'; color: number }
+  /** Font family id (see `FONT_FAMILIES`): of the selection, or of the whole text. */
+  | { type: 'font'; font: string }
+  /**
+   * Font size as shown (after autoFit): of the selection, or of the whole text. `auto`: the
+   * text grows or shrinks to fill its box, as the default size of stickies in Miro; a number
+   * switches that off.
+   */
+  | { type: 'fontSize'; size: number | 'auto' }
+  /** One step bigger or smaller, like Ctrl+Shift+> / <. */
+  | { type: 'stepSize'; direction: 1 | -1 }
+  /** Bulleted or numbered list on/off for the selected paragraphs. */
+  | { type: 'list'; kind: ListKind }
+  /** Indents (1) or outdents (-1) the selected list items, like Tab / Shift+Tab. */
+  | { type: 'indent'; direction: 1 | -1 }
+  | { type: 'align'; align: TextAlign }
+  /**
+   * Links the selection (or the link around the caret) to `href`; null removes the link.
+   * With a caret outside a link, inserts the address as linked text.
+   */
+  | { type: 'link'; href: string | null };
+
+/**
+ * Formatting at the selection of the text being edited, for the app's own controls.
+ * `null` where the selection mixes values.
+ */
+export interface TextFormatState {
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strike: boolean;
+  /** Font family id. */
+  font: string | null;
+  /** Font size as shown (after autoFit), rounded to 0.1. */
+  fontSize: number | null;
+  /** The size is automatic (`fontSize: 'auto'`): it follows the box. */
+  autoSize: boolean;
+  /** Text color (RGBA); `null` when the selection mixes colors. */
+  color: number | null;
+  align: TextAlign;
+  /** List kind shared by all selected paragraphs, or null. */
+  list: ListKind | null;
+  /** Address of the link at the caret, or shared by the whole selection. */
+  link: string | null;
+}
+
+/**
+ * Marks the app's formatting controls (`<div data-ap-text-controls>`): pressing or focusing
+ * something inside keeps the text editor open. Buttons should also prevent `mousedown`'s
+ * default so the text keeps its selection; fields may take the focus (the selection is
+ * remembered and formatting applies to it).
+ */
+export const TEXT_CONTROLS_ATTRIBUTE = 'data-ap-text-controls';
+
+function isTextControl(target: EventTarget | null): boolean {
+  return target instanceof Element && !!target.closest(`[${TEXT_CONTROLS_ATTRIBUTE}]`);
+}
+
+function sameFormat(first: TextFormatState | null, second: TextFormatState | null): boolean {
+  if (first === second) return true;
+  if (!first || !second) return false;
+  for (const key of Object.keys(first) as Array<keyof TextFormatState>)
+    if (first[key] !== second[key]) return false;
+  return true;
+}
+
 /** Opens a link from text in a new tab, never giving the page a handle on the opener. */
 export function openLink(href: string): void {
   if (isAllowedLink(href)) window.open(href, '_blank', 'noopener,noreferrer');
 }
 
-/** Replaces [from, to) of `runs` with `text`, styled like the run it lands in plus `style`. */
-function replaceRuns(
-  runs: readonly TextRun[],
-  from: number,
-  to: number,
-  text: string,
-  style: TextStyle | null,
-): TextRun[] {
-  const out: TextRun[] = [];
-  let pos = 0;
-  let inserted = false;
-  for (const run of runs) {
-    const start = pos;
-    const end = pos + run.text.length;
-    pos = end;
-    if (end <= from || start >= to) {
-      out.push(run);
-      if (!inserted && end === from) {
-        out.push({ ...run, ...style, text });
-        inserted = true;
-      }
-      continue;
-    }
-    out.push({ ...run, text: run.text.slice(0, Math.max(0, from - start)) });
-    if (!inserted) {
-      out.push({ ...run, ...style, text });
-      inserted = true;
-    }
-    out.push({ ...run, text: run.text.slice(Math.max(0, to - start)) });
-  }
-  if (!inserted) out.unshift({ ...style, text });
-  return normalizeRuns(out);
-}
+/** Ctrl/⌘ + letter (by physical key) toggles a style: Shift+X strikes through. */
+const STYLE_SHORTCUTS: Readonly<Record<string, BooleanStyle>> = {
+  B: 'bold',
+  I: 'italic',
+  U: 'underline',
+};
 
 /**
  * Rich text editor laid exactly over an element. Every change is written to the scene,
- * so other views (and later other users) see it live. The board keeps drawing the text
- * while it is edited (same weight, colors and layout as before editing): the editor's
- * own text is transparent, only its caret and selection show. Only an IME composition,
- * which isn't in the scene yet, is shown by the editor (the board text is hidden then).
+ * so other views (and later other users) see it live. While it is open, the editor shows
+ * the text and the board hides its own: the caret and the selection are where the browser
+ * drew the letters, whatever the browser's or the board's zoom, so they never drift off them
+ * (the browser's text layout can differ from the board's by fractions of a pixel).
  *
  * Per-character: bold/italic/underline/strike (Ctrl+B/I/U, Ctrl+Shift+X), color, font
  * family, size and links (Ctrl+K). Per paragraph: bulleted and numbered lists
  * (Ctrl+Shift+8/7, or "- " / "1. " at the start of a line), nested with Tab / Shift+Tab.
  * Size and font apply to the selection, or to the whole text when nothing is selected.
  * With a collapsed caret, a toggled style applies to what is typed next.
+ *
+ * There is no built-in formatting UI: the app shows its own controls (marked with
+ * `TEXT_CONTROLS_ATTRIBUTE`), reads `format` and changes it with `apply`.
  */
 export class TextEditor {
   private root = document.createElement('div');
   private input = document.createElement('div');
-  private readonly bar: TextToolbar;
-  /** Range the open link field applies to (a collapsed one inserts the link as text). */
-  private linkRange: [number, number] | null = null;
-  /** Last caret/selection inside the text, to restore after a toolbar field took focus. */
+  /** Last caret/selection inside the text, to restore after an app control took focus. */
   private lastSelection: [number, number] | null = null;
-  /** Called when editing ends, with the element id (null if it was removed for being empty). */
+  private formatState: TextFormatState | null = null;
   /** Called when editing of element `id` begins (e.g. to hide the selection handles). */
   onStart: (id: string) => void = () => undefined;
+  /** Called when editing ends, with the element id (null if it was removed for being empty). */
   onStop: (id: string | null) => void = () => undefined;
+  /** `format` changed (selection moved, text restyled, editing started or ended). */
+  onFormat: () => void = () => undefined;
   private id: string | null = null;
   private block: TextBlock | null = null;
   private pending: TextStyle | null = null;
@@ -173,9 +224,7 @@ export class TextEditor {
      * Board undo history: one editing session (open → close) becomes one step there.
      * Inside the session Ctrl+Z is handled by the editor's own finer-grained undo.
      */
-    private history?: Pick<History, 'beginGroup' | 'endGroup'>,
-    /** Texts of the formatting toolbar (default English). */
-    private readonly labels: BoardLabels = EN_LABELS,
+    private history?: Pick<UndoHistory, 'beginGroup' | 'endGroup'>,
   ) {
     this.root.className = 'ap-text-editor';
     this.input.className = 'ap-text-editor-input';
@@ -187,76 +236,64 @@ export class TextEditor {
     this.input.spellcheck = false;
     this.root.append(this.input);
     this.root.hidden = true;
-    this.bar = new TextToolbar(labels, {
-      setFont: (id) => this.setFont(id),
-      stepSize: (dir) => this.stepSize(dir),
-      setFontSize: (size) => this.setFontSize(size),
-      toggle: (key) => this.toggle(key),
-      openLinkBar: () => this.openLinkBar(),
-      applyLink: () => this.applyLink(),
-      closeLinkBar: () => this.closeLinkBar(),
-      toggleList: (kind) => this.toggleListAtSelection(kind),
-      setAlign: (align) => this.setBlock({ align }),
-      setColor: (color) => this.setColor(color),
-      refocus: () => this.refocus(),
-    });
-    container.append(this.root, this.toolbar);
+    container.append(this.root);
 
-    this.input.addEventListener('beforeinput', (e) => this.onBeforeInput(e));
+    this.input.addEventListener('beforeinput', (event) => this.onBeforeInput(event));
     this.input.addEventListener('input', () => this.onInput());
     this.input.addEventListener('compositionstart', () => {
       this.composing = true;
-      this.setComposing(true);
     });
     this.input.addEventListener('compositionend', () => {
       this.composing = false;
       this.onInput();
-      this.setComposing(false);
     });
-    this.input.addEventListener('blur', (e) => {
-      if (!this.toolbar.contains(e.relatedTarget as Node | null)) this.stop();
+    this.input.addEventListener('blur', (event) => {
+      if (!isTextControl(event.relatedTarget)) this.stop();
     });
-    this.input.addEventListener('keydown', (e) => this.onKeyDown(e));
+    this.input.addEventListener('keydown', (event) => this.onKeyDown(event));
     // Ctrl/Cmd+click opens a link (a plain click places the caret, as in any editor).
-    this.input.addEventListener('click', (e) => {
-      const href = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-href]')?.dataset
-        .href;
-      if (href && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
+    this.input.addEventListener('click', (event) => {
+      const href = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-href]')
+        ?.dataset.href;
+      if (href && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
         openLink(href);
       }
     });
     const onSelectionChange = () => {
-      const sel = getSelection();
-      if (this.id && sel && sel.rangeCount > 0 && this.input.contains(sel.anchorNode))
+      const selection = getSelection();
+      if (
+        this.id &&
+        selection &&
+        selection.rangeCount > 0 &&
+        this.input.contains(selection.anchorNode)
+      )
         this.lastSelection = this.selection();
-      this.syncToolbar();
+      this.syncFormat();
     };
     document.addEventListener('selectionchange', onSelectionChange);
     // A press anywhere else closes the editor before the board handles it (capture phase,
     // ahead of blur), so the text edit and the next gesture are separate undo steps.
-    const onOutsidePointer = (e: Event) => {
-      const t = e.target as Node | null;
-      if (this.id && !this.root.contains(t) && !this.toolbar.contains(t)) this.stop();
+    const onOutsidePointer = (event: Event) => {
+      const target = event.target as Node | null;
+      if (this.id && !this.root.contains(target) && !isTextControl(target)) this.stop();
     };
     window.addEventListener('pointerdown', onOutsidePointer, true);
     this.disposers.push(() => window.removeEventListener('pointerdown', onOutsidePointer, true));
-    for (const el of [this.root, this.toolbar])
-      el.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.root.addEventListener('pointerdown', (event) => event.stopPropagation());
     this.disposers.push(
       () => document.removeEventListener('selectionchange', onSelectionChange),
       renderer.onAfterRender(() => this.sync()),
-      scene.subscribe((c) => this.onSceneChanges(c.updated)),
+      scene.subscribe((changes) => this.onSceneChanges(changes.updated)),
     );
   }
 
   /** Removes the editor from the page and stops listening to the document and the scene. */
   destroy(): void {
     this.stop();
-    for (const d of this.disposers) d();
+    for (const dispose of this.disposers) dispose();
     this.disposers = [];
     this.root.remove();
-    this.toolbar.remove();
   }
 
   /**
@@ -265,18 +302,17 @@ export class TextEditor {
    */
   private onSceneChanges(updated: readonly BoardElement[]): void {
     if (!this.id || !this.block || this.composing) return;
-    const el = updated.find((e) => e.id === this.id);
-    if (!el || !isShape(el) || !el.text || el.text === this.block) return;
+    const element = updated.find((candidate) => candidate.id === this.id);
+    if (!element || !isShape(element) || !element.text || element.text === this.block) return;
     const [from, to] = this.selection();
     // Someone else typed: keep the caret on the same characters, not the same offset.
-    const map = offsetMapper(plainText(this.block), plainText(el.text));
-    this.block = el.text;
+    const mapOffset = offsetMapper(plainText(this.block), plainText(element.text));
+    this.block = element.text;
     this.undoStack = [];
     this.redoStack = [];
-    render(this.input, this.block, this.labels.openLinkHint);
+    this.render(this.input, this.block);
     const length = runsLength(this.block.runs);
-    this.select(Math.min(map(from), length), Math.min(map(to), length));
-    this.syncToolbar();
+    this.select(Math.min(mapOffset(from), length), Math.min(mapOffset(to), length));
     this.sync();
   }
 
@@ -288,29 +324,29 @@ export class TextEditor {
    * Adds a new element and opens it for typing, as one undo step with the typing: closing
    * it while still empty removes it again, leaving no trace in the history (Figma, Miro).
    */
-  create(el: ShapeElement): void {
+  create(element: ShapeElement): void {
     this.stop();
     this.history?.beginGroup();
     try {
-      this.scene.add(el);
-      this.start(el.id);
+      this.scene.add(element);
+      this.start(element.id);
     } finally {
       this.history?.endGroup(); // the step stays open until `stop` (start nests a group)
     }
   }
 
   start(id: string): void {
-    const el = this.scene.get(id);
-    if (!el || !isShape(el)) return;
+    const element = this.scene.get(id);
+    if (!element || !isShape(element)) return;
     this.stop();
     this.history?.beginGroup();
     this.id = id;
-    const block = el.text ?? defaultTextBlock(el.type);
+    const block = element.text ?? defaultTextBlock(element.type);
     // The editor only writes '\n' line breaks; '\r\n' from elsewhere becomes one.
-    this.block = block.runs.some((r) => r.text.includes('\r'))
+    this.block = block.runs.some((run) => run.text.includes('\r'))
       ? {
           ...block,
-          runs: block.runs.map((r) => ({ ...r, text: r.text.replace(/\r\n?/g, '\n') })),
+          runs: block.runs.map((run) => ({ ...run, text: run.text.replace(/\r\n?/g, '\n') })),
         }
       : block;
     this.lastSelection = null;
@@ -318,17 +354,15 @@ export class TextEditor {
     this.undoStack = [];
     this.redoStack = [];
     this.lastTypingAt = 0;
-    this.closeLinkBar();
-    render(this.input, this.block, this.labels.openLinkHint);
-    this.setComposing(false);
+    this.render(this.input, this.block);
+    this.renderer.setTextHidden(id, true);
     this.root.hidden = false;
-    this.toolbar.hidden = false;
     this.sync();
     this.input.focus();
     const end = runsLength(this.block.runs);
     this.select(end, end);
-    this.syncToolbar();
     this.onStart(id);
+    this.syncFormat();
   }
 
   stop(): void {
@@ -340,141 +374,135 @@ export class TextEditor {
     if (this.input.contains(document.activeElement)) this.input.blur();
     this.block = null;
     this.root.hidden = true;
-    this.toolbar.hidden = true;
-    this.closeLinkBar();
     // An empty text box has nothing to show: it goes away (shapes keep their box).
-    const el = this.scene.get(id);
-    const removed = !!el && el.type === 'text' && (!el.text || plainText(el.text) === '');
+    const element = this.scene.get(id);
+    const removed =
+      !!element && element.type === 'text' && (!element.text || plainText(element.text) === '');
     if (removed) this.scene.remove(id);
     this.history?.endGroup();
-    this.onStop(removed || !el ? null : id);
+    this.onStop(removed || !element ? null : id);
+    this.syncFormat();
   }
 
   /**
-   * IME composition: its text isn't in the scene until it ends, so the editor shows its
-   * own text then (and the board's is hidden). Otherwise the board draws the text.
+   * Renders `block` into `root` in the colors the board draws the edited element's text with.
    */
-  private setComposing(on: boolean): void {
-    this.input.classList.toggle('composing', on);
-    if (this.id) this.renderer.setTextHidden(this.id, on);
+  private render(root: HTMLElement, block: TextBlock): void {
+    const type = this.id ? this.scene.get(this.id)?.type : undefined;
+    render(root, block, (color) => (type ? this.renderer.drawnColor(type, color) : color));
+  }
+
+  /**
+   * Shows the text in the board's current colors again, after its color theme changed (the
+   * caret and selection stay).
+   */
+  restyle(): void {
+    if (!this.id || !this.block || this.composing) return;
+    const [from, to] = this.selection();
+    this.render(this.input, this.block);
+    this.select(from, to);
+    this.sync();
   }
 
   /** Positions the editor over the element; called after every frame. */
   sync(): void {
     if (!this.id || !this.block) return;
-    const el = this.scene.get(this.id);
-    if (!el || !isShape(el)) {
+    const element = this.scene.get(this.id);
+    if (!element || !isShape(element)) {
       this.stop();
       return;
     }
     const zoom = this.camera.zoom;
-    const center = this.camera.worldToScreen({ x: el.x + el.w / 2, y: el.y + el.h / 2 });
-    const area = textArea(el);
-    const layout = this.renderer.textLayout(el);
-    const k = layout?.scale ?? 1;
-    const s = this.root.style;
-    s.width = `${el.w}px`;
-    s.height = `${el.h}px`;
-    s.transform = `translate(${center.x}px, ${center.y}px) scale(${zoom}) rotate(${el.rotation}rad) translate(-50%, -50%)`;
-    s.padding = `${area.minY}px ${el.w - area.maxX}px ${el.h - area.maxY}px ${area.minX}px`;
-    s.justifyContent = JUSTIFY[this.block.verticalAlign];
-    const i = this.input.style;
-    i.fontFamily = fontFamily(this.block.font).css;
-    i.fontSize = `${this.block.fontSize * k}px`;
-    i.setProperty('--k', String(k));
-    i.setProperty('--gap', `${LIST_GAP_EM * this.block.fontSize * k}px`);
-    i.lineHeight = String(LINE_HEIGHT);
-    i.textAlign = this.block.align;
-    // As drawn on the board: a dark theme may show the stored color differently. The text
-    // itself is transparent (the board draws it); the caret takes the text's color.
-    i.color = toCss(this.renderer.drawnColor(el.type, this.block.color));
-    i.caretColor = i.color;
+    const center = this.camera.worldToScreen({
+      x: element.x + element.width / 2,
+      y: element.y + element.height / 2,
+    });
+    const area = textArea(element);
+    const layout = this.renderer.textLayout(element);
+    const scale = layout?.scale ?? 1;
+    const style = this.root.style;
+    style.width = `${element.width}px`;
+    style.height = `${element.height}px`;
+    style.transform = `translate(${center.x}px, ${center.y}px) scale(${zoom}) rotate(${element.rotation}rad) translate(-50%, -50%)`;
+    style.padding = `${area.minY}px ${element.width - area.maxX}px ${element.height - area.maxY}px ${area.minX}px`;
+    style.justifyContent = JUSTIFY[this.block.verticalAlign];
+    const inputStyle = this.input.style;
+    inputStyle.fontFamily = fontFamily(this.block.font).css;
+    inputStyle.fontSize = `${this.block.fontSize * scale}px`;
+    inputStyle.setProperty('--k', String(scale));
+    inputStyle.setProperty('--gap', `${LIST_GAP_EM * this.block.fontSize * scale}px`);
+    inputStyle.lineHeight = String(LINE_HEIGHT);
+    inputStyle.textAlign = this.block.align;
+    // As drawn on the board: a dark theme may show the stored color differently. The caret
+    // takes the text's color.
+    inputStyle.color = cssColor(this.renderer.drawnColor(element.type, this.block.color));
+    inputStyle.caretColor = inputStyle.color;
     // Auto-width text never wraps; the box grows with it instead.
-    i.whiteSpace = el.type === 'text' && this.block.sizing === 'auto-width' ? 'pre' : '';
-    if (document.activeElement !== this.bar.sizeInput) {
-      const size = this.sizeAtSelection();
-      this.bar.sizeInput.value = size === null ? '' : String(Math.round(size * k * 10) / 10);
-    }
-
-    // Toolbar sits above the element's screen bounding box, unscaled.
-    const b = this.scene.getBounds(this.id);
-    if (b) {
-      const top = this.camera.worldToScreen({ x: (b.minX + b.maxX) / 2, y: b.minY });
-      const bottom = this.camera.worldToScreen({ x: 0, y: b.maxY }).y;
-      // Kept on screen: pushed in from the sides, and under the element if there is no
-      // room above it.
-      const tw = this.toolbar.offsetWidth;
-      const th = this.toolbar.offsetHeight;
-      const vw = this.camera.viewportWidth;
-      const margin = 8;
-      const x = Math.max(margin, Math.min(top.x - tw / 2, vw - tw - margin));
-      const y = top.y - 12 - th >= margin ? top.y - 12 - th : bottom + 12;
-      this.toolbar.style.transform = `translate(${x}px, ${y}px)`;
-    }
+    inputStyle.whiteSpace =
+      element.type === 'text' && this.block.sizing === 'auto-width' ? 'pre' : '';
+    this.syncFormat(); // autoFit may have changed the shown size
   }
 
-  private onKeyDown(e: KeyboardEvent): void {
-    e.stopPropagation(); // board shortcuts (Delete, Ctrl+A) must not fire while typing
-    if (e.key === 'Escape') {
+  private onKeyDown(event: KeyboardEvent): void {
+    event.stopPropagation(); // board shortcuts (Delete, Ctrl+A) must not fire while typing
+    if (event.key === 'Escape') {
       this.input.blur();
       return;
     }
-    if (e.key === 'Tab') {
+    if (event.key === 'Tab') {
       // Nest list items; elsewhere Tab must not move focus out of the text.
-      e.preventDefault();
-      this.indentAtSelection(e.shiftKey ? -1 : 1);
+      event.preventDefault();
+      this.indentAtSelection(event.shiftKey ? -1 : 1);
       return;
     }
-    if (!(e.ctrlKey || e.metaKey)) return;
-    if (e.shiftKey && (e.code === 'Period' || e.code === 'Comma')) {
-      e.preventDefault();
-      this.stepSize(e.code === 'Period' ? 1 : -1);
+    if (!(event.ctrlKey || event.metaKey)) return;
+    if (event.shiftKey && (event.code === 'Period' || event.code === 'Comma')) {
+      event.preventDefault();
+      this.stepSize(event.code === 'Period' ? 1 : -1);
       return;
     }
-    if (e.shiftKey && (e.code === 'Digit7' || e.code === 'Digit8')) {
-      e.preventDefault();
-      this.toggleListAtSelection(e.code === 'Digit7' ? 'ordered' : 'bullet');
+    if (event.shiftKey && (event.code === 'Digit7' || event.code === 'Digit8')) {
+      event.preventDefault();
+      this.toggleListAtSelection(event.code === 'Digit7' ? 'ordered' : 'bullet');
       return;
     }
-    if (!e.shiftKey && !e.altKey && e.code === 'KeyK') {
-      e.preventDefault();
-      this.openLinkBar();
-      return;
-    }
-    const key = e.key.toLowerCase();
-    if (key === 'z' || key === 'y' || key === 'я' || key === 'н') {
-      e.preventDefault();
-      const redo = key === 'y' || key === 'н' || e.shiftKey;
-      if (redo) this.redo();
+    // By physical key, like the board's shortcuts: they work with any keyboard layout.
+    const letter = keyLetter(event);
+    if (letter === 'Z' || letter === 'Y') {
+      event.preventDefault();
+      if (letter === 'Y' || event.shiftKey) this.redo();
       else this.undo();
       return;
     }
-    const map: Record<string, BooleanStyle> = { b: 'bold', i: 'italic', u: 'underline' };
-    const toggle = e.shiftKey ? (key === 'x' ? 'strike' : undefined) : map[key];
+    const toggle = event.shiftKey
+      ? letter === 'X'
+        ? 'strike'
+        : undefined
+      : STYLE_SHORTCUTS[letter];
     if (toggle) {
-      e.preventDefault();
+      event.preventDefault();
       this.toggle(toggle);
     }
   }
 
-  private onBeforeInput(e: InputEvent): void {
+  private onBeforeInput(event: InputEvent): void {
     const [from, to] = this.selection();
     this.inputStart = from;
     this.beforeSelection = [from, to];
     if (!this.block) return;
     const runs = this.block.runs;
-    const para = paragraphAt(runs, from);
-    const style = paragraphStyle(this.block, para);
+    const paragraph = paragraphAt(runs, from);
+    const style = paragraphStyle(this.block, paragraph);
     const atLineStart = from === to && (from === 0 || plainText(this.block)[from - 1] === '\n');
-    if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+    if (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak') {
       // Insert a plain '\n' ourselves: browsers otherwise disagree on <div>/<br>.
-      e.preventDefault();
+      event.preventDefault();
       const lineEmpty = atLineStart && (plainText(this.block)[from] ?? '\n') === '\n';
       if (style.list && lineEmpty) {
         // Enter on an empty item leaves the list (one level up first), like word processors.
         this.write(
-          updateParagraphs(this.block, para, para, (s) =>
-            s.indent ? { ...s, indent: s.indent - 1 } : {},
+          updateParagraphs(this.block, paragraph, paragraph, (style) =>
+            style.indent ? { ...style, indent: style.indent - 1 } : {},
           ),
           from,
           to,
@@ -482,21 +510,24 @@ export class TextEditor {
         return;
       }
       this.replace(from, to, '\n');
-    } else if (e.inputType === 'deleteContentBackward' && style.list && atLineStart) {
+    } else if (event.inputType === 'deleteContentBackward' && style.list && atLineStart) {
       // Backspace at the start of an item turns it back into a plain line first.
-      e.preventDefault();
+      event.preventDefault();
       this.write(
-        updateParagraphs(this.block, para, para, () => ({})),
+        updateParagraphs(this.block, paragraph, paragraph, () => ({})),
         from,
         to,
       );
-    } else if (e.inputType.startsWith('delete') && this.deleteAtEdges(e.inputType, from, to)) {
-      e.preventDefault();
-    } else if (e.inputType.startsWith('format')) {
-      e.preventDefault(); // formatting goes through our model only
-    } else if (e.inputType === 'historyUndo' || e.inputType === 'historyRedo') {
-      e.preventDefault(); // menu/gesture undo: ours, not the browser's (it doesn't know our DOM)
-      if (e.inputType === 'historyUndo') this.undo();
+    } else if (
+      event.inputType.startsWith('delete') &&
+      this.deleteAtEdges(event.inputType, from, to)
+    ) {
+      event.preventDefault();
+    } else if (event.inputType.startsWith('format')) {
+      event.preventDefault(); // formatting goes through our model only
+    } else if (event.inputType === 'historyUndo' || event.inputType === 'historyRedo') {
+      event.preventDefault(); // menu/gesture undo: ours, not the browser's (it doesn't know our DOM)
+      if (event.inputType === 'historyUndo') this.undo();
       else this.redo();
     }
   }
@@ -539,8 +570,8 @@ export class TextEditor {
   private travel(from: Snapshot[], to: Snapshot[]): void {
     const target = from.pop();
     if (!target || !this.block) return;
-    const [selFrom, selTo] = this.selection();
-    to.push({ block: this.block, from: selFrom, to: selTo });
+    const [selectionFrom, selectionTo] = this.selection();
+    to.push({ block: this.block, from: selectionFrom, to: selectionTo });
     this.lastTypingAt = 0; // the next keystroke starts a new undo step
     this.write(target.block, target.from, target.to, 'none');
   }
@@ -573,43 +604,133 @@ export class TextEditor {
     let at = caret;
     // "- " or "1. " typed at the start of a plain line: make it a list item.
     const text = plainText(block);
-    const para = paragraphAt(runs, caret);
+    const paragraph = paragraphAt(runs, caret);
     const lineStart = text.lastIndexOf('\n', caret - 1) + 1;
     const typed = text.slice(lineStart, caret);
-    const shortcut = LIST_SHORTCUTS.find(([re]) => re.test(typed));
-    if (shortcut && !paragraphStyle(block, para).list) {
+    const shortcut = LIST_SHORTCUTS.find(([pattern]) => pattern.test(typed));
+    if (shortcut && !paragraphStyle(block, paragraph).list) {
       // First record the plain typing, so Ctrl+Z brings the "- " back.
       this.write(block, caret, caret, 'typing');
-      runs = replaceRuns(runs, lineStart, caret, '', null);
+      runs = replaceText(runs, lineStart, caret, '');
       paragraphs = remapParagraphs(block.runs, block.paragraphs, lineStart, caret, '');
       block = withParagraphs({ ...block, runs }, paragraphs);
-      block = updateParagraphs(block, para, para, (s) => ({ ...s, list: shortcut[1] }));
+      block = updateParagraphs(block, paragraph, paragraph, (style) => ({
+        ...style,
+        list: shortcut[1],
+      }));
       at = lineStart;
       this.write(block, at, at, 'other');
       return;
     }
-    this.write(block, at, at, 'typing');
+    this.write(block, at, at, 'typing', true);
   }
 
   private replace(from: number, to: number, text: string): void {
     if (!this.block) return;
-    const runs = replaceRuns(this.block.runs, from, to, text, this.pending);
-    const paragraphs = remapParagraphs(this.block.runs, this.block.paragraphs, from, to, text);
-    this.write(
-      withParagraphs({ ...this.block, runs }, paragraphs),
-      from + text.length,
-      from + text.length,
-    );
+    const caret = from + text.length;
+    this.write(replaceBlockText(this.block, from, to, text, this.pending), caret, caret);
+  }
+
+  // --- Formatting from the app --------------------------------------------------------
+
+  /**
+   * Formatting at the selection (the remembered one while an app control has the focus);
+   * null when nothing is edited. Same object until it changes (`onFormat`).
+   */
+  get format(): TextFormatState | null {
+    return this.formatState;
+  }
+
+  /**
+   * Applies a formatting change to the text being edited and returns the focus to it.
+   * False when nothing is edited, or for a link whose address is not allowed.
+   */
+  apply(command: TextFormatCommand): boolean {
+    if (!this.id || !this.block) return false;
+    let applied = true;
+    switch (command.type) {
+      case 'toggle':
+        this.toggle(command.style);
+        break;
+      case 'color':
+        this.setColor(command.color);
+        break;
+      case 'font':
+        this.setFont(command.font);
+        break;
+      case 'fontSize':
+        if (command.size === 'auto') this.setAutoSize();
+        else this.setFontSize(command.size);
+        break;
+      case 'stepSize':
+        this.stepSize(command.direction);
+        break;
+      case 'list':
+        this.toggleListAtSelection(command.kind);
+        break;
+      case 'indent':
+        this.indentAtSelection(command.direction);
+        break;
+      case 'align':
+        this.setBlock({ align: command.align });
+        break;
+      case 'link':
+        applied = this.setLink(command.href);
+        break;
+    }
+    this.refocus();
+    this.syncFormat();
+    return applied;
+  }
+
+  private computeFormat(): TextFormatState | null {
+    const block = this.block;
+    if (!this.id || !block) return null;
+    const [from, to] = this.lastSelectionOrCurrent();
+    const pending = from === to ? this.pending : null;
+    const style = (key: BooleanStyle) => pending?.[key] ?? hasStyle(block.runs, from, to, key);
+    const [first, last] = paragraphRange(block.runs, from, to);
+    let list: ListKind | null = paragraphStyle(block, first).list ?? null;
+    for (let i = first + 1; i <= last && list; i++)
+      if (paragraphStyle(block, i).list !== list) list = null;
+    const rangeLink = commonStyle(block.runs, from, to, 'link');
+    const link =
+      (from === to ? linkAt(block.runs, from)?.href : undefined) ??
+      (typeof rangeLink === 'string' ? rangeLink : null);
+    const font = commonStyle(block.runs, from, to, 'font');
+    const size = this.sizeAtSelection();
+    const color =
+      pending && 'color' in pending ? pending.color : commonStyle(block.runs, from, to, 'color');
+    return {
+      bold: style('bold'),
+      italic: style('italic'),
+      underline: style('underline'),
+      strike: style('strike'),
+      font: font === MIXED ? null : fontFamily(font ?? block.font).id,
+      fontSize: size === null ? null : Math.round(size * this.scale() * 10) / 10,
+      color: color === MIXED ? null : (color ?? block.color),
+      align: block.align,
+      autoSize: !!(block.autoFit && block.autoGrow),
+      list,
+      link,
+    };
+  }
+
+  private syncFormat(): void {
+    const next = this.computeFormat();
+    if (sameFormat(next, this.formatState)) return;
+    this.formatState = next;
+    this.onFormat();
   }
 
   private toggle(key: BooleanStyle): void {
     if (!this.block) return;
-    const [from, to] = this.selection();
+    const [from, to] = this.lastSelectionOrCurrent();
     if (from === to) {
       // No selection: affects what is typed next.
       const current = this.pending?.[key] ?? hasStyle(this.block.runs, from, to, key);
       this.pending = { ...this.pending, [key]: !current };
-      this.syncToolbar();
+      this.syncFormat();
       return;
     }
     this.update(toggleStyle(this.block.runs, from, to, key), from, to);
@@ -617,7 +738,7 @@ export class TextEditor {
 
   private setColor(color: number): void {
     if (!this.block) return;
-    const [from, to] = this.selection();
+    const [from, to] = this.lastSelectionOrCurrent();
     const value = color === this.block.color ? undefined : color;
     if (from === to) {
       this.pending = { ...this.pending, color: value };
@@ -632,48 +753,63 @@ export class TextEditor {
   private sizeAtSelection(): number | null {
     if (!this.block) return null;
     const [from, to] = this.lastSelectionOrCurrent();
-    const v = commonStyle(this.block.runs, from, to, 'size');
-    return v === MIXED ? null : (v ?? this.block.fontSize);
+    const size = commonStyle(this.block.runs, from, to, 'size');
+    return size === MIXED ? null : (size ?? this.block.fontSize);
+  }
+
+  /**
+   * The text with its automatic size switched off, as choosing a size does in Miro: every
+   * size becomes the one shown now, so nothing jumps. And the scale it is shown at then.
+   */
+  private withFixedSize(block: TextBlock): { block: TextBlock; scale: number } {
+    const scale = this.scale();
+    if (!block.autoGrow) return { block, scale };
+    const fixed: TextBlock = {
+      ...block,
+      fontSize: clampFontSize(block.fontSize * scale),
+      runs: block.runs.map((run) =>
+        run.size === undefined ? run : { ...run, size: clampFontSize(run.size * scale) },
+      ),
+    };
+    delete fixed.autoGrow;
+    return { block: fixed, scale: 1 };
+  }
+
+  /** Back to the automatic size: the text grows or shrinks to fill its box. */
+  private setAutoSize(): void {
+    if (!this.block || this.block.autoGrow) return;
+    const [from, to] = this.lastSelectionOrCurrent();
+    this.write({ ...this.block, autoFit: true, autoGrow: true }, from, to);
+    this.refocus();
   }
 
   private setFontSize(size: number): void {
     if (!this.block) return;
-    const fontSize = clampFontSize(size / this.scale());
+    const { block, scale } = this.withFixedSize(this.block);
+    const fontSize = clampFontSize(size / scale);
     const [from, to] = this.lastSelectionOrCurrent();
     if (from === to) {
       // The whole text gets this size.
-      const len = runsLength(this.block.runs);
-      const runs =
-        len > 0 ? applyStyle(this.block.runs, 0, len, { size: undefined }) : this.block.runs;
-      this.write({ ...this.block, fontSize, runs }, from, to);
+      this.write(withFontSize(block, fontSize), from, to);
     } else {
-      const value = fontSize === this.block.fontSize ? undefined : fontSize;
-      this.write(
-        { ...this.block, runs: applyStyle(this.block.runs, from, to, { size: value }) },
-        from,
-        to,
-      );
+      const value = fontSize === block.fontSize ? undefined : fontSize;
+      this.write({ ...block, runs: applyStyle(block.runs, from, to, { size: value }) }, from, to);
     }
     this.refocus();
   }
 
-  private stepSize(dir: 1 | -1): void {
+  private stepSize(direction: 1 | -1): void {
     if (!this.block) return;
     const [from, to] = this.lastSelectionOrCurrent();
-    const k = this.scale();
     if (from !== to) {
       // From the size actually shown: an auto-fitted sticky may be smaller than its maximum.
-      const shown = (this.sizeAtSelection() ?? this.block.fontSize) * k;
-      this.setFontSize(stepFontSize(shown, dir));
+      const shown = (this.sizeAtSelection() ?? this.block.fontSize) * this.scale();
+      this.setFontSize(stepFontSize(shown, direction));
       return;
     }
     // Whole text: every size steps by the same ratio, so headings stay bigger.
-    const next = clampFontSize(stepFontSize(this.block.fontSize * k, dir) / k);
-    const ratio = next / this.block.fontSize;
-    const runs = this.block.runs.map((r) =>
-      r.size === undefined ? r : { ...r, size: clampFontSize(r.size * ratio) },
-    );
-    this.write({ ...this.block, fontSize: next, runs }, from, to);
+    const { block, scale } = this.withFixedSize(this.block);
+    this.write(stepTextSize(block, direction, scale), from, to);
     this.refocus();
   }
 
@@ -681,14 +817,9 @@ export class TextEditor {
     if (!this.block) return;
     const [from, to] = this.lastSelectionOrCurrent();
     if (from === to) {
-      const len = runsLength(this.block.runs);
-      const runs =
-        len > 0 ? applyStyle(this.block.runs, 0, len, { font: undefined }) : this.block.runs;
-      const block: TextBlock = { ...this.block, runs, font: id };
-      if (fontIndex(id) === 0) delete block.font;
-      this.write(block, from, to);
+      this.write(withFont(this.block, id), from, to);
     } else {
-      const value = fontIndex(id) === fontIndex(this.block.font) ? undefined : id;
+      const value = fontFamily(id).id === fontFamily(this.block.font).id ? undefined : id;
       this.write(
         { ...this.block, runs: applyStyle(this.block.runs, from, to, { font: value }) },
         from,
@@ -700,8 +831,8 @@ export class TextEditor {
 
   /** autoFit factor the text is shown at (sizes in the model are before it). */
   private scale(): number {
-    const el = this.id ? this.scene.get(this.id) : undefined;
-    return el && isShape(el) ? (this.renderer.textLayout(el)?.scale ?? 1) : 1;
+    const element = this.id ? this.scene.get(this.id) : undefined;
+    return element && isShape(element) ? (this.renderer.textLayout(element)?.scale ?? 1) : 1;
   }
 
   // --- Lists -----------------------------------------------------------------------
@@ -714,57 +845,33 @@ export class TextEditor {
     this.refocus();
   }
 
-  private indentAtSelection(dir: 1 | -1): void {
+  private indentAtSelection(direction: 1 | -1): void {
     if (!this.block) return;
     const [from, to] = this.selection();
     const [first, last] = paragraphRange(this.block.runs, from, to);
-    const next = indentList(this.block, first, last, dir);
+    const next = indentList(this.block, first, last, direction);
     if (next.paragraphs !== this.block.paragraphs) this.write(next, from, to);
   }
 
   // --- Links -----------------------------------------------------------------------
 
-  private openLinkBar(): void {
-    if (!this.block) return;
-    const [from, to] = this.selection();
-    const around = from === to ? linkAt(this.block.runs, from) : null;
-    this.linkRange = around ? [around.from, around.to] : [from, to];
-    const href = around?.href ?? commonStyle(this.block.runs, from, to, 'link');
-    this.bar.linkInput.value = typeof href === 'string' ? href : '';
-    this.bar.linkInput.classList.remove('invalid');
-    this.bar.linkBar.hidden = false;
-    this.bar.linkInput.focus();
-    this.bar.linkInput.select();
-  }
-
-  private closeLinkBar(): void {
-    this.bar.linkBar.hidden = true;
-    this.linkRange = null;
-  }
-
   /**
-   * Links the remembered range to the typed address (an empty field removes the link).
-   * Without a selection the address itself is inserted as linked text.
+   * Links the selection, or the link around the caret, to `address` (null or empty removes
+   * the link). With a caret outside a link the address itself is inserted as linked text.
+   * False if the address is not an allowed link.
    */
-  private applyLink(): void {
-    if (!this.block || !this.linkRange) return;
-    const [from, to] = this.linkRange;
-    const raw = this.bar.linkInput.value.trim();
+  private setLink(address: string | null): boolean {
+    if (!this.block) return false;
+    const [selectionFrom, selectionTo] = this.lastSelectionOrCurrent();
+    const around = selectionFrom === selectionTo ? linkAt(this.block.runs, selectionFrom) : null;
+    const [from, to] = around ? [around.from, around.to] : [selectionFrom, selectionTo];
+    const raw = address?.trim() ?? '';
     const href = raw === '' ? undefined : normalizeLink(raw);
-    if (href === null) {
-      this.bar.linkInput.classList.add('invalid');
-      return;
-    }
-    this.closeLinkBar();
+    if (href === null) return false;
     if (from === to) {
       if (href) {
-        const runs = replaceRuns(this.block.runs, from, to, raw, { link: href });
-        const paragraphs = remapParagraphs(this.block.runs, this.block.paragraphs, from, to, raw);
-        this.write(
-          withParagraphs({ ...this.block, runs }, paragraphs),
-          from + raw.length,
-          from + raw.length,
-        );
+        const caret = from + raw.length;
+        this.write(replaceBlockText(this.block, from, to, raw, { link: href }), caret, caret);
       }
     } else {
       this.write(
@@ -774,6 +881,7 @@ export class TextEditor {
       );
     }
     this.refocus();
+    return true;
   }
 
   // --- Writing ---------------------------------------------------------------------
@@ -788,12 +896,12 @@ export class TextEditor {
 
   private update(
     runs: TextRun[],
-    selFrom: number,
-    selTo: number,
+    selectionFrom: number,
+    selectionTo: number,
     history: 'typing' | 'other' | 'none' = 'other',
   ): void {
     if (!this.block) return;
-    this.write({ ...this.block, runs }, selFrom, selTo, history);
+    this.write({ ...this.block, runs }, selectionFrom, selectionTo, history);
   }
 
   /**
@@ -802,27 +910,37 @@ export class TextEditor {
    */
   private write(
     block: TextBlock,
-    selFrom: number,
-    selTo: number,
+    selectionFrom: number,
+    selectionTo: number,
     history: 'typing' | 'other' | 'none' = 'other',
+    /**
+     * The browser has just typed into the DOM itself. When that DOM is already what the block
+     * renders to, it stays as it is, caret included: rebuilding it on every keystroke loses
+     * the caret's side at a soft line break (it jumps between lines) and the browser's own
+     * state of the field.
+     */
+    typedByBrowser = false,
   ): void {
     if (!this.id || !this.block) return;
-    const el = this.scene.get(this.id);
-    if (!el || !isShape(el)) return;
+    const element = this.scene.get(this.id);
+    if (!element || !isShape(element)) return;
     if (history !== 'none') this.record(history);
     this.block = block;
-    render(this.input, block, this.labels.openLinkHint);
-    this.select(selFrom, selTo);
-    this.lastSelection = [selFrom, selTo];
+    const rendered = document.createElement('div');
+    this.render(rendered, block);
+    if (!typedByBrowser || rendered.innerHTML !== this.input.innerHTML) {
+      this.input.replaceChildren(...rendered.childNodes);
+      this.select(selectionFrom, selectionTo);
+    }
+    this.lastSelection = [selectionFrom, selectionTo];
     this.scene.update(this.id, {
       text: block,
-      ...fitTextPatch(el, this.renderer.measurer, block),
+      ...fitTextPatch(element, this.renderer.measurer, block),
     });
-    this.syncToolbar();
-    this.sync(); // autoFit may have changed the font size
+    this.sync(); // autoFit may have changed the font size; syncs `format` too
   }
 
-  /** Back to typing after a toolbar field took the focus, with the selection it had. */
+  /** Back to typing after an app control took the focus, with the selection it had. */
   private refocus(): void {
     if (!this.id || document.activeElement === this.input) return;
     const [from, to] = this.lastSelectionOrCurrent();
@@ -831,51 +949,34 @@ export class TextEditor {
   }
 
   private lastSelectionOrCurrent(): [number, number] {
-    const sel = getSelection();
-    if (sel && sel.rangeCount > 0 && this.input.contains(sel.anchorNode)) return this.selection();
+    const selection = getSelection();
+    if (selection && selection.rangeCount > 0 && this.input.contains(selection.anchorNode))
+      return this.selection();
     return this.lastSelection ?? this.selection();
   }
 
   private selection(): [number, number] {
-    const sel = getSelection();
-    if (!sel || sel.rangeCount === 0 || !this.input.contains(sel.anchorNode)) {
+    const selection = getSelection();
+    if (!selection || selection.rangeCount === 0 || !this.input.contains(selection.anchorNode)) {
       if (this.lastSelection) return this.lastSelection;
       const end = this.block ? runsLength(this.block.runs) : 0;
       return [end, end];
     }
-    const r = sel.getRangeAt(0);
-    const a = offsetOf(this.input, r.startContainer, r.startOffset);
-    const b = offsetOf(this.input, r.endContainer, r.endOffset);
-    return [Math.min(a, b), Math.max(a, b)];
+    const range = selection.getRangeAt(0);
+    const startOffset = offsetOf(this.input, range.startContainer, range.startOffset);
+    const endOffset = offsetOf(this.input, range.endContainer, range.endOffset);
+    return [Math.min(startOffset, endOffset), Math.max(startOffset, endOffset)];
   }
 
   private select(from: number, to: number): void {
-    const sel = getSelection();
-    if (!sel) return;
-    const a = positionOf(this.input, from);
-    const b = positionOf(this.input, to);
+    const selection = getSelection();
+    if (!selection) return;
+    const start = positionOf(this.input, from);
+    const end = positionOf(this.input, to);
     const range = document.createRange();
-    range.setStart(a.node, a.offset);
-    range.setEnd(b.node, b.offset);
-    sel.removeAllRanges();
-    sel.addRange(range);
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    selection.removeAllRanges();
+    selection.addRange(range);
   }
-
-  private syncToolbar(): void {
-    if (!this.block || this.toolbar.hidden) return;
-    const [from, to] = this.selection();
-    this.bar.sync(this.block, from, to, this.pending);
-  }
-
-  /** The toolbar's element (shown above the text while editing). */
-  private get toolbar(): HTMLElement {
-    return this.bar.el;
-  }
-}
-
-/** `block` with these paragraph styles (the field is dropped when all are plain). */
-function withParagraphs(block: TextBlock, paragraphs: ParagraphStyle[] | undefined): TextBlock {
-  const next: TextBlock = { ...block, paragraphs };
-  if (!paragraphs) delete next.paragraphs;
-  return next;
 }

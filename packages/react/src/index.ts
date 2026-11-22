@@ -2,9 +2,10 @@
 export {
   Board,
   BoardProvider,
+  boardOptions,
+  type BoardOptions,
   type BoardProps,
   type BoardProviderProps,
-  type BoardSettings,
   type BoardTheme,
   type BoardViewProps,
 } from './board';
@@ -14,4 +15,4 @@ export { useBoard, type BoardApi, type ElementUpdate } from './board-api';
 export * from './hooks';
 export type { BoardChangeListener, BoardChanges } from './changes';
 // Low level.
-export { useEditor, useIsClient, type BoardOptions } from './editor-context';
+export { useEditor } from './editor-context';

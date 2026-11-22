@@ -1,6 +1,6 @@
 /**
- * Unique element id. Random UUIDs: ids created by different participants at the same
- * millisecond must never collide once boards are shared.
+ * Unique element id, `prefix-<uuid>`. Random UUIDs: ids created by different participants
+ * at the same millisecond must never collide once boards are shared.
  */
 export function newId(prefix: string): string {
   const uuid =

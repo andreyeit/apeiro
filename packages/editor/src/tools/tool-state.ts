@@ -8,22 +8,10 @@ import type {
 } from '@apeiro/core';
 
 /** Tools that put a new element on the board: a click drops a default one, a drag sizes it. */
-export type PlaceKind = 'sticky' | 'rect' | 'ellipse' | 'polygon';
+const PLACE_KINDS = ['sticky', 'rect', 'ellipse', 'polygon'] as const;
+export type PlaceKind = (typeof PLACE_KINDS)[number];
 
-export type BuiltinTool =
-  | 'select'
-  | 'hand'
-  | 'connector'
-  | 'text'
-  | 'pen'
-  | 'eraser'
-  | 'comment'
-  | PlaceKind;
-
-/** Built-in names keep autocomplete; registered tools may use any other name. */
-export type Tool = BuiltinTool | (string & {});
-
-const BUILTIN_TOOLS = new Set<string>([
+const BUILTIN_TOOLS = [
   'select',
   'hand',
   'connector',
@@ -31,10 +19,21 @@ const BUILTIN_TOOLS = new Set<string>([
   'pen',
   'eraser',
   'comment',
-  'sticky',
-  'rect',
-  'ellipse',
-  'polygon',
+  ...PLACE_KINDS,
+] as const;
+export type BuiltinTool = (typeof BUILTIN_TOOLS)[number];
+
+/** Built-in names keep autocomplete; registered tools may use any other name. */
+export type Tool = BuiltinTool | (string & {});
+
+const BUILTIN_TOOL_SET: ReadonlySet<string> = new Set(BUILTIN_TOOLS);
+/** Tools that stay active after a gesture unless told otherwise. */
+const REPEATING_TOOLS: ReadonlySet<string> = new Set([
+  'select',
+  'hand',
+  'pen',
+  'eraser',
+  'connector',
 ]);
 
 export interface ToolActivation {
@@ -61,7 +60,7 @@ export interface CustomTool {
 export type ShapeToolStyle = Partial<
   Pick<
     ShapeElement,
-    'w' | 'h' | 'fill' | 'stroke' | 'strokeWidth' | 'strokeStyle' | 'radius' | 'sides'
+    'width' | 'height' | 'fill' | 'stroke' | 'strokeWidth' | 'strokeStyle' | 'radius' | 'sides'
   >
 >;
 export interface ToolStyles {
@@ -74,8 +73,8 @@ export interface ToolStyles {
   pen: Partial<PenStyle>;
 }
 
-const PLACE_KINDS = new Set<Tool>(['sticky', 'rect', 'ellipse', 'polygon']);
-export const isPlaceTool = (t: Tool): t is PlaceKind => PLACE_KINDS.has(t);
+const PLACE_KIND_SET: ReadonlySet<string> = new Set(PLACE_KINDS);
+export const isPlaceTool = (tool: Tool): tool is PlaceKind => PLACE_KIND_SET.has(tool);
 
 /** Tools that don't change the board: the only ones a read-only board offers. */
 export const VIEW_TOOLS: ReadonlySet<Tool> = new Set<Tool>(['select', 'hand', 'comment']);
@@ -127,10 +126,9 @@ export class ToolState {
   onChange: () => void = () => undefined;
 
   setTool(tool: Tool, options: ToolActivation = {}): void {
-    if (!BUILTIN_TOOLS.has(tool) && !this.custom.has(tool))
+    if (!BUILTIN_TOOL_SET.has(tool) && !this.custom.has(tool))
       throw new Error(`Unknown tool: ${tool}. Register it before activating it.`);
-    const repeat =
-      options.repeat ?? ['select', 'hand', 'pen', 'eraser', 'connector'].includes(tool);
+    const repeat = options.repeat ?? REPEATING_TOOLS.has(tool);
     if (this.tool === tool && this.repeat === repeat) return;
     this.tool = tool;
     this.repeat = repeat;
@@ -163,7 +161,7 @@ export class ToolState {
   }
 
   register(name: string, definition: CustomTool): () => void {
-    if (!name || BUILTIN_TOOLS.has(name) || this.custom.has(name))
+    if (!name || BUILTIN_TOOL_SET.has(name) || this.custom.has(name))
       throw new Error(`Tool ${name} is already registered or reserved`);
     const registered = { ...definition };
     this.custom.set(name, registered);

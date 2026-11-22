@@ -108,26 +108,15 @@
   /* Same glyph shapes as the board: no ligatures, normal kerning. */
   font-variant-ligatures: none;
   font-kerning: normal;
+  /* Same glyph widths as the board, which measures them unrounded: Chrome on Linux otherwise
+     rounds each advance to whole pixels for hinting, the text drifts from the board's along
+     the line and wraps elsewhere (the caret lands off the letters). */
+  text-rendering: geometricPrecision;
 }
-/*
- * The board keeps drawing the text being edited, so nothing changes when editing starts
- * (weight, colors, layout). The editor's text is only there for the caret and selection;
- * during an IME composition (.composing) it shows, as that text isn't on the board yet.
- */
-.ap-text-editor-input:not(.composing),
-.ap-text-editor-input:not(.composing) *,
-.ap-text-editor-input:not(.composing) [data-list]::before {
-  color: transparent !important;
-  text-decoration-color: transparent !important;
-}
+/* While editing, this text is what shows (the board hides its own), in the board's colors. */
 .ap-text-editor-input ::selection,
 .ap-text-editor-input::selection {
   background: color-mix(in srgb, var(--ap-accent) 28%, transparent);
-  color: transparent;
-}
-.ap-text-editor-input.composing ::selection,
-.ap-text-editor-input.composing::selection {
-  color: inherit;
 }
 .ap-text-editor-input [data-b] {
   font-weight: 700;
@@ -154,120 +143,17 @@
   padding-right: var(--gap);
   text-align: right;
   font-weight: 400;
+  color: var(--mc);
   font-style: normal;
   text-decoration: none;
   white-space: nowrap;
 }
-/* Links: underlined, blue unless colored; Ctrl+click opens. */
+/* Links: underlined (in `LINK_COLOR` unless colored, set by `render`); Ctrl+click opens. */
 .ap-text-editor-input [data-href] {
   text-decoration: underline;
 }
-.ap-text-editor-input [data-href]:not([data-c]) {
-  color: var(--ap-accent);
-}
 .ap-text-editor-input [data-href][data-s] {
   text-decoration: underline line-through;
-}
-
-/* The editor's floating text toolbar: styled like the selection toolbar. */
-.ap-text-toolbar {
-  position: absolute;
-  left: 0;
-  top: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 4px;
-  padding: 4px;
-  background: var(--ap-surface);
-  color: var(--ap-foreground);
-  border: 1px solid var(--ap-border);
-  border-radius: var(--ap-radius-md);
-  box-shadow: var(--ap-shadow);
-  pointer-events: auto;
-  font: 400 14px/20px var(--ap-font);
-}
-.ap-text-toolbar-row {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-.ap-text-toolbar button {
-  display: grid;
-  place-items: center;
-  min-width: 32px;
-  height: 32px;
-  padding: 0;
-  border: 0;
-  border-radius: var(--ap-radius-sm);
-  background: transparent;
-  font-weight: 600;
-  cursor: pointer;
-}
-.ap-text-toolbar button:hover {
-  background: var(--ap-muted);
-}
-.ap-text-toolbar button.wide {
-  padding: 0 8px;
-}
-.ap-text-toolbar button.active {
-  background: var(--ap-muted);
-  color: var(--ap-accent);
-}
-.ap-text-toolbar button[data-style='italic'] {
-  font-style: italic;
-}
-.ap-text-toolbar button[data-style='underline'] {
-  text-decoration: underline;
-}
-.ap-text-toolbar button[data-style='strike'] {
-  text-decoration: line-through;
-}
-.ap-text-toolbar button[data-list] {
-  font-weight: 700;
-}
-.ap-text-toolbar .swatch {
-  min-width: 20px;
-  width: 20px;
-  height: 20px;
-  margin: 0 2px;
-  border: 1px solid var(--ap-border);
-  border-radius: 50%;
-}
-.ap-text-toolbar .font-size,
-.ap-text-toolbar .font-family,
-.ap-link-bar .ap-link-input {
-  height: 32px;
-  padding: 0 8px;
-  border: 1px solid var(--ap-border);
-  border-radius: var(--ap-radius-sm);
-  background: var(--ap-surface);
-}
-.ap-text-toolbar .font-size {
-  width: 56px;
-  text-align: center;
-}
-.ap-text-toolbar .font-family {
-  max-width: 130px;
-}
-.ap-text-toolbar .sep {
-  width: 1px;
-  height: 20px;
-  margin: 0 2px;
-  background: var(--ap-border);
-}
-.ap-link-bar .ap-link-input {
-  flex: 1;
-  min-width: 220px;
-}
-.ap-link-bar .ap-link-input.invalid {
-  border-color: var(--ap-danger);
-  outline: 1px solid var(--ap-danger);
-}
-
-/* `textToolbar: false`: the host app shows its own formatting controls. */
-.ap-board[data-ap-text-toolbar='off'] .ap-text-toolbar {
-  display: none !important;
 }
 
 /* --- React: UI rendered over the board (`<Board>{children}</Board>`) --------- */

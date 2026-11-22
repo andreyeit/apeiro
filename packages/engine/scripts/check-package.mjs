@@ -47,22 +47,7 @@ for (const entry of ['dist/react.js']) {
   if (!readFileSync(join(root, entry), 'utf8').startsWith('"use client"'))
     problems.push(`${entry} does not start with "use client"`);
 }
-// yjs is optional: only `apeiro/sync` may load it, not `apeiro` or `apeiro/react`.
-for (const entry of ['dist/index.js', 'dist/react.js']) {
-  const seen = new Set();
-  const visit = (file) => {
-    if (seen.has(file)) return;
-    seen.add(file);
-    const code = readFileSync(file, 'utf8');
-    if (/from ["'](yjs|y-protocols)[/"']/.test(code))
-      problems.push(`${entry} loads yjs (through ${file})`);
-    for (const [, path] of code.matchAll(/from ["'](\.{1,2}\/[^"']+)["']/g))
-      visit(join(dirname(file), path));
-  };
-  visit(join(root, entry));
-}
-
-for (const entry of ['dist/index.js', 'dist/sync.js']) {
+for (const entry of ['dist/index.js']) {
   if (readFileSync(join(root, entry), 'utf8').includes('use client'))
     problems.push(`${entry} must not be a client module`);
 }
@@ -78,7 +63,7 @@ try {
   cpSync(join(root, 'package.json'), join(installed, 'package.json'));
   cpSync(join(root, 'scripts/consumer.tsx'), join(consumer, 'consumer.tsx'));
   writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
-  for (const dependency of ['react', 'yjs', 'y-protocols', '@types', '@mapbox']) {
+  for (const dependency of ['react', '@types', '@mapbox']) {
     symlinkSync(join(root, 'node_modules', dependency), join(modules, dependency), 'junction');
   }
   for (const [name, module, moduleResolution] of [
@@ -119,8 +104,8 @@ try {
       type: 'rect',
       x: 0,
       y: 0,
-      w: 10,
-      h: 10,
+      width: 10,
+      height: 10,
       rotation: 0,
       z: 0,
       fill: 0,

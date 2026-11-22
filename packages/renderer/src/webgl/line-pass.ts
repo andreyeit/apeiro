@@ -1,6 +1,11 @@
-import { uploadInstances } from '../layers/buffer-upload';
-import { compileProgram, uniforms } from './gl-utils';
-import { LINE_STRIDE, type LineLayer } from '../layers/line-layer';
+import { LINE_LAYOUT, LINE_STRIDE, type LineLayer } from '../layers/line-layer';
+import {
+  bindInstanceAttributes,
+  compileProgram,
+  createUnitQuad,
+  uniforms,
+  uploadInstances,
+} from './gl-utils';
 import { LINE_FRAGMENT, LINE_VERTEX } from './shaders';
 
 interface Resources {
@@ -9,12 +14,16 @@ interface Resources {
   quad: WebGLBuffer;
   instances: WebGLBuffer;
   instanceBytes: number;
-  u: Record<'u_camera' | 'u_viewport', WebGLUniformLocation | null>;
+  uniforms: Record<'u_camera' | 'u_viewport' | 'u_depthOnly', WebGLUniformLocation | null>;
 }
 
-/** GL side of connectors: one instanced draw call for all segments and caps. */
+/**
+ * GL side of connectors: all segments and caps in two instanced draws. First depth only, for
+ * fully opaque pixels, so the line on top hides those below; then color without depth
+ * writes, so an antialiased edge never cuts a hole into a line under it.
+ */
 export class LinePass {
-  private res: Resources | null = null;
+  private resources: Resources | null = null;
   uploadedBytes = 0;
 
   constructor(
@@ -22,75 +31,69 @@ export class LinePass {
     private readonly layer: LineLayer,
   ) {}
 
-  init(): void {
+  initialize(): void {
     const gl = this.gl;
     const program = compileProgram(gl, LINE_VERTEX, LINE_FRAGMENT);
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
-    const quad = gl.createBuffer()!;
-    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-
+    const quad = createUnitQuad(gl);
     const instances = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, instances);
-    const attr = (loc: number, size: number, type: number, normalized: boolean, offset: number) => {
-      gl.enableVertexAttribArray(loc);
-      gl.vertexAttribPointer(loc, size, type, normalized, LINE_STRIDE, offset);
-      gl.vertexAttribDivisor(loc, 1);
-    };
-    attr(1, 4, gl.FLOAT, false, 0);
-    attr(2, 4, gl.FLOAT, false, 16);
-    attr(3, 4, gl.FLOAT, false, 32);
-    attr(4, 4, gl.UNSIGNED_BYTE, true, 48);
+    bindInstanceAttributes(gl, LINE_LAYOUT);
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    this.res = {
+    this.resources = {
       program,
       vao,
       quad,
       instances,
       instanceBytes: 0,
-      u: uniforms(gl, program, ['u_camera', 'u_viewport'] as const),
+      uniforms: uniforms(gl, program, ['u_camera', 'u_viewport', 'u_depthOnly'] as const),
     };
     this.layer.markUploadAll();
   }
 
   lose(): void {
-    this.res = null;
+    this.resources = null;
   }
 
-  draw(x: number, y: number, zoom: number, viewportW: number, viewportH: number): void {
-    const res = this.res;
-    if (!res) return;
-    this.upload(res);
+  draw(x: number, y: number, zoom: number, viewportWidth: number, viewportHeight: number): void {
+    const resources = this.resources;
+    if (!resources) return;
+    this.upload(resources);
     if (this.layer.count === 0) return;
     const gl = this.gl;
-    gl.useProgram(res.program);
-    gl.uniform3f(res.u.u_camera, x, y, zoom);
-    gl.uniform2f(res.u.u_viewport, viewportW, viewportH);
-    gl.bindVertexArray(res.vao);
+    gl.useProgram(resources.program);
+    gl.uniform3f(resources.uniforms.u_camera, x, y, zoom);
+    gl.uniform2f(resources.uniforms.u_viewport, viewportWidth, viewportHeight);
+    gl.bindVertexArray(resources.vao);
+    gl.colorMask(false, false, false, false);
+    gl.uniform1f(resources.uniforms.u_depthOnly, 1);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.layer.count);
+    gl.colorMask(true, true, true, true);
+    gl.depthMask(false);
+    gl.uniform1f(resources.uniforms.u_depthOnly, 0);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.layer.count);
+    gl.depthMask(true);
     gl.bindVertexArray(null);
   }
 
   dispose(): void {
-    const res = this.res;
-    if (!res) return;
+    const resources = this.resources;
+    if (!resources) return;
     const gl = this.gl;
-    gl.deleteProgram(res.program);
-    gl.deleteVertexArray(res.vao);
-    gl.deleteBuffer(res.quad);
-    gl.deleteBuffer(res.instances);
-    this.res = null;
+    gl.deleteProgram(resources.program);
+    gl.deleteVertexArray(resources.vao);
+    gl.deleteBuffer(resources.quad);
+    gl.deleteBuffer(resources.instances);
+    this.resources = null;
   }
 
-  private upload(res: Resources): void {
+  private upload(resources: Resources): void {
     this.uploadedBytes += uploadInstances(
       this.gl,
-      res,
+      resources,
       this.layer.data,
       this.layer.count,
       LINE_STRIDE,

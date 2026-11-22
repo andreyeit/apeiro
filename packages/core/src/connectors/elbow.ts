@@ -1,6 +1,8 @@
-import type { Box, Vec2 } from '../geometry/math';
-import { axis, ELBOW_STUB, type ResolvedEnd, sub } from './local-geometry';
-import { dirOf, routeOrthogonal } from './orthogonal-router';
+import { boxOfPoints, inflateBox, type Box } from '../geometry/box';
+import { lerp } from '../geometry/numbers';
+import { subtract, type Vec2 } from '../geometry/vector';
+import { ELBOW_STUB, snapToAxis, type ResolvedEnd } from './local-geometry';
+import { directionOf, routeOrthogonal } from './orthogonal-router';
 import type { ConnectorHandle } from './types';
 
 // Elbow (orthogonal) routes: the default layout between two ends, and detours around
@@ -19,8 +21,8 @@ interface ElbowLayout {
   bend: ElbowBend | null;
 }
 
-const transpose = (v: Vec2): Vec2 => ({ x: v.y, y: v.x });
-const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const transpose = (vector: Vec2): Vec2 => ({ x: vector.y, y: vector.x });
+const otherAxis = (axis: 'x' | 'y'): 'x' | 'y' => (axis === 'x' ? 'y' : 'x');
 
 /**
  * Orthogonal route. Every case keeps two invariants: the line leaves each shape
@@ -29,104 +31,160 @@ const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
  * Written for a horizontal first end; a vertical first end is handled by
  * transposing x/y in and out.
  */
-export function elbowLayout(a: ResolvedEnd, b: ResolvedEnd, at = 0.5): ElbowLayout {
-  const n0 = axis(a.normal ?? sub(b.p, a.p));
-  if (n0.x === 0) {
-    const t = elbowLayout(
-      { p: transpose(a.p), normal: a.normal && transpose(a.normal) },
-      { p: transpose(b.p), normal: b.normal && transpose(b.normal) },
+export function elbowLayout(
+  resolvedStart: ResolvedEnd,
+  resolvedEnd: ResolvedEnd,
+  at = 0.5,
+): ElbowLayout {
+  const startNormal = snapToAxis(
+    resolvedStart.normal ?? subtract(resolvedEnd.point, resolvedStart.point),
+  );
+  if (startNormal.x === 0) {
+    const layout = elbowLayout(
+      {
+        point: transpose(resolvedStart.point),
+        normal: resolvedStart.normal && transpose(resolvedStart.normal),
+      },
+      {
+        point: transpose(resolvedEnd.point),
+        normal: resolvedEnd.normal && transpose(resolvedEnd.normal),
+      },
       at,
     );
     return {
-      points: t.points.map(transpose),
-      handle: t.handle && {
-        ...t.handle,
-        point: transpose(t.handle.point),
-        axis: t.handle.axis === 'x' ? 'y' : 'x',
+      points: layout.points.map(transpose),
+      handle: layout.handle && {
+        ...layout.handle,
+        point: transpose(layout.handle.point),
+        axis: otherAxis(layout.handle.axis ?? 'y'),
       },
-      bend: t.bend && { ...t.bend, axis: t.bend.axis === 'x' ? 'y' : 'x' },
+      bend: layout.bend && { ...layout.bend, axis: otherAxis(layout.bend.axis) },
     };
   }
-  const n1 = axis(b.normal ?? sub(a.p, b.p));
-  const stub0 = a.normal ? ELBOW_STUB : 0;
-  const stub1 = b.normal ? ELBOW_STUB : 0;
-  const out = (end: ResolvedEnd, n: Vec2, len: number): Vec2 => ({
-    x: end.p.x + n.x * len,
-    y: end.p.y + n.y * len,
+  const endNormal = snapToAxis(
+    resolvedEnd.normal ?? subtract(resolvedStart.point, resolvedEnd.point),
+  );
+  // Free points have no stub: the line starts turning right there.
+  const startStubLength = resolvedStart.normal ? ELBOW_STUB : 0;
+  const endStubLength = resolvedEnd.normal ? ELBOW_STUB : 0;
+  const stubEnd = (end: ResolvedEnd, normal: Vec2, length: number): Vec2 => ({
+    x: end.point.x + normal.x * length,
+    y: end.point.y + normal.y * length,
   });
 
-  if (n1.x !== 0) {
+  if (endNormal.x !== 0) {
     // Both ends horizontal.
-    if (n0.x === -n1.x && n0.x * (b.p.x - a.p.x) > 0) {
+    if (
+      startNormal.x === -endNormal.x &&
+      startNormal.x * (resolvedEnd.point.x - resolvedStart.point.x) > 0
+    ) {
       // Facing each other with a gap: a Z through the middle. Stubs shrink to fit the gap,
       // otherwise in a narrow gap they would cross and the line would run backwards.
-      const gap = Math.abs(b.p.x - a.p.x) / 2;
-      const p = out(a, n0, Math.min(stub0, gap));
-      const q = out(b, n1, Math.min(stub1, gap));
+      const gap = Math.abs(resolvedEnd.point.x - resolvedStart.point.x) / 2;
+      const startStub = stubEnd(resolvedStart, startNormal, Math.min(startStubLength, gap));
+      const endStub = stubEnd(resolvedEnd, endNormal, Math.min(endStubLength, gap));
       // Clamped: a middle segment outside the gap would run back over the stubs.
-      const mx = lerp(p.x, q.x, Math.min(1, Math.max(0, at)));
+      const middleX = lerp(startStub.x, endStub.x, Math.min(1, Math.max(0, at)));
       const handle: ConnectorHandle | null =
-        Math.abs(q.y - p.y) >= 1
-          ? { point: { x: mx, y: (p.y + q.y) / 2 }, kind: 'elbow', axis: 'x' }
+        Math.abs(endStub.y - startStub.y) >= 1
+          ? { point: { x: middleX, y: (startStub.y + endStub.y) / 2 }, kind: 'elbow', axis: 'x' }
           : null;
       return {
-        points: [a.p, p, { x: mx, y: p.y }, { x: mx, y: q.y }, q, b.p],
+        points: [
+          resolvedStart.point,
+          startStub,
+          { x: middleX, y: startStub.y },
+          { x: middleX, y: endStub.y },
+          endStub,
+          resolvedEnd.point,
+        ],
         handle,
-        bend: handle && { axis: 'x', from: p.x, to: q.x },
+        bend: handle && { axis: 'x', from: startStub.x, to: endStub.x },
       };
     }
-    const p = out(a, n0, stub0);
-    const q = out(b, n1, stub1);
-    if (n0.x === n1.x) {
+    const startStub = stubEnd(resolvedStart, startNormal, startStubLength);
+    const endStub = stubEnd(resolvedEnd, endNormal, endStubLength);
+    if (startNormal.x === endNormal.x) {
       // Same direction (e.g. both from right sides): go out past both, then across.
-      const x = n0.x > 0 ? Math.max(p.x, q.x) : Math.min(p.x, q.x);
-      return { points: [a.p, p, { x, y: p.y }, { x, y: q.y }, q, b.p], handle: null, bend: null };
+      const x =
+        startNormal.x > 0 ? Math.max(startStub.x, endStub.x) : Math.min(startStub.x, endStub.x);
+      return {
+        points: [
+          resolvedStart.point,
+          startStub,
+          { x, y: startStub.y },
+          { x, y: endStub.y },
+          endStub,
+          resolvedEnd.point,
+        ],
+        handle: null,
+        bend: null,
+      };
     }
     // Facing, but each is behind the other: step out, cross over between them, step in.
     // On the same level the crossing would run back over the stubs, so detour above.
-    const from = p.y;
-    const to = Math.abs(q.y - p.y) < 1 ? p.y - ELBOW_STUB * 4 : q.y;
-    const my = lerp(from, to, at);
+    const from = startStub.y;
+    const to = Math.abs(endStub.y - startStub.y) < 1 ? startStub.y - ELBOW_STUB * 4 : endStub.y;
+    const middleY = lerp(from, to, at);
     return {
-      points: [a.p, p, { x: p.x, y: my }, { x: q.x, y: my }, q, b.p],
-      handle: { point: { x: (p.x + q.x) / 2, y: my }, kind: 'elbow', axis: 'y' },
+      points: [
+        resolvedStart.point,
+        startStub,
+        { x: startStub.x, y: middleY },
+        { x: endStub.x, y: middleY },
+        endStub,
+        resolvedEnd.point,
+      ],
+      handle: { point: { x: (startStub.x + endStub.x) / 2, y: middleY }, kind: 'elbow', axis: 'y' },
       bend: { axis: 'y', from, to },
     };
   }
 
   // First end horizontal, second vertical: an L if its corner lies in front of both ends.
-  const inFront = (corner: Vec2, from0: Vec2, from1: Vec2) =>
-    (corner.x - from0.x) * n0.x >= 0 && (corner.y - from1.y) * n1.y >= 0;
-  const p = out(a, n0, stub0);
-  const q = out(b, n1, stub1);
-  const corner = { x: q.x, y: p.y };
-  if (inFront(corner, p, q)) return { points: [a.p, p, corner, q, b.p], handle: null, bend: null };
-  const tight = { x: b.p.x, y: a.p.y }; // without stubs, for shapes that are close
-  if (inFront(tight, a.p, b.p)) return { points: [a.p, tight, b.p], handle: null, bend: null };
+  const inFront = (corner: Vec2, fromStart: Vec2, fromEnd: Vec2) =>
+    (corner.x - fromStart.x) * startNormal.x >= 0 && (corner.y - fromEnd.y) * endNormal.y >= 0;
+  const startStub = stubEnd(resolvedStart, startNormal, startStubLength);
+  const endStub = stubEnd(resolvedEnd, endNormal, endStubLength);
+  const corner = { x: endStub.x, y: startStub.y };
+  if (inFront(corner, startStub, endStub))
+    return {
+      points: [resolvedStart.point, startStub, corner, endStub, resolvedEnd.point],
+      handle: null,
+      bend: null,
+    };
+  const tight = { x: resolvedEnd.point.x, y: resolvedStart.point.y }; // without stubs, for shapes that are close
+  if (inFront(tight, resolvedStart.point, resolvedEnd.point))
+    return { points: [resolvedStart.point, tight, resolvedEnd.point], handle: null, bend: null };
   // Otherwise: out of the first, along to the second's stub level, across, into the second.
   return {
-    points: [a.p, p, { x: p.x, y: q.y }, q, b.p],
+    points: [
+      resolvedStart.point,
+      startStub,
+      { x: startStub.x, y: endStub.y },
+      endStub,
+      resolvedEnd.point,
+    ],
     handle: null,
     bend: null,
   };
 }
 
 /** True if an axis-aligned segment runs through the inside of a box (edges don't count). */
-function segmentCrossesBox(p: Vec2, q: Vec2, b: Box): boolean {
-  const e = 0.5;
-  if (Math.abs(p.y - q.y) < 1e-6) {
+function segmentCrossesBox(segmentStart: Vec2, segmentEnd: Vec2, box: Box): boolean {
+  const half = 0.5; // edges and a hair inside them don't count
+  if (Math.abs(segmentStart.y - segmentEnd.y) < 1e-6) {
     return (
-      p.y > b.minY + e &&
-      p.y < b.maxY - e &&
-      Math.max(p.x, q.x) > b.minX + e &&
-      Math.min(p.x, q.x) < b.maxX - e
+      segmentStart.y > box.minY + half &&
+      segmentStart.y < box.maxY - half &&
+      Math.max(segmentStart.x, segmentEnd.x) > box.minX + half &&
+      Math.min(segmentStart.x, segmentEnd.x) < box.maxX - half
     );
   }
   return (
-    p.x > b.minX + e &&
-    p.x < b.maxX - e &&
-    Math.max(p.y, q.y) > b.minY + e &&
-    Math.min(p.y, q.y) < b.maxY - e
+    segmentStart.x > box.minX + half &&
+    segmentStart.x < box.maxX - half &&
+    Math.max(segmentStart.y, segmentEnd.y) > box.minY + half &&
+    Math.min(segmentStart.y, segmentEnd.y) < box.maxY - half
   );
 }
 
@@ -137,31 +195,25 @@ function segmentCrossesBox(p: Vec2, q: Vec2, b: Box): boolean {
  */
 function routeCrossesEnds(points: Vec2[], startBox?: Box, endBox?: Box): boolean {
   for (let i = 0; i + 1 < points.length; i++) {
-    const p = points[i]!;
-    const q = points[i + 1]!;
-    if (startBox && i > 0 && segmentCrossesBox(p, q, startBox)) return true;
-    if (endBox && i < points.length - 2 && segmentCrossesBox(p, q, endBox)) return true;
+    const segmentStart = points[i]!;
+    const segmentEnd = points[i + 1]!;
+    if (startBox && i > 0 && segmentCrossesBox(segmentStart, segmentEnd, startBox)) return true;
+    if (endBox && i < points.length - 2 && segmentCrossesBox(segmentStart, segmentEnd, endBox))
+      return true;
   }
   return false;
 }
 
-const inflate = (b: Box, m: number): Box => ({
-  minX: b.minX - m,
-  minY: b.minY - m,
-  maxX: b.maxX + m,
-  maxY: b.maxY + m,
-});
-
-/** Moves from `p` along axis direction `n` until outside `box` (and at least `min` away). */
-function exitPoint(p: Vec2, n: Vec2, min: number, box?: Box): Vec2 {
-  let t = min;
+/** Moves from `point` along axis direction `normal` until outside `box` (and at least `minimum` away). */
+function exitPoint(point: Vec2, normal: Vec2, minimum: number, box?: Box): Vec2 {
+  let candidate = minimum;
   if (box) {
-    if (n.x > 0) t = Math.max(t, box.maxX - p.x);
-    else if (n.x < 0) t = Math.max(t, p.x - box.minX);
-    else if (n.y > 0) t = Math.max(t, box.maxY - p.y);
-    else t = Math.max(t, p.y - box.minY);
+    if (normal.x > 0) candidate = Math.max(candidate, box.maxX - point.x);
+    else if (normal.x < 0) candidate = Math.max(candidate, point.x - box.minX);
+    else if (normal.y > 0) candidate = Math.max(candidate, box.maxY - point.y);
+    else candidate = Math.max(candidate, point.y - box.minY);
   }
-  return { x: p.x + n.x * t, y: p.y + n.y * t };
+  return { x: point.x + normal.x * candidate, y: point.y + normal.y * candidate };
 }
 
 /**
@@ -181,95 +233,89 @@ export function routeCrossesAny(points: Vec2[], boxes: Box[]): boolean {
   // Every segment counts here (a straight line is a single segment); only the connected
   // shapes get the exemption for the segments leaving/entering them.
   for (let i = 0; i + 1 < points.length; i++) {
-    for (const b of boxes) if (segmentCrossesBox(points[i]!, points[i + 1]!, b)) return true;
+    for (const box of boxes) if (segmentCrossesBox(points[i]!, points[i + 1]!, box)) return true;
   }
   return false;
 }
 
-function pointsBounds(points: Vec2[], pad: number): Box {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const p of points) {
-    minX = Math.min(minX, p.x);
-    minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x);
-    maxY = Math.max(maxY, p.y);
-  }
-  return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
-}
-
-const boxKey = (b: Box) => `${b.minX},${b.minY},${b.maxX},${b.maxY}`;
+const boxKey = (box: Box) => `${box.minX},${box.minY},${box.maxX},${box.maxY}`;
 
 /** Distance between a box and an axis-aligned segment (0 if they touch). */
-function boxSegmentDistance(b: Box, p: Vec2, q: Vec2): number {
-  const dx = Math.max(b.minX - Math.max(p.x, q.x), Math.min(p.x, q.x) - b.maxX, 0);
-  const dy = Math.max(b.minY - Math.max(p.y, q.y), Math.min(p.y, q.y) - b.maxY, 0);
-  return Math.hypot(dx, dy);
+function boxSegmentDistance(box: Box, segmentStart: Vec2, segmentEnd: Vec2): number {
+  const deltaX = Math.max(
+    box.minX - Math.max(segmentStart.x, segmentEnd.x),
+    Math.min(segmentStart.x, segmentEnd.x) - box.maxX,
+    0,
+  );
+  const deltaY = Math.max(
+    box.minY - Math.max(segmentStart.y, segmentEnd.y),
+    Math.min(segmentStart.y, segmentEnd.y) - box.maxY,
+    0,
+  );
+  return Math.hypot(deltaX, deltaY);
 }
 
 /** Up to `limit` boxes closest to any of the polylines (all of them if there are few). */
 function closestBoxes(boxes: Box[], paths: Vec2[][], limit: number): Box[] {
   if (boxes.length <= limit) return boxes;
   const scored = boxes.map((box) => {
-    let d = Infinity;
+    let distance = Infinity;
     for (const path of paths)
       for (let i = 0; i + 1 < path.length; i++)
-        d = Math.min(d, boxSegmentDistance(box, path[i]!, path[i + 1]!));
-    return { box, d };
+        distance = Math.min(distance, boxSegmentDistance(box, path[i]!, path[i + 1]!));
+    return { box, distance };
   });
-  scored.sort((x, y) => x.d - y.d);
-  return scored.slice(0, limit).map((s) => s.box);
+  scored.sort((first, second) => first.distance - second.distance);
+  return scored.slice(0, limit).map((scoredBox) => scoredBox.box);
 }
 
 /** Orthogonal path around the connected shapes and `others`, or null if there is none. */
 function routeAround(
-  a: ResolvedEnd,
-  b: ResolvedEnd,
+  start: ResolvedEnd,
+  end: ResolvedEnd,
   startBox: Box | undefined,
   endBox: Box | undefined,
   others: Box[],
 ): Vec2[] | null {
-  const n0 = axis(a.normal ?? sub(b.p, a.p));
-  const n1 = axis(b.normal ?? sub(a.p, b.p));
-  const m = ELBOW_STUB;
-  const s0 = startBox && inflate(startBox, m);
-  const s1 = endBox && inflate(endBox, m);
-  const from = exitPoint(a.p, n0, a.normal ? m : 0, s0);
-  const to = exitPoint(b.p, n1, b.normal ? m : 0, s1);
-  const ends = [startBox, endBox].filter((o): o is Box => !!o);
+  const startNormal = snapToAxis(start.normal ?? subtract(end.point, start.point));
+  const endNormal = snapToAxis(end.normal ?? subtract(start.point, end.point));
+  const stub = ELBOW_STUB;
+  const startArea = startBox && inflateBox(startBox, stub);
+  const endArea = endBox && inflateBox(endBox, stub);
+  const from = exitPoint(start.point, startNormal, start.normal ? stub : 0, startArea);
+  const to = exitPoint(end.point, endNormal, end.normal ? stub : 0, endArea);
+  const ends = [startBox, endBox].filter((box): box is Box => !!box);
   const path = routeOrthogonal({
     from,
-    fromDir: dirOf(n0),
+    fromDirection: directionOf(startNormal),
     to,
-    toDir: dirOf({ x: -n1.x, y: -n1.y }),
+    toDirection: directionOf({ x: -endNormal.x, y: -endNormal.y }),
     obstacles: [
-      ...ends.map((box) => ({ box, margin: m })),
+      ...ends.map((box) => ({ box, margin: stub })),
       ...others.map((box) => ({ box, margin: OBSTACLE_MARGIN })),
     ],
-    centered: [s0, s1].filter((o): o is Box => !!o),
-    bendCost: m * 2,
-    margin: m,
+    centered: [startArea, endArea].filter((box): box is Box => !!box),
+    bendCost: stub * 2,
+    margin: stub,
   });
-  return path && simplify([a.p, ...path, b.p]);
+  return path && simplify([start.point, ...path, end.point]);
 }
 
 export function elbowPoints(
-  a: ResolvedEnd,
-  b: ResolvedEnd,
+  start: ResolvedEnd,
+  end: ResolvedEnd,
   at = 0.5,
   startBox?: Box,
   endBox?: Box,
   findObstacles?: ObstacleQuery,
 ): { points: Vec2[]; handle: ConnectorHandle | null; routed: boolean } {
-  const layout = elbowLayout(a, b, at);
+  const layout = elbowLayout(start, end, at);
   const simple = simplify(layout.points);
   const known = new Map<string, Box>();
   const discover = (points: Vec2[]): Box[] => {
     if (!findObstacles) return [];
     const fresh: Box[] = [];
-    for (const box of findObstacles(pointsBounds(points, OBSTACLE_MARGIN))) {
+    for (const box of findObstacles(inflateBox(boxOfPoints(points), OBSTACLE_MARGIN))) {
       const key = boxKey(box);
       if (!known.has(key)) {
         known.set(key, box);
@@ -290,7 +336,7 @@ export function elbowPoints(
   const tried = [simple];
   for (let pass = 0; pass < MAX_ROUTE_PASSES; pass++) {
     const obstacles = closestBoxes([...known.values()], tried, MAX_OBSTACLES);
-    const routed = routeAround(a, b, startBox, endBox, obstacles);
+    const routed = routeAround(start, end, startBox, endBox, obstacles);
     if (!routed) break;
     best = routed;
     tried.push(routed);
@@ -304,18 +350,21 @@ export function elbowPoints(
 
 /** Drops duplicate and collinear points (keeps the ends). */
 export function simplify(points: Vec2[]): Vec2[] {
-  const out: Vec2[] = [];
-  for (const pt of points) {
-    const last = out[out.length - 1];
-    if (last && Math.abs(last.x - pt.x) < 1e-6 && Math.abs(last.y - pt.y) < 1e-6) continue;
-    if (out.length >= 2) {
-      const prev = out[out.length - 2]!;
-      const cross = (last!.x - prev.x) * (pt.y - prev.y) - (last!.y - prev.y) * (pt.x - prev.x);
-      const dot = (last!.x - prev.x) * (pt.x - last!.x) + (last!.y - prev.y) * (pt.y - last!.y);
-      if (Math.abs(cross) < 1e-6 && dot >= 0) out[out.length - 1] = pt;
-      else out.push(pt);
-    } else out.push(pt);
+  const kept: Vec2[] = [];
+  for (const point of points) {
+    const last = kept[kept.length - 1];
+    if (last && Math.abs(last.x - point.x) < 1e-6 && Math.abs(last.y - point.y) < 1e-6) continue;
+    if (kept.length >= 2) {
+      const previous = kept[kept.length - 2]!;
+      const cross =
+        (last!.x - previous.x) * (point.y - previous.y) -
+        (last!.y - previous.y) * (point.x - previous.x);
+      const dot =
+        (last!.x - previous.x) * (point.x - last!.x) + (last!.y - previous.y) * (point.y - last!.y);
+      if (Math.abs(cross) < 1e-6 && dot >= 0) kept[kept.length - 1] = point;
+      else kept.push(point);
+    } else kept.push(point);
   }
-  if (out.length === 1) out.push({ ...out[0]! });
-  return out;
+  if (kept.length === 1) kept.push({ ...kept[0]! });
+  return kept;
 }

@@ -1,5 +1,5 @@
 import type { BoardElement } from '@apeiro/core';
-import { BoardEditor, type BoardEditorOptions, type BoardSync } from '@apeiro/editor';
+import { BoardEditor, type BoardEditorOptions } from '@apeiro/editor';
 import {
   createContext,
   useContext,
@@ -9,11 +9,9 @@ import {
   useSyncExternalStore,
 } from 'react';
 
-/** What `<BoardProvider>` hands down: its editor, its sync, and where errors of the board go. */
+/** What `<BoardProvider>` hands down: its editor and where errors of the board go. */
 export interface BoardContextValue {
   editor: BoardEditor;
-  /** The provider's `sync`, if the board is shared. */
-  sync: BoardSync | null;
   /** The provider's `onError`, or the console. */
   reportError: (error: unknown) => void;
 }
@@ -21,12 +19,10 @@ export interface BoardContextValue {
 export const BoardContext = createContext<BoardContextValue | null>(null);
 
 /** Options of the editor a `<BoardProvider>` (or a standalone `<Board>`) creates. */
-export interface BoardOptions extends BoardEditorOptions {
+export interface EditorOptions extends BoardEditorOptions {
   /**
    * What the new board shows at first (plain element data, e.g. loaded from your storage).
    * Not an undo step. Read once, when the editor is created, like the other options.
-   * With `sync` the shared board decides the content: these are only sent when it is
-   * empty (a template for a new board).
    */
   initialElements?: readonly BoardElement[];
 }
@@ -47,8 +43,8 @@ function release(editor: BoardEditor): void {
 }
 
 function createEditor(
-  { initialElements, ...options }: BoardOptions,
-  latest: { readonly current: BoardOptions | null },
+  { initialElements, ...options }: EditorOptions,
+  latest: { readonly current: EditorOptions | null },
 ): BoardEditor {
   // Callbacks (`upload`, `openLink`, `onComment`…) call the latest ones passed, so inline
   // functions that use the component's state stay current.
@@ -70,7 +66,7 @@ function createEditor(
  * the component unmounts. Null when created without options (an editor comes from elsewhere).
  */
 export function useOwnedEditor(
-  options: BoardOptions | null,
+  options: EditorOptions | null,
   /** Options the caller applies itself when they change (not reported as ignored). */
   live: ReadonlySet<string> = NONE,
 ): BoardEditor | null {
@@ -93,7 +89,7 @@ const NONE: ReadonlySet<string> = new Set();
  * with changes later: options are read once, so the change has no effect. Callbacks and
  * objects are skipped, since inline ones are new on every render.
  */
-function useIgnoredOptionsWarning(options: BoardOptions | null, live: ReadonlySet<string>): void {
+function useIgnoredOptionsWarning(options: EditorOptions | null, live: ReadonlySet<string>): void {
   const first = useRef<Record<string, unknown> | null>(null);
   const warned = useRef<Set<string> | null>(null);
   useEffect(() => {
@@ -106,8 +102,8 @@ function useIgnoredOptionsWarning(options: BoardOptions | null, live: ReadonlySe
     const now = options as Record<string, unknown>;
     for (const key of new Set([...Object.keys(was), ...Object.keys(now)])) {
       if (live.has(key) || Object.is(was[key], now[key])) continue;
-      const plain = (v: unknown) =>
-        v === undefined || (typeof v !== 'object' && typeof v !== 'function');
+      const plain = (value: unknown) =>
+        value === undefined || (typeof value !== 'object' && typeof value !== 'function');
       if (!plain(was[key]) || !plain(now[key])) continue;
       const seen = (warned.current ??= new Set());
       if (seen.has(key)) continue;
@@ -122,7 +118,7 @@ function useIgnoredOptionsWarning(options: BoardOptions | null, live: ReadonlySe
 
 /**
  * The low-level `BoardEditor` of the surrounding board: the scene, the camera, the renderer,
- * and everything `useBoard()` doesn't cover (e.g. to connect Yjs by hand). Never re-renders
+ * and everything `useBoard()` doesn't cover. Never re-renders
  * by itself; read changing state with `useBoardState` or the other hooks.
  */
 export function useEditor(): BoardEditor {
@@ -139,7 +135,7 @@ export function useBoardContext(): BoardContextValue {
   return context;
 }
 
-const noSubscribe = () => () => undefined;
+export const noSubscribe = () => () => undefined;
 
 /**
  * False on the server and while hydrating, true once rendering in the browser (React then

@@ -8,9 +8,9 @@ import type { Scene } from './scene';
  */
 
 /** Live members of the element's group, or null if it isn't in a group of two or more. */
-export function groupOf(scene: Scene, el: BoardElement | undefined): string[] | null {
-  if (!el?.groupId) return null;
-  const members = scene.groupMembers(el.groupId);
+export function groupOf(scene: Scene, element: BoardElement | undefined): string[] | null {
+  if (!element?.groupId) return null;
+  const members = scene.groupMembers(element.groupId);
   return members.length >= 2 ? members : null;
 }
 

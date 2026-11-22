@@ -1,7 +1,7 @@
 {
   "name": "apeiro",
   "version": "0.1.0",
-  "description": "Infinite canvas whiteboard for the web: WebGPU/WebGL2 rendering, shapes, connectors, rich text, pen, images and undo, with React bindings and real-time collaboration over Yjs.",
+  "description": "Infinite canvas whiteboard for the web: WebGPU/WebGL2 rendering, shapes, connectors, rich text, pen, images and undo, with React bindings.",
   "keywords": [
     "whiteboard",
     "infinite-canvas",
@@ -11,11 +11,7 @@
     "webgpu",
     "webgl",
     "react",
-    "nextjs",
-    "yjs",
-    "crdt",
-    "collaboration",
-    "socket.io"
+    "nextjs"
   ],
   "license": "MIT",
   "author": "andreyeit",
@@ -46,10 +42,6 @@
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
     },
-    "./sync": {
-      "types": "./dist/sync.d.ts",
-      "default": "./dist/sync.js"
-    },
     "./styles.css": "./dist/styles.css",
     "./package.json": "./package.json"
   },
@@ -65,18 +57,10 @@
     "@mapbox/tiny-sdf": "^2.3.0"
   },
   "peerDependencies": {
-    "react": "^18.2.0 || ^19.0.0",
-    "yjs": "^13.6.0",
-    "y-protocols": "^1.0.6"
+    "react": "^18.2.0 || ^19.0.0"
   },
   "peerDependenciesMeta": {
     "react": {
-      "optional": true
-    },
-    "yjs": {
-      "optional": true
-    },
-    "y-protocols": {
       "optional": true
     }
   },
@@ -85,12 +69,9 @@
     "@apeiro/editor": "workspace:*",
     "@apeiro/react": "workspace:*",
     "@apeiro/renderer": "workspace:*",
-    "@apeiro/yjs": "workspace:*",
     "@types/react": "^19.3.0",
     "react": "^19.3.1",
-    "tsdown": "^0.23.7",
-    "yjs": "^13.6.33",
-    "y-protocols": "^1.0.7"
+    "tsdown": "^0.23.7"
   },
   "engines": {
     "node": ">=18"

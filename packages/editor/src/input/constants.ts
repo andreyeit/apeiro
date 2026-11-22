@@ -6,7 +6,7 @@ import type { Tool } from '../tools/tool-state';
 /** Elements are hit this far outside their outline. */
 export const HIT_TOLERANCE_PX = 4;
 /** Connection dots are grabbable within this radius. */
-export const DOT_HIT_PX = 14;
+export const DOT_HIT_PX = 10;
 /** Connector end and bend handles are grabbable within this radius. */
 export const HANDLE_HIT_PX = HANDLE_RADIUS_PX + 6;
 /** Shapes smaller than this on screen don't show connection dots (they'd overlap). */
@@ -36,6 +36,18 @@ export const MAX_SNAP_TARGETS = 2000;
 export const INK_STEP_PX = 1.5;
 /** Pen: points closer than this to the simplified line are dropped on release. */
 export const INK_SIMPLIFY_PX = 0.6;
+/**
+ * Pen: the stabilizer's string (see `pullString`) at full speed; longer is smoother but lags
+ * more. Slower than INK_FULL_STRING_SPEED (screen px per ms) it shortens, down to nothing
+ * when the pointer stops: the line catches up with the pointer before the button is let go.
+ */
+export const INK_STRING_PX = 8;
+export const INK_FULL_STRING_SPEED = 0.6;
+/** Pen: how much of a new speed sample goes into the smoothed speed. */
+export const INK_SPEED_BLEND = 0.3;
+/** Pen: the drawn line is resampled this often and evened out this many times (`relaxStroke`). */
+export const INK_RELAX_SPACING_PX = 3;
+export const INK_RELAX_PASSES = 6;
 /** Eraser radius. */
 export const ERASER_PX = 8;
 /** Audio player controls are hit this far outside their drawn area. */

@@ -25,8 +25,8 @@ export class HistoryProxy implements UndoHistory {
   endGroup(): void {
     this.current().endGroup();
   }
-  batch<T>(fn: () => T): T {
-    return this.current().batch(fn);
+  batch<T>(run: () => T): T {
+    return this.current().batch(run);
   }
   clear(): void {
     this.current().clear();

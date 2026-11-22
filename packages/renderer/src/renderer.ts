@@ -1,4 +1,3 @@
-import { CanvasSize, MAX_PIXEL_RATIO } from './canvas-size';
 import {
   FONT_FAMILIES,
   GRID_MIN_PX,
@@ -6,15 +5,23 @@ import {
   boxIntersects,
   isConnector,
   isMedia,
+  unpackColor,
   type BoardElement,
   type Camera,
-  type FontMeasurer,
   type Scene,
   type SceneChanges,
   type ShapeElement,
   type TextLayout,
 } from '@apeiro/core';
 import type { BackendFactory, BackendKind, GridLevel, RenderBackend } from './backend';
+import { CanvasSize, MAX_PIXEL_RATIO } from './canvas-size';
+import { ColorTheme } from './color-theme';
+import { shapeDepth } from './depth';
+import { InstanceStore } from './layers/instance-store';
+import { LineLayer } from './layers/line-layer';
+import { TextLayer, type TextLayerOptions } from './layers/text-layer';
+import type { AudioVisualState, AudioWidgetStyle } from './media/audio-widget';
+import { MediaPass, type MediaDrawItem, type MediaPassOptions } from './media/media-pass';
 import {
   CanvasFontMeasurer,
   createColorRasterizer,
@@ -22,17 +29,9 @@ import {
   cssFont,
   SDF_CUTOFF,
 } from './text/font';
-import { createWebGlBackend } from './webgl/gl-backend';
-import { unpackColor } from './webgl/gl-utils';
 import { GlyphAtlas } from './text/glyph-atlas';
+import { createWebGlBackend } from './webgl/gl-backend';
 import { requestWebGpuBackend } from './webgpu/gpu-backend';
-import { InstanceStore } from './layers/instance-store';
-import type { AudioVisualState, AudioWidgetStyle } from './media/audio-widget';
-import { shapeDepth } from './depth';
-import { ColorTheme } from './color-theme';
-import { LineLayer } from './layers/line-layer';
-import { MediaPass, type MediaDrawItem, type MediaPassOptions } from './media/media-pass';
-import { TextLayer, type TextLayerOptions } from './layers/text-layer';
 
 /** Text whose glyphs make the browser load both the Latin and the Cyrillic subset of a face. */
 const FACE_SAMPLE = 'AaЯя';
@@ -40,7 +39,7 @@ const FACE_SAMPLE = 'AaЯя';
 export type GridStyle = 'dots' | 'lines';
 
 /** Elements drawn by the line pass: connectors and pen strokes. */
-const drawnAsLine = (el: BoardElement) => isConnector(el) || el.type === 'ink';
+const drawnAsLine = (element: BoardElement) => isConnector(element) || element.type === 'ink';
 
 export interface RendererOptions {
   canvas: HTMLCanvasElement;
@@ -137,7 +136,7 @@ export class BoardRenderer {
   private gridColor: [number, number, number, number];
   private gridStyle: GridStyle;
   private readonly maxPixelRatio: number;
-  private dpr = 1;
+  private pixelRatio = 1;
   private readonly size: CanvasSize;
   private readonly fixedPixelRatio: number | null;
   private frame = 0;
@@ -151,9 +150,9 @@ export class BoardRenderer {
   private colorTheme = new ColorTheme();
   private readonly mediaPass: MediaPass;
   /** Image and audio elements (few, tracked directly instead of querying the viewport) → their src. */
-  private mediaSrc = new Map<string, string>();
+  private mediaSource = new Map<string, string>();
   /** How many elements use each src: a texture is freed when the last one goes away. */
-  private srcRefs = new Map<string, number>();
+  private sourceReferences = new Map<string, number>();
   /** Connectors added/changed since the last frame. */
   private pendingLines = new Set<string>();
   /** Which board font faces were loaded when glyphs were last reset. */
@@ -197,16 +196,16 @@ export class BoardRenderer {
         this.frame = 0;
       },
       onRestored: () => {
-        this.mediaPass.init();
+        this.mediaPass.initialize();
         this.requestRender();
       },
     });
     this.mediaPass = new MediaPass(this.gpu.textures, () => this.requestRender(), options.media);
     this.mediaPass.colorOf = (type, color) => this.colorTheme.of(type, color);
-    if (this.gpu.ready) this.mediaPass.init();
+    if (this.gpu.ready) this.mediaPass.initialize();
 
     this.disposers.push(
-      this.scene.subscribe((c) => this.onSceneChanges(c)),
+      this.scene.subscribe((changes) => this.onSceneChanges(changes)),
       this.camera.subscribe(() => this.requestRender()),
     );
     // Web fonts load asynchronously: glyphs and metrics cached before that belong to the
@@ -240,8 +239,8 @@ export class BoardRenderer {
   }
 
   /** Layout the renderer uses for an element's text (cached). For editors and hit testing text. */
-  textLayout(el: ShapeElement): TextLayout | undefined {
-    return this.textLayer.layoutOf(el);
+  textLayout(element: ShapeElement): TextLayout | undefined {
+    return this.textLayer.layoutOf(element);
   }
 
   /** Hides an element's text, e.g. while a DOM editor shows it instead. */
@@ -250,21 +249,23 @@ export class BoardRenderer {
     this.requestRender();
   }
 
-  get fontMeasurer(): FontMeasurer {
-    return this.measurer;
-  }
-
   /**
    * Syncs the drawing buffer with the canvas's size on screen, pixel for pixel (see
    * `CanvasSize`). The renderer watches its canvas itself; call it after a layout change
    * it can't see (e.g. a canvas that was hidden).
    */
   resize(): void {
-    const m = this.size.measure(this.maxPixelRatio, this.fixedPixelRatio);
-    this.size.apply(m);
-    this.dpr = m.ratio;
-    this.camera.setViewport(m.cssWidth, m.cssHeight);
-    this.requestRender();
+    const metrics = this.size.measure(this.maxPixelRatio, this.fixedPixelRatio);
+    const cleared = this.size.apply(metrics);
+    this.pixelRatio = metrics.ratio;
+    this.camera.setViewport(metrics.cssWidth, metrics.cssHeight);
+    if (cleared && this.gpu.ready) {
+      // Resizing the buffer cleared it, and ResizeObserver runs after this frame's
+      // animation callbacks: waiting for the next one would show an empty canvas (flicker).
+      cancelAnimationFrame(this.frame);
+      this.frame = 0;
+      this.render();
+    } else this.requestRender();
   }
 
   /**
@@ -308,15 +309,15 @@ export class BoardRenderer {
   }
 
   /** Called after each frame; overlays (selection, cursors) can sync to it. */
-  onAfterRender(cb: () => void): () => void {
-    this.afterRender.add(cb);
-    return () => this.afterRender.delete(cb);
+  onAfterRender(callback: () => void): () => void {
+    this.afterRender.add(callback);
+    return () => this.afterRender.delete(callback);
   }
 
   /** Renders synchronously. Normally you want `requestRender`. */
   render(): void {
     if (!this.gpu.ready) return;
-    const t0 = performance.now();
+    const startTime = performance.now();
 
     if (this.fontsChanged) {
       this.fontsChanged = false;
@@ -334,16 +335,16 @@ export class BoardRenderer {
     const { x, y, zoom } = this.camera.getState();
     // Text comes from element data (other participants, eventually): whatever it contains,
     // a failure there must not stop shapes, lines and media from being drawn.
-    let textOk = true;
+    let textDrawn = true;
     try {
-      this.textLayer.update(this.scene, this.camera.viewportBounds(), zoom, this.dpr, (id) =>
+      this.textLayer.update(this.scene, this.camera.viewportBounds(), zoom, this.pixelRatio, (id) =>
         this.store.slot(id),
       );
-    } catch (e) {
-      textOk = false;
+    } catch (error) {
+      textDrawn = false;
       if (!this.textErrorLogged) {
         this.textErrorLogged = true;
-        console.error('apeiro: text layout failed, text is not drawn this frame', e);
+        console.error('apeiro: text layout failed, text is not drawn this frame', error);
       }
     }
 
@@ -351,13 +352,13 @@ export class BoardRenderer {
       x,
       y,
       zoom,
-      viewportW: this.camera.viewportWidth,
-      viewportH: this.camera.viewportHeight,
-      dpr: this.dpr,
+      viewportWidth: this.camera.viewportWidth,
+      viewportHeight: this.camera.viewportHeight,
+      pixelRatio: this.pixelRatio,
       background: this.background,
       grid: this.gridColor[3] > 0 ? this.grid(zoom) : null,
-      media: this.mediaPass.prepare(this.visibleMedia(), x, y, zoom, this.dpr),
-      drawText: textOk,
+      media: this.mediaPass.prepare(this.visibleMedia(), x, y, zoom, this.pixelRatio),
+      drawText: textDrawn,
     });
 
     this.stats.glyphs = this.textLayer.count;
@@ -367,18 +368,18 @@ export class BoardRenderer {
     this.stats.atlasSize = this.sdfAtlas.size;
     this.stats.instances = this.store.count - this.store.holeCount;
     this.stats.holes = this.store.holeCount;
-    this.stats.cpuMs = performance.now() - t0;
+    this.stats.cpuMs = performance.now() - startTime;
     this.stats.frames++;
     // One failing overlay must not keep the others (or the next frames) from running.
-    for (const cb of this.afterRender) {
+    for (const callback of this.afterRender) {
       try {
-        cb();
-      } catch (e) {
-        console.error('apeiro: an after-render callback failed', e);
+        callback();
+      } catch (error) {
+        console.error('apeiro: an after-render callback failed', error);
       }
     }
     // Glyphs/layouts that didn't fit this frame's budget arrive in the next ones.
-    if (textOk && this.textLayer.needsMoreFrames) this.requestRender();
+    if (textDrawn && this.textLayer.needsMoreFrames) this.requestRender();
   }
 
   /** Playback state of an audio element (owned by the app's audio player); redraws it. */
@@ -406,7 +407,7 @@ export class BoardRenderer {
   destroy(): void {
     cancelAnimationFrame(this.frame);
     this.frame = 0;
-    for (const d of this.disposers) d();
+    for (const dispose of this.disposers) dispose();
     this.disposers = [];
     this.afterRender.clear();
     this.mediaPass.dispose();
@@ -426,25 +427,31 @@ export class BoardRenderer {
     const levels: GridLevel[] = [
       { spacing: spacing * 4, fade: lines ? 1 - fade : 1 },
       { spacing, fade },
-    ].filter((l) => l.fade > 0);
+    ].filter((level) => level.fade > 0);
     return { color: this.gridColor, lines, levels };
   }
 
   private visibleMedia(): MediaDrawItem[] {
     const view = this.camera.viewportBounds();
     const items: MediaDrawItem[] = [];
-    for (const id of this.mediaSrc.keys()) {
-      const el = this.scene.get(id);
-      const b = this.scene.getBounds(id);
+    for (const id of this.mediaSource.keys()) {
+      const element = this.scene.get(id);
+      const bounds = this.scene.getBounds(id);
       const slot = this.store.slot(id);
-      if (!el || !b || slot === undefined || !boxIntersects(b, view) || el.type === 'connector')
+      if (
+        !element ||
+        !bounds ||
+        slot === undefined ||
+        !boxIntersects(bounds, view) ||
+        element.type === 'connector'
+      )
         continue;
-      if (Math.max(el.w, el.h) * this.camera.zoom < 1) continue; // sub-pixel
-      items.push({ el, depth: shapeDepth(slot) });
+      if (Math.max(element.width, element.height) * this.camera.zoom < 1) continue; // sub-pixel
+      items.push({ element, depth: shapeDepth(slot) });
     }
     // Paint order: overlapping images with transparent pixels blend bottom to top, as
     // `bringToFront`/`sendToBack` say, not in the order they were added. Depth decreases upwards.
-    return items.sort((a, b) => b.depth - a.depth);
+    return items.sort((first, second) => second.depth - first.depth);
   }
 
   /**
@@ -468,7 +475,8 @@ export class BoardRenderer {
   /** Every face text can use: each family of `FONT_FAMILIES` in regular/bold/italic. */
   private faces(): string[] {
     const out: string[] = [];
-    for (let v = 0; v < FONT_FAMILIES.length * 4; v++) out.push(cssFont(v, 16));
+    for (let variant = 0; variant < FONT_FAMILIES.length * 4; variant++)
+      out.push(cssFont(variant, 16));
     return out;
   }
 
@@ -477,52 +485,55 @@ export class BoardRenderer {
     const fonts = typeof document !== 'undefined' ? document.fonts : undefined;
     if (!fonts) return '';
     return this.faces()
-      .map((f) => (fonts.check(f, FACE_SAMPLE) ? '1' : '0'))
+      .map((font) => (fonts.check(font, FACE_SAMPLE) ? '1' : '0'))
       .join('');
   }
 
-  private onSceneChanges(c: SceneChanges): void {
-    this.textLayer.applyChanges(c);
-    for (const id of c.removed) {
+  private onSceneChanges(changes: SceneChanges): void {
+    this.textLayer.applyChanges(changes);
+    for (const id of changes.removed) {
       this.lineLayer.remove(id);
       this.pendingLines.delete(id);
       this.trackMedia(id, undefined);
     }
-    for (const el of c.added) if (drawnAsLine(el)) this.pendingLines.add(el.id);
-    for (const el of [...c.added, ...c.updated])
-      this.trackMedia(el.id, isMedia(el) ? el.media.src : undefined);
-    for (const el of c.updated) if (drawnAsLine(el)) this.pendingLines.add(el.id);
+    for (const element of changes.added)
+      if (drawnAsLine(element)) this.pendingLines.add(element.id);
+    for (const element of [...changes.added, ...changes.updated])
+      this.trackMedia(element.id, isMedia(element) ? element.media.source : undefined);
+    for (const element of changes.updated)
+      if (drawnAsLine(element)) this.pendingLines.add(element.id);
     if (!this.needsRebuild) {
-      if (c.orderChanged) this.needsRebuild = true;
+      if (changes.orderChanged) this.needsRebuild = true;
       else {
-        for (const id of c.removed) this.store.remove(id);
-        for (const el of c.updated) if (!this.store.update(el)) this.needsRebuild = true;
-        if (!this.store.tryAppend(c.added)) this.needsRebuild = true;
+        for (const id of changes.removed) this.store.remove(id);
+        for (const element of changes.updated)
+          if (!this.store.update(element)) this.needsRebuild = true;
+        if (!this.store.tryAppend(changes.added)) this.needsRebuild = true;
         if (this.store.needsCompaction()) this.needsRebuild = true;
       }
     }
     this.requestRender();
   }
 
-  /** Keeps `mediaSrc`/`srcRefs` in sync and frees GPU resources nobody uses any more. */
-  private trackMedia(id: string, src: string | undefined): void {
-    const old = this.mediaSrc.get(id);
-    if (old === src) return;
-    if (old !== undefined) {
-      const n = (this.srcRefs.get(old) ?? 1) - 1;
-      if (n > 0) this.srcRefs.set(old, n);
+  /** Keeps `mediaSource`/`sourceReferences` in sync and frees GPU resources nobody uses any more. */
+  private trackMedia(id: string, source: string | undefined): void {
+    const previous = this.mediaSource.get(id);
+    if (previous === source) return;
+    if (previous !== undefined) {
+      const count = (this.sourceReferences.get(previous) ?? 1) - 1;
+      if (count > 0) this.sourceReferences.set(previous, count);
       else {
-        this.srcRefs.delete(old);
-        this.mediaPass.releaseImage(old);
+        this.sourceReferences.delete(previous);
+        this.mediaPass.releaseImage(previous);
       }
       this.mediaPass.releaseAudio(id);
     }
-    if (src === undefined) {
-      this.mediaSrc.delete(id);
+    if (source === undefined) {
+      this.mediaSource.delete(id);
       return;
     }
-    this.mediaSrc.set(id, src);
-    this.srcRefs.set(src, (this.srcRefs.get(src) ?? 0) + 1);
+    this.mediaSource.set(id, source);
+    this.sourceReferences.set(source, (this.sourceReferences.get(source) ?? 0) + 1);
   }
 
   /** Rewrites connectors changed since the last frame (after slots are up to date). */
@@ -533,11 +544,11 @@ export class BoardRenderer {
       return;
     }
     for (const id of this.pendingLines) {
-      const el = this.scene.get(id);
-      if (el && isConnector(el)) {
-        this.lineLayer.set(el, this.scene.connectorGeometry(id), this.store.slot(id));
-      } else if (el && el.type === 'ink') {
-        this.lineLayer.setInk(el, this.store.slot(id));
+      const element = this.scene.get(id);
+      if (element && isConnector(element)) {
+        this.lineLayer.set(element, this.scene.connectorGeometry(id), this.store.slot(id));
+      } else if (element && element.type === 'ink') {
+        this.lineLayer.setInk(element, this.store.slot(id));
       }
     }
     this.pendingLines.clear();

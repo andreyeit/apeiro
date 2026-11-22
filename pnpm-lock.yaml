@@ -182,6 +182,34 @@ importers:
         specifier: ^5.1.0
         version: 5.1.0(@types/node@26.6.6)(happy-dom@21.0.4)(vite@8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))
 
+  apps/playground:
+    dependencies:
+      '@apeiro/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@apeiro/editor':
+        specifier: workspace:*
+        version: link:../../packages/editor
+      '@apeiro/react':
+        specifier: workspace:*
+        version: link:../../packages/react
+      react:
+        specifier: ^19.3.1
+        version: 19.3.1
+      react-dom:
+        specifier: ^19.3.1
+        version: 19.3.1(react@19.3.1)
+    devDependencies:
+      '@types/react':
+        specifier: ^19.3.0
+        version: 19.3.0
+      '@types/react-dom':
+        specifier: ^19.3.0
+        version: 19.3.0(@types/react@19.3.0)
+      vite:
+        specifier: ^8.3.6
+        version: 8.3.6(@types/node@26.6.6)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1)
+
   packages/core: {}
 
   packages/editor:
@@ -211,9 +239,6 @@ importers:
       '@apeiro/renderer':
         specifier: workspace:*
         version: link:../renderer
-      '@apeiro/yjs':
-        specifier: workspace:*
-        version: link:../yjs
       '@types/react':
         specifier: ^19.3.0
         version: 19.3.0
@@ -223,12 +248,6 @@ importers:
       tsdown:
         specifier: ^0.23.7
         version: 0.23.7(typescript@6.0.3)
-      y-protocols:
-        specifier: ^1.0.7
-        version: 1.0.7(yjs@13.6.33)
-      yjs:
-        specifier: ^13.6.33
-        version: 13.6.33
 
   packages/react:
     dependencies:
@@ -260,22 +279,6 @@ importers:
       '@mapbox/tiny-sdf':
         specifier: ^2.3.0
         version: 2.3.0
-
-  packages/yjs:
-    dependencies:
-      '@apeiro/core':
-        specifier: workspace:*
-        version: link:../core
-      '@apeiro/editor':
-        specifier: workspace:*
-        version: link:../editor
-    devDependencies:
-      y-protocols:
-        specifier: ^1.0.7
-        version: 1.0.7(yjs@13.6.33)
-      yjs:
-        specifier: ^13.6.33
-        version: 13.6.33
 
 packages:
 
@@ -1107,16 +1110,8 @@ packages:
     resolution: {integrity: sha512-vXoV9PjKHEednCUu01e98TkImxy67e3BJXbTIOmIq4Hyzw3IAwYRcuPkfeTzJzwyyts4kjuA73x+pWJLc4f86A==}
     engines: {node: ^22.18.0 || >=24.0.0}
 
-  isomorphic.js@0.2.5:
-    resolution: {integrity: sha512-PIeMbHqMt4DnUP3MA/Flc0HElYjMXArsw1qwJZcm9sqR8mq3l8NYizFMty0pWwE/tzIGH3EKK5+jes5mAr85yw==}
-
   jiti@2.7.0:
     resolution: {integrity: sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ==}
-    hasBin: true
-
-  lib0@0.2.120:
-    resolution: {integrity: sha512-/a2eRImR8sZbmMVKe2we1/KukDQkuPyPf8yol6epvCu2PH6hurjcRI3mdGFFAi0uGoRJGyns99JquZgxwW1tQg==}
-    engines: {node: '>=16'}
     hasBin: true
 
   lightningcss-android-arm64@1.33.0:
@@ -1482,20 +1477,10 @@ packages:
       utf-8-validate:
         optional: true
 
-  y-protocols@1.0.7:
-    resolution: {integrity: sha512-YSVsLoXxO67J6eE/nV4AtFtT3QEotZf5sK5BHxFBXso7VDUT3Tx07IfA6hsu5Q5OmBdMkQVmFZ9QOA7fikWvnw==}
-    engines: {node: '>=16.0.0', npm: '>=8.0.0'}
-    peerDependencies:
-      yjs: ^13.0.0
-
   yaml@2.9.1:
     resolution: {integrity: sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==}
     engines: {node: '>= 14.6'}
     hasBin: true
-
-  yjs@13.6.33:
-    resolution: {integrity: sha512-q/UYvr1gOk4XII+Cu1CW2dINjYqJJFifTzogEaIARznrvX7uOlHsdTEXcnOBMuIsrCGEEKdNxi74kyMLZlKVfw==}
-    engines: {node: '>=16.0.0', npm: '>=8.0.0'}
 
   yuku@0.28.0:
     resolution: {integrity: sha512-vzuml0lBwq8gYUujhLZn9AZwgPG1yPF1081ceOkTnEIM9bwgRnFUGAW5x2hTLC+qGI/iqu9PLs5Jko6rUn7YDA==}
@@ -2014,14 +1999,8 @@ snapshots:
 
   import-without-cache@0.4.1: {}
 
-  isomorphic.js@0.2.5: {}
-
   jiti@2.7.0:
     optional: true
-
-  lib0@0.2.120:
-    dependencies:
-      isomorphic.js: 0.2.5
 
   lightningcss-android-arm64@1.33.0:
     optional: true
@@ -2317,17 +2296,8 @@ snapshots:
   ws@8.22.1:
     optional: true
 
-  y-protocols@1.0.7(yjs@13.6.33):
-    dependencies:
-      lib0: 0.2.120
-      yjs: 13.6.33
-
   yaml@2.9.1:
     optional: true
-
-  yjs@13.6.33:
-    dependencies:
-      lib0: 0.2.120
 
   yuku@0.28.0:
     optionalDependencies:

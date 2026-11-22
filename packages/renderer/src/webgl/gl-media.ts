@@ -1,5 +1,5 @@
 import type { MediaQuad, MediaSource, MediaTextures, TextureHandle } from '../backend';
-import { compileProgram, uniforms } from './gl-utils';
+import { compileProgram, createUnitQuad, uniforms } from './gl-utils';
 import { MEDIA_FRAGMENT, MEDIA_VERTEX } from './shaders';
 
 type Uniforms = Record<
@@ -19,12 +19,12 @@ interface Resources {
   program: WebGLProgram;
   vao: WebGLVertexArrayObject;
   quad: WebGLBuffer;
-  u: Uniforms;
+  uniforms: Uniforms;
 }
 
 /** WebGL side of images and audio players: their textures and one draw call per quad. */
 export class GlMedia implements MediaTextures {
-  private res: Resources | null = null;
+  private resources: Resources | null = null;
 
   constructor(private readonly gl: WebGL2RenderingContext) {}
 
@@ -32,23 +32,19 @@ export class GlMedia implements MediaTextures {
     return this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) as number;
   }
 
-  init(): void {
+  initialize(): void {
     const gl = this.gl;
     const program = compileProgram(gl, MEDIA_VERTEX, MEDIA_FRAGMENT);
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
-    const quad = gl.createBuffer()!;
-    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    const quad = createUnitQuad(gl);
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    this.res = {
+    this.resources = {
       program,
       vao,
       quad,
-      u: uniforms(gl, program, [
+      uniforms: uniforms(gl, program, [
         'u_camera',
         'u_viewport',
         'u_rect',
@@ -63,38 +59,45 @@ export class GlMedia implements MediaTextures {
   }
 
   lose(): void {
-    this.res = null;
+    this.resources = null;
   }
 
   dispose(): void {
-    const res = this.res;
-    if (!res) return;
+    const resources = this.resources;
+    if (!resources) return;
     const gl = this.gl;
-    gl.deleteProgram(res.program);
-    gl.deleteVertexArray(res.vao);
-    gl.deleteBuffer(res.quad);
-    this.res = null;
+    gl.deleteProgram(resources.program);
+    gl.deleteVertexArray(resources.vao);
+    gl.deleteBuffer(resources.quad);
+    this.resources = null;
   }
 
-  draw(quads: MediaQuad[], x: number, y: number, zoom: number, vw: number, vh: number): void {
-    const res = this.res;
-    if (!res || quads.length === 0) return;
+  draw(
+    quads: MediaQuad[],
+    x: number,
+    y: number,
+    zoom: number,
+    viewportWidth: number,
+    viewportHeight: number,
+  ): void {
+    const resources = this.resources;
+    if (!resources || quads.length === 0) return;
     const gl = this.gl;
-    const u = res.u;
-    gl.useProgram(res.program);
-    gl.bindVertexArray(res.vao);
-    gl.uniform3f(u.u_camera, x, y, zoom);
-    gl.uniform2f(u.u_viewport, vw, vh);
+    const uniforms = resources.uniforms;
+    gl.useProgram(resources.program);
+    gl.bindVertexArray(resources.vao);
+    gl.uniform3f(uniforms.u_camera, x, y, zoom);
+    gl.uniform2f(uniforms.u_viewport, viewportWidth, viewportHeight);
     gl.activeTexture(gl.TEXTURE0);
-    gl.uniform1i(u.u_tex, 0);
-    for (const q of quads) {
-      gl.uniform4f(u.u_rect, ...q.rect);
-      gl.uniform4f(u.u_uv, ...q.uv);
-      gl.uniform1f(u.u_rotation, q.rotation);
-      gl.uniform1f(u.u_depth, q.depth);
-      gl.uniform1f(u.u_radius, q.radius);
-      if (q.texture) gl.bindTexture(gl.TEXTURE_2D, q.texture as WebGLTexture);
-      gl.uniform1f(u.u_mode, q.texture ? 0 : 1);
+    gl.uniform1i(uniforms.u_tex, 0);
+    for (const quad of quads) {
+      gl.uniform4f(uniforms.u_rect, ...quad.box);
+      gl.uniform4f(uniforms.u_uv, ...quad.textureCoordinates);
+      gl.uniform1f(uniforms.u_rotation, quad.rotation);
+      gl.uniform1f(uniforms.u_depth, quad.depth);
+      gl.uniform1f(uniforms.u_radius, quad.radius);
+      if (quad.texture) gl.bindTexture(gl.TEXTURE_2D, quad.texture as WebGLTexture);
+      gl.uniform1f(uniforms.u_mode, quad.texture ? 0 : 1);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
     gl.bindVertexArray(null);

@@ -3,19 +3,17 @@ import {
   closestOutlinePoint,
   hasCustomOutline,
   outlineAlongRay,
-  outlineNormal,
+  shapeSdf,
 } from '../elements/shape-geometry';
-import type { Vec2 } from '../geometry/math';
+import { boxCenter, localToWorld, worldToLocal } from '../geometry/frame';
+import { normalize, rotateVector, type Vec2 } from '../geometry/vector';
 import {
+  anchorBoxPoint,
   anchorLocal,
-  axis,
-  center,
-  norm,
+  outlineNormalAt,
   outlinePoint,
-  rotate,
   sideNormal,
-  toLocal,
-  toWorld,
+  snapToAxis,
   type ResolvedEnd,
 } from './local-geometry';
 import type { ConnectorElement, ConnectorEnd, ConnectorRoute } from './types';
@@ -23,79 +21,79 @@ import type { ConnectorElement, ConnectorEnd, ConnectorRoute } from './types';
 // Where a connector's ends are: on a shape's outline (floating or at an anchor), at a
 // free point, moved clear of the shape's border.
 
-function referencePoint(
-  end: ConnectorEnd,
-  getShape: (id: string) => ShapeElement | undefined,
-): Vec2 | null {
+type ShapeLookup = (id: string) => ShapeElement | undefined;
+
+/** The point the other end aims at: a free point, an anchor's box point or the shape center. */
+function referencePoint(end: ConnectorEnd, getShape: ShapeLookup): Vec2 | null {
   if (end.kind === 'point') return { x: end.x, y: end.y };
-  const s = getShape(end.id);
-  if (!s) return null;
-  return end.anchor
-    ? toWorld(s, { x: (end.anchor.x - 0.5) * s.w, y: (end.anchor.y - 0.5) * s.h })
-    : center(s);
+  const shape = getShape(end.id);
+  if (!shape) return null;
+  return end.anchor ? localToWorld(shape, anchorBoxPoint(shape, end.anchor)) : boxCenter(shape);
 }
 
+export const isFloating = (end: ConnectorEnd): boolean => end.kind === 'element' && !end.anchor;
+
+/** Where an end sits and which way it leaves, aiming at `toward` when it floats. */
 export function resolveEnd(
   end: ConnectorEnd,
   toward: Vec2,
   route: ConnectorRoute,
-  getShape: (id: string) => ShapeElement | undefined,
+  getShape: ShapeLookup,
 ): ResolvedEnd | null {
-  if (end.kind === 'point') return { p: { x: end.x, y: end.y }, normal: null };
-  const s = getShape(end.id);
-  if (!s) return null;
-  const custom = hasCustomOutline(s);
+  if (end.kind === 'point') return { point: { x: end.x, y: end.y }, normal: null };
+  const shape = getShape(end.id);
+  if (!shape) return null;
+  const resolved = (local: Vec2, normal: Vec2): ResolvedEnd => ({
+    point: localToWorld(shape, local),
+    normal: rotateVector(normal, shape.rotation),
+  });
   if (end.anchor) {
-    const local = anchorLocal(s, end.anchor);
-    const n =
-      route === 'elbow'
-        ? sideNormal(s, local)
-        : s.type === 'ellipse'
-          ? norm({ x: local.x / (s.w * s.w || 1), y: local.y / (s.h * s.h || 1) })
-          : custom
-            ? outlineNormal(s, local)
-            : sideNormal(s, local);
-    return { p: toWorld(s, local), normal: rotate(n, s.rotation) };
+    const local = anchorLocal(shape, end.anchor);
+    return resolved(
+      local,
+      route === 'elbow' ? sideNormal(shape, local) : outlineNormalAt(shape, local),
+    );
   }
-  const dir = toLocal(s, toward);
+  const direction = worldToLocal(shape, toward);
   if (route === 'elbow') {
     // Orthogonal routes leave from the middle of the side facing the other end
     // (for polygons: where the outline crosses the line to that side's middle).
-    const n = sideNormal(s, dir);
-    const mid = { x: (n.x * s.w) / 2, y: (n.y * s.h) / 2 };
-    const local = s.type === 'polygon' ? outlineAlongRay(s, mid) : mid;
-    return { p: toWorld(s, local), normal: rotate(n, s.rotation) };
+    const normal = sideNormal(shape, direction);
+    const middle = { x: (normal.x * shape.width) / 2, y: (normal.y * shape.height) / 2 };
+    return resolved(shape.type === 'polygon' ? outlineAlongRay(shape, middle) : middle, normal);
   }
-  const local = outlinePoint(s, norm(dir));
-  const n =
-    s.type === 'ellipse'
-      ? norm({ x: local.x / (s.w * s.w || 1), y: local.y / (s.h * s.h || 1) })
-      : custom
-        ? outlineNormal(s, local)
-        : norm(local);
-  return { p: toWorld(s, local), normal: rotate(n, s.rotation) };
+  const local = outlinePoint(shape, normalize(direction));
+  // A plain box faces the other end straight from its center.
+  const plainBox = shape.type !== 'ellipse' && !hasCustomOutline(shape);
+  return resolved(local, plainBox ? normalize(local) : outlineNormalAt(shape, local));
 }
 
 /** Point on a shape's (unrotated) outline at the given side, moved along that side to `along`. */
-function sidePointAt(s: ShapeElement, normal: Vec2, along: number): Vec2 {
-  const cx = s.x + s.w / 2;
-  const cy = s.y + s.h / 2;
-  const hw = s.w / 2;
-  const hh = s.h / 2;
-  let p: Vec2;
+function sidePointAt(shape: ShapeElement, normal: Vec2, along: number): Vec2 {
+  const centerX = shape.x + shape.width / 2;
+  const centerY = shape.y + shape.height / 2;
+  const halfWidth = shape.width / 2;
+  const halfHeight = shape.height / 2;
+  let point: Vec2;
   if (normal.x !== 0) {
-    const t = (along - cy) / hh;
-    const x = s.type === 'ellipse' ? hw * Math.sqrt(Math.max(0, 1 - t * t)) : hw;
-    p = { x: cx + normal.x * x, y: along };
+    const fraction = (along - centerY) / halfHeight;
+    const reach =
+      shape.type === 'ellipse'
+        ? halfWidth * Math.sqrt(Math.max(0, 1 - fraction * fraction))
+        : halfWidth;
+    point = { x: centerX + normal.x * reach, y: along };
   } else {
-    const t = (along - cx) / hw;
-    const y = s.type === 'ellipse' ? hh * Math.sqrt(Math.max(0, 1 - t * t)) : hh;
-    p = { x: along, y: cy + normal.y * y };
+    const fraction = (along - centerX) / halfWidth;
+    const reach =
+      shape.type === 'ellipse'
+        ? halfHeight * Math.sqrt(Math.max(0, 1 - fraction * fraction))
+        : halfHeight;
+    point = { x: along, y: centerY + normal.y * reach };
   }
-  if (s.type === 'ellipse' || !hasCustomOutline(s)) return p;
+  if (shape.type === 'ellipse' || !hasCustomOutline(shape)) return point;
   // Rounded corners: the box side point may be off the outline near the corner.
-  const q = closestOutlinePoint(s, { x: p.x - cx, y: p.y - cy });
-  return { x: cx + q.x, y: cy + q.y };
+  const closest = closestOutlinePoint(shape, { x: point.x - centerX, y: point.y - centerY });
+  return { x: centerX + closest.x, y: centerY + closest.y };
 }
 
 /**
@@ -104,43 +102,110 @@ function sidePointAt(s: ShapeElement, normal: Vec2, along: number): Vec2 {
  * making a tiny Z-step (what Miro does). Only for unrotated shapes.
  */
 function alignFacingEnds(
-  c: ConnectorElement,
-  a: ResolvedEnd,
-  b: ResolvedEnd,
-  getShape: (id: string) => ShapeElement | undefined,
+  connector: ConnectorElement,
+  start: ResolvedEnd,
+  end: ResolvedEnd,
+  getShape: ShapeLookup,
 ): void {
-  if (c.start.kind !== 'element' || c.end.kind !== 'element' || c.start.anchor || c.end.anchor)
+  if (!isFloating(connector.start) || !isFloating(connector.end)) return;
+  if (connector.start.kind !== 'element' || connector.end.kind !== 'element') return;
+  const startShape = getShape(connector.start.id);
+  const endShape = getShape(connector.end.id);
+  if (
+    !startShape ||
+    !endShape ||
+    startShape.rotation !== 0 ||
+    endShape.rotation !== 0 ||
+    !start.normal ||
+    !end.normal
+  )
     return;
-  const s0 = getShape(c.start.id);
-  const s1 = getShape(c.end.id);
-  if (!s0 || !s1 || s0.rotation !== 0 || s1.rotation !== 0 || !a.normal || !b.normal) return;
-  if (s0.type === 'polygon' || s1.type === 'polygon') return; // sides aren't the box sides
-  const n0 = axis(a.normal);
-  const n1 = axis(b.normal);
-  if (n0.x + n1.x !== 0 || n0.y + n1.y !== 0) return; // not facing each other
-  const horizontal = n0.x !== 0;
-  const lo = horizontal ? Math.max(s0.y, s1.y) : Math.max(s0.x, s1.x);
-  const hi = horizontal ? Math.min(s0.y + s0.h, s1.y + s1.h) : Math.min(s0.x + s0.w, s1.x + s1.w);
-  if (hi - lo < 1) return;
-  const mid = (lo + hi) / 2;
-  a.p = sidePointAt(s0, n0, mid);
-  b.p = sidePointAt(s1, n1, mid);
+  if (startShape.type === 'polygon' || endShape.type === 'polygon') return; // sides aren't the box sides
+  const startNormal = snapToAxis(start.normal);
+  const endNormal = snapToAxis(end.normal);
+  if (startNormal.x + endNormal.x !== 0 || startNormal.y + endNormal.y !== 0) return; // not facing each other
+  const horizontal = startNormal.x !== 0;
+  const low = horizontal ? Math.max(startShape.y, endShape.y) : Math.max(startShape.x, endShape.x);
+  const high = horizontal
+    ? Math.min(startShape.y + startShape.height, endShape.y + endShape.height)
+    : Math.min(startShape.x + startShape.width, endShape.x + endShape.width);
+  if (high - low < 1) return;
+  const middle = (low + high) / 2;
+  start.point = sidePointAt(startShape, startNormal, middle);
+  end.point = sidePointAt(endShape, endNormal, middle);
 }
 
-export const isFloating = (end: ConnectorEnd): boolean => end.kind === 'element' && !end.anchor;
-
+/** Both ends of a connector, clear of the borders; null if an attached shape is missing. */
 export function resolveEnds(
-  c: ConnectorElement,
-  getShape: (id: string) => ShapeElement | undefined,
+  connector: ConnectorElement,
+  getShape: ShapeLookup,
 ): [ResolvedEnd, ResolvedEnd] | null {
-  const r0 = referencePoint(c.start, getShape);
-  const r1 = referencePoint(c.end, getShape);
-  if (!r0 || !r1) return null;
-  const a = resolveEnd(c.start, r1, c.route, getShape);
-  const b = resolveEnd(c.end, r0, c.route, getShape);
-  if (!a || !b) return null;
-  if (c.route === 'elbow') alignFacingEnds(c, a, b, getShape);
-  return [clearBorder(c, c.start, a, getShape), clearBorder(c, c.end, b, getShape)];
+  const startReference = referencePoint(connector.start, getShape);
+  const endReference = referencePoint(connector.end, getShape);
+  if (!startReference || !endReference) return null;
+  const start = resolveEnd(connector.start, endReference, connector.route, getShape);
+  const end = resolveEnd(connector.end, startReference, connector.route, getShape);
+  if (!start || !end) return null;
+  if (connector.route === 'elbow') alignFacingEnds(connector, start, end, getShape);
+  return [
+    clearBorder(connector, connector.start, start, getShape),
+    clearBorder(connector, connector.end, end, getShape),
+  ];
+}
+
+/**
+ * How far out along `normal` (from the outline point `local`, shape-local) a capless line of
+ * half width `half` ends, so that it joins a border of half width `border` with no notches.
+ * On a flat side its end sits on the border's outer edge (further out when the border is
+ * thinner than the rounded end is long, so it doesn't reach into the fill). Where the outline
+ * falls away across the line's width — a corner of a polygon, a curve — the outer edge is
+ * deeper there, and the line goes in by that much more, so its whole width meets the border.
+ */
+function caplessDistance(
+  shape: ShapeElement,
+  local: Vec2,
+  normal: Vec2,
+  border: number,
+  half: number,
+): number {
+  const flat = Math.max(border, half - border);
+  const side = { x: -normal.y, y: normal.x };
+  const reach = Math.max(shape.width, shape.height) + border + half;
+  // Along the normal, at `lateral` across the line: where the border's outer edge is (the
+  // outline is the middle of the border), or null if the line passes beside the shape there.
+  const outerEdgeAt = (lateral: number): number | null => {
+    const outside = (along: number) =>
+      shapeSdf(shape, {
+        x: local.x + normal.x * along + side.x * lateral,
+        y: local.y + normal.y * along + side.y * lateral,
+      }) > border;
+    let high = border + half + Math.abs(lateral) + 1;
+    if (!outside(high)) return null;
+    // The first point inside going in: further on the line may leave the shape again (it
+    // crosses a corner of a polygon and comes out of its far side).
+    const step = Math.max(half, border, 1e-3) / 4;
+    let low = Number.NaN;
+    for (let along = border; along >= -reach; along -= step) {
+      if (!outside(along)) {
+        low = along;
+        break;
+      }
+      high = along;
+    }
+    if (Number.isNaN(low)) return null;
+    for (let iteration = 0; iteration < 40; iteration++) {
+      const middle = (low + high) / 2;
+      if (outside(middle)) high = middle;
+      else low = middle;
+    }
+    return high;
+  };
+  let deepest = border;
+  for (const share of [-1, -0.5, 0, 0.5, 1]) {
+    const edge = outerEdgeAt(share * half);
+    if (edge !== null && edge < deepest) deepest = edge;
+  }
+  return flat - (border - deepest);
 }
 
 /**
@@ -148,26 +213,35 @@ export function resolveEnds(
  * against the outer edge of the shape's border instead of running into it. The outline
  * point is the middle of the border, so the end moves out by half the border plus half
  * the line's own width (its rounded end reaches that far past the point).
+ *
+ * An end without a cap joins the border instead: the line's full width reaches the outer
+ * edge of the border (a rounded end only touching it would leave a notch on each side), and
+ * its rounded end goes into the border, at most to its inner edge, never into the fill.
  */
 export function clearBorder(
-  c: ConnectorElement,
+  connector: ConnectorElement,
   end: ConnectorEnd,
-  r: ResolvedEnd,
-  getShape: (id: string) => ShapeElement | undefined,
+  resolved: ResolvedEnd,
+  getShape: ShapeLookup,
 ): ResolvedEnd {
-  if (end.kind !== 'element') return r;
-  const s = getShape(end.id);
-  if (!s) return r;
-  const d = s.strokeWidth / 2 + c.strokeWidth / 2;
-  if (!(d > 0)) return r;
+  if (end.kind !== 'element') return resolved;
+  const shape = getShape(end.id);
+  if (!shape) return resolved;
+  const border = shape.strokeWidth / 2;
+  const half = connector.strokeWidth / 2;
+  const cap = end === connector.start ? connector.startCap : connector.endCap;
   // Straight out of the border at that point (a side of a box, the normal of a curve).
-  const local = toLocal(s, r.p);
-  const n =
-    s.type === 'ellipse'
-      ? norm({ x: local.x / (s.w * s.w || 1), y: local.y / (s.h * s.h || 1) })
-      : hasCustomOutline(s)
-        ? outlineNormal(s, local)
-        : sideNormal(s, local);
-  const out = rotate(n, s.rotation);
-  return { p: { x: r.p.x + out.x * d, y: r.p.y + out.y * d }, normal: r.normal };
+  const local = worldToLocal(shape, resolved.point);
+  const normal = outlineNormalAt(shape, local);
+  const distance =
+    cap === 'none' ? caplessDistance(shape, local, normal, border, half) : border + half;
+  if (!(distance > 0)) return resolved;
+  const outward = rotateVector(normal, shape.rotation);
+  return {
+    point: {
+      x: resolved.point.x + outward.x * distance,
+      y: resolved.point.y + outward.y * distance,
+    },
+    normal: resolved.normal,
+  };
 }

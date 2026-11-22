@@ -18,7 +18,7 @@ export class ColorTheme {
   /** The packed 0xRRGGBBAA color to draw for `color` of an element of type `type`. */
   of(type: string, color: number): number {
     if (this.map.size === 0 || this.keep.has(type)) return color;
-    const rgb = this.map.get(color >>> 8);
-    return rgb === undefined ? color : ((rgb << 8) | (color & 255)) >>> 0;
+    const mapped = this.map.get(color >>> 8);
+    return mapped === undefined ? color : ((mapped << 8) | (color & 255)) >>> 0;
   }
 }

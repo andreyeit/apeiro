@@ -41,8 +41,8 @@ export interface SnapContext {
 
 /** The offset of a move and the guides to draw. */
 export interface DragStep {
-  dx: number;
-  dy: number;
+  deltaX: number;
+  deltaY: number;
   guides: SnapGuide[];
   spacing: SpacingGuide[];
 }
@@ -58,31 +58,42 @@ export function dragStep(
   box: Box | null,
   targets: readonly Box[],
   moved: boolean,
-  k: SnapContext,
+  snapContext: SnapContext,
 ): DragStep {
-  let dx = world.x - start.x;
-  let dy = world.y - start.y;
+  let deltaX = world.x - start.x;
+  let deltaY = world.y - start.y;
   let lockX = false;
   let lockY = false;
-  if (k.shift) {
-    if (Math.abs(dx) >= Math.abs(dy)) lockY = true;
+  if (snapContext.shift) {
+    if (Math.abs(deltaX) >= Math.abs(deltaY)) lockY = true;
     else lockX = true;
-    if (lockY) dy = 0;
-    else dx = 0;
+    if (lockY) deltaY = 0;
+    else deltaX = 0;
   }
-  if (!k.snapping || !box || !moved || k.deep) return { dx, dy, guides: [], spacing: [] };
+  if (!snapContext.snapping || !box || !moved || snapContext.deep)
+    return { deltaX, deltaY, guides: [], spacing: [] };
   const snap = snapBox(
-    { minX: box.minX + dx, minY: box.minY + dy, maxX: box.maxX + dx, maxY: box.maxY + dy },
+    {
+      minX: box.minX + deltaX,
+      minY: box.minY + deltaY,
+      maxX: box.maxX + deltaX,
+      maxY: box.maxY + deltaY,
+    },
     targets,
     {
-      threshold: GUIDE_SNAP_PX / k.zoom,
+      threshold: GUIDE_SNAP_PX / snapContext.zoom,
       // The grid only with Shift; otherwise the move is free between guides.
-      grid: k.shift ? gridStep(k.zoom) : 0,
+      grid: snapContext.shift ? gridStep(snapContext.zoom) : 0,
       lockX,
       lockY,
     },
   );
-  return { dx: dx + snap.dx, dy: dy + snap.dy, guides: snap.guides, spacing: snap.spacing };
+  return {
+    deltaX: deltaX + snap.deltaX,
+    deltaY: deltaY + snap.deltaY,
+    guides: snap.guides,
+    spacing: snap.spacing,
+  };
 }
 
 /** A resize as it started. */
@@ -114,58 +125,66 @@ export interface ResizeStep {
  * elements are scaled into it; auto-sized text refits with `measurer`.
  */
 export function resizeStep(
-  m: ResizeStart,
+  start: ResizeStart,
   local: Vec2,
-  k: SnapContext,
+  snapContext: SnapContext,
   measurer?: FontMeasurer,
 ): ResizeStep {
-  const [hx, hy] = HANDLE_SIGNS[m.handle];
-  const corner = hx !== 0 && hy !== 0;
+  const [signX, signY] = HANDLE_SIGNS[start.handle];
+  const corner = signX !== 0 && signY !== 0;
   const options = {
-    keepAspect: k.shift !== (m.lockAspect && corner),
-    fromCenter: k.alt,
-    minSize: 2 / k.zoom,
+    keepAspect: snapContext.shift !== (start.lockAspect && corner),
+    fromCenter: snapContext.alt,
+    minSize: 2 / snapContext.zoom,
   };
-  const delta = { x: local.x - m.start.x, y: local.y - m.start.y };
-  const f = m.frame;
-  let next = resizeFrame(f, m.handle, delta, options);
+  const delta = { x: local.x - start.start.x, y: local.y - start.start.y };
+  const frame = start.frame;
+  let next = resizeFrame(frame, start.handle, delta, options);
   let guides: SnapGuide[] = [];
   // With a locked aspect only the side that drives the size snaps: the other one follows.
-  if (k.snapping && f.rotation === 0 && !k.deep) {
-    const xDrives = !options.keepAspect || hy === 0 || (hx !== 0 && next.w / f.w >= next.h / f.h);
-    const side = (s: number) => (s > 0 ? ['max' as const] : s < 0 ? ['min' as const] : []);
+  if (snapContext.snapping && frame.rotation === 0 && !snapContext.deep) {
+    const xDrives =
+      !options.keepAspect ||
+      signY === 0 ||
+      (signX !== 0 && next.width / frame.width >= next.height / frame.height);
+    const side = (sign: number) => (sign > 0 ? ['max' as const] : sign < 0 ? ['min' as const] : []);
     const snap = snapBox(
       {
-        minX: next.cx - next.w / 2,
-        maxX: next.cx + next.w / 2,
-        minY: next.cy - next.h / 2,
-        maxY: next.cy + next.h / 2,
+        minX: next.centerX - next.width / 2,
+        maxX: next.centerX + next.width / 2,
+        minY: next.centerY - next.height / 2,
+        maxY: next.centerY + next.height / 2,
       },
-      m.targets,
+      start.targets,
       {
-        threshold: GUIDE_SNAP_PX / k.zoom,
-        grid: k.shift ? gridStep(k.zoom) : 0, // the grid only with Shift
+        threshold: GUIDE_SNAP_PX / snapContext.zoom,
+        grid: snapContext.shift ? gridStep(snapContext.zoom) : 0, // the grid only with Shift
         edges: {
-          x: xDrives ? side(hx) : [],
-          y: !options.keepAspect || !xDrives ? side(hy) : [],
+          x: xDrives ? side(signX) : [],
+          y: !options.keepAspect || !xDrives ? side(signY) : [],
         },
       },
     );
-    if (snap.dx !== 0 || snap.dy !== 0)
-      next = resizeFrame(f, m.handle, { x: delta.x + snap.dx, y: delta.y + snap.dy }, options);
+    if (snap.deltaX !== 0 || snap.deltaY !== 0)
+      next = resizeFrame(
+        frame,
+        start.handle,
+        { x: delta.x + snap.deltaX, y: delta.y + snap.deltaY },
+        options,
+      );
     guides = snap.guides;
   }
-  const patches = scaleElements(m.originals, f, next, {
-    scaleText: m.scaleText,
+  const patches = scaleElements(start.originals, frame, next, {
+    scaleText: start.scaleText,
   });
   if (measurer) {
     // Auto-sized text follows its text: e.g. a narrower box wraps and grows taller.
-    for (const o of m.originals) {
-      const patch = patches.get(o.id);
-      if (!patch || o.type !== 'text' || !isShape(o)) continue;
-      const fit = fitTextPatch({ ...o, ...patch } as ShapeElement, measurer);
+    for (const original of start.originals) {
+      const patch = patches.get(original.id);
+      if (!patch || original.type !== 'text' || !isShape(original)) continue;
+      const fit = fitTextPatch({ ...original, ...patch } as ShapeElement, measurer);
       if (fit) Object.assign(patch, fit);
     }
   }
-  return { patches, guides, badge: `${Math.round(next.w)} × ${Math.round(next.h)}` };
+  return { patches, guides, badge: `${Math.round(next.width)} × ${Math.round(next.height)}` };
 }

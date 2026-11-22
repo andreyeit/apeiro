@@ -1,3 +1,5 @@
+import { TEXT_MAX_SAMPLES, TEXT_THINNING } from '../text/font';
+
 /**
  * WGSL versions of the shaders in shaders.ts, for the WebGPU backend. The math is the
  * same line for line; differences come from the API:
@@ -46,7 +48,7 @@ const HIDDEN = vec4f(2.0, 2.0, 2.0, 1.0); // outside the clip volume
 
 export const SHAPE_WGSL = /* wgsl */ `${FRAME}
 const DEPTH_STEP: f32 = 1.0 / 1048576.0;
-const STICKY_SHADOW: f32 = 14.0;
+const STICKY_SHADOW: f32 = 24.0;
 const MAX_SIDES: i32 = 12;
 const RADIUS_CAP: f32 = 0.999;
 
@@ -275,9 +277,12 @@ fn shapeColor(in: ShapeOut) -> vec4f {
   }
 
   if (kind == 2.0) {
-    // Soft drop shadow under stickies, slightly offset down.
-    let sd = sdRoundBox(in.local - vec2f(0.0, 6.0), in.halfSize - 2.0, in.params.y + 4.0);
-    let shadow = 0.18 * (1.0 - smoothstep(-10.0, 10.0, sd));
+    // Shadow of a sticky as in Miro: paper lifting at its lower edge. A box a bit narrower
+    // than the note, shifted down, blurred, and fading in from top to bottom, so it shows
+    // under the lower edge and hardly at the sides.
+    let lift = smoothstep(-in.halfSize.y * 0.3, in.halfSize.y, in.local.y);
+    let sd = sdRoundBox(in.local - vec2f(0.0, 8.0), in.halfSize - vec2f(6.0, 4.0), 6.0);
+    let shadow = 0.24 * lift * (1.0 - smoothstep(-12.0, 12.0, sd));
     color = color + vec4f(0.0, 0.0, 0.0, shadow) * (1.0 - color.a);
   }
   return color;
@@ -399,10 +404,11 @@ fn fs(in: GlyphOut) -> @location(0) vec4f {
   let dx = dpdx(in.uv);
   let dy = dpdy(in.uv);
   let d = textureSample(sdfAtlas, atlasSampler, in.uv).r;
-  // Screen-space derivative keeps edges ~1px wide at any zoom and tier; each of the four
-  // samples covers a quarter of the pixel, so its own edge is half as wide.
-  let w = max(fwidth(d) * 0.35, 1e-4);
-  let w1 = max(fwidth(d) * 0.5, 1e-4);
+  // SDF units per screen pixel across the outline: the gradient's length. fwidth (|dx|+|dy|)
+  // is up to 1.4x that on slanted and curved edges, which spread over more than a pixel.
+  // Keeps edges ~1px wide at any zoom and tier.
+  let fw = length(vec2f(dpdx(d), dpdy(d)));
+  let w1 = max(fw * 0.5, 1e-4);
   if (in.mode > 1.5) {
     return vec4f(in.color.rgb * in.color.a, in.color.a);
   }
@@ -425,18 +431,31 @@ fn fs(in: GlyphOut) -> @location(0) vec4f {
     }
     return t;
   }
-  let edge = frame.viewport.z;
+  // The outline moves inwards by TEXT_THINNING of a pixel (see there): otherwise glyphs come
+  // out heavier than the browser's and look smudged.
+  let edge = frame.viewport.z + ${TEXT_THINNING.toFixed(2)} * fw;
   // Drawn at about its raster size or bigger: one sample with an edge one pixel wide, as
-  // crisp as the browser's own text. Shrunk a lot (zoomed out): the four-sample box filter.
+  // crisp as the browser's own text.
   let crisp = smoothstep(edge - w1, edge + w1, d);
-  let lo = edge - w;
-  let hi = edge + w;
-  let filtered = 0.25 * (
-    sdfCoverage(in.uv + o1, dx, dy, lo, hi) + sdfCoverage(in.uv - o1, dx, dy, lo, hi) +
-    sdfCoverage(in.uv + o2, dx, dy, lo, hi) + sdfCoverage(in.uv - o2, dx, dy, lo, hi)
-  );
-  // Atlas texels per screen pixel; blended, so zooming never pops between the two.
+  // Atlas texels per screen pixel.
   let shrink = max(length(dx), length(dy)) * f32(textureDimensions(sdfAtlas).x);
+  // Shrunk (zoomed out): a box filter over the pixel, n x n samples on a grid, about one per
+  // atlas texel (see the WebGL shader); each covers 1/n of the pixel, so its own edge is that
+  // much narrower.
+  let n = i32(clamp(ceil(shrink), 2.0, f32(${TEXT_MAX_SAMPLES})));
+  let cell = 1.0 / f32(n);
+  let wn = max(fw * 0.7 * cell, 1e-4);
+  let lo = edge - wn;
+  let hi = edge + wn;
+  var filtered = 0.0;
+  for (var i = 0; i < n; i++) {
+    for (var j = 0; j < n; j++) {
+      let offset = ((f32(i) + 0.5) * cell - 0.5) * dx + ((f32(j) + 0.5) * cell - 0.5) * dy;
+      filtered += sdfCoverage(in.uv + offset, dx, dy, lo, hi);
+    }
+  }
+  filtered *= cell * cell;
+  // Blended, so zooming never pops between the two.
   let a = mix(crisp, filtered, smoothstep(1.5, 2.5, shrink)) * in.color.a;
   if (a <= 0.0) {
     discard;
@@ -545,9 +564,14 @@ fn vs(in: LineIn) -> LineOut {
 // A joint belongs to one of its two pieces at each pixel (line-layer.ts): a piece draws from
 // the split line at its start, and up to a hundredth of a pixel past the one at its end. That
 // sliver, drawn by both, means float noise can't leave a pixel to neither of them.
-fn outsideJoints(joints: vec4f, fromStart: f32, pastEnd: f32, px: f32) -> bool {
-  return (any(joints.xy != vec2f(0.0)) && fromStart < 0.0) ||
-    (any(joints.zw != vec2f(0.0)) && pastEnd > 0.01 * px);
+// The split angles are quantized (line-layer.ts), so two neighbours' split lines differ by up
+// to JOIN_SLACK radians: a gap that widens away from the centre line. Each piece reaches that
+// far past its split ("across": distance from the centre line), so no pixel is left out.
+const JOIN_SLACK: f32 = 0.002;
+fn outsideJoints(joints: vec4f, fromStart: f32, pastEnd: f32, across: f32, px: f32) -> bool {
+  let slack = across * JOIN_SLACK;
+  return (any(joints.xy != vec2f(0.0)) && fromStart < -slack) ||
+    (any(joints.zw != vec2f(0.0)) && pastEnd > 0.01 * px + slack);
 }
 
 // How far a point at arc length u (plus the connector's dash offset) is from a dash; 0 inside one.
@@ -589,8 +613,8 @@ fn sdRhombus(p0: vec2f, b: vec2f) -> f32 {
   return d * sign(p.x * b.y + p.y * b.x - b.x * b.y);
 }
 
-@fragment
-fn fs(in: LineOut) -> @location(0) vec4f {
+// Coverage of a line pixel (times its alpha), or -1 where no piece of the line is drawn.
+fn lineAlpha(in: LineOut) -> f32 {
   let px = 1.0 / frame.camera.z;
   let hw = in.params.x;
   let mode = in.params.y;
@@ -610,16 +634,16 @@ fn fs(in: LineOut) -> @location(0) vec4f {
     let rel = fmod((atan2(v, u) - in.arcStart) * turn, tau); // here (u, v) = point - center
     let along = select(rel - tau, rel, rel <= span + (tau - span) * 0.5) * r;
     // Joined ends split along the radius: the neighbouring segments are tangent there.
-    if (outsideJoints(in.joints, along, along - span * r, px)) {
-      discard;
+    if (outsideJoints(in.joints, along, along - span * r, abs(length(vec2f(u, v)) - r), px)) {
+      return -1.0;
     }
     var off = abs(along - clamp(along, 0.0, span * r));
     off = max(off, toDash(along, in.extra.x, in.params.z, in.params.w));
     d = length(vec2f(off, length(vec2f(u, v)) - r)) - hw;
   } else if (mode < 0.5) {
     let len = in.extra.y;
-    if (outsideJoints(in.joints, dot(vec2f(u, v), in.joints.xy), dot(vec2f(u - len, v), in.joints.zw), px)) {
-      discard;
+    if (outsideJoints(in.joints, dot(vec2f(u, v), in.joints.xy), dot(vec2f(u - len, v), in.joints.zw), abs(v), px)) {
+      return -1.0;
     }
     var off = abs(u - clamp(u, 0.0, len)); // past the segment ends: round caps
     off = max(off, toDash(u, in.extra.x, in.params.z, in.params.w));
@@ -635,11 +659,28 @@ fn fs(in: LineOut) -> @location(0) vec4f {
     d = sdRhombus(vec2f(u - size * 0.5, v), vec2f(size * 0.5, size * 0.35));
   }
 
-  let a = clamp(0.5 - d / px, 0.0, 1.0) * in.color.a;
+  return clamp(0.5 - d / px, 0.0, 1.0) * in.color.a;
+}
+
+// Color, without depth writes: the depth pass before it already decided which line is on top.
+@fragment
+fn fs(in: LineOut) -> @location(0) vec4f {
+  let a = lineAlpha(in);
   if (a <= 0.01) {
     discard;
   }
   return vec4f(in.color.rgb * a, a);
+}
+
+// Depth pass (color writes masked off), drawn first: only fully opaque pixels hide the lines
+// below. An antialiased edge must not, or a line under it would be cut away there and the
+// half-transparent edge would show the background: a light seam where lines cross.
+@fragment
+fn fsDepth(in: LineOut) -> @location(0) vec4f {
+  if (lineAlpha(in) < 0.99) {
+    discard;
+  }
+  return vec4f(0.0);
 }
 `;
 

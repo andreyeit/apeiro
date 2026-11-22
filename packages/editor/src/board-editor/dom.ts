@@ -15,25 +15,21 @@ export interface BoardDom {
 }
 
 const div = (className: string): HTMLDivElement => {
-  const el = document.createElement('div');
-  el.className = className;
-  return el;
+  const element = document.createElement('div');
+  element.className = className;
+  return element;
 };
 
 const canvas = (className: string): HTMLCanvasElement => {
-  const el = document.createElement('canvas');
-  el.className = className;
-  return el;
+  const element = document.createElement('canvas');
+  element.className = className;
+  return element;
 };
 
 /** Builds the board's elements (see `styles.css`) and appends them to `container`. */
-export function createBoardDom(
-  container: HTMLElement,
-  options: { theme: string; textToolbar: boolean },
-): BoardDom {
+export function createBoardDom(container: HTMLElement, options: { theme: string }): BoardDom {
   const root = div('ap-board');
   root.dataset.apTheme = options.theme;
-  if (!options.textToolbar) root.dataset.apTextToolbar = 'off';
   const stage = div('ap-stage');
   const board = canvas('ap-canvas');
   const previewCanvas = canvas('ap-preview');

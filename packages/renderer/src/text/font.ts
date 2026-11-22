@@ -19,9 +19,9 @@ export function cssFont(variant: FontVariant, size: number): string {
   return `${style} ${weight} ${size}px ${familyCss(variant)}`;
 }
 
-type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+type Context2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
-function createContext(width = 1, height = 1): Ctx2D {
+function createContext(width = 1, height = 1): Context2D {
   if (typeof OffscreenCanvas !== 'undefined') {
     return new OffscreenCanvas(width, height).getContext('2d', { willReadFrequently: true })!;
   }
@@ -39,9 +39,9 @@ function createContext(width = 1, height = 1): Ctx2D {
 export class CanvasFontMeasurer implements FontMeasurer {
   ascent = 0.9;
   descent = 0.22;
-  private ctx = createContext();
+  private context = createContext();
   private advances = new Map<string, number>();
-  private kerns = new Map<string, number>();
+  private kernings = new Map<string, number>();
   private vertical = new Map<number, { ascent: number; descent: number }>();
   private currentVariant: FontVariant | -1 = -1;
 
@@ -51,52 +51,52 @@ export class CanvasFontMeasurer implements FontMeasurer {
 
   advance(cluster: string, variant: FontVariant): number {
     const key = `${variant}|${cluster}`;
-    let w = this.advances.get(key);
-    if (w === undefined) {
-      w = this.measure(cluster, variant);
-      this.advances.set(key, w);
+    let width = this.advances.get(key);
+    if (width === undefined) {
+      width = this.measure(cluster, variant);
+      this.advances.set(key, width);
     }
-    return w;
+    return width;
   }
 
   kerning(left: string, right: string, variant: FontVariant): number {
     const key = `${variant}|${left}\u0000${right}`;
-    let k = this.kerns.get(key);
-    if (k === undefined) {
-      k =
+    let kerning = this.kernings.get(key);
+    if (kerning === undefined) {
+      kerning =
         this.measure(left + right, variant) -
         this.advance(left, variant) -
         this.advance(right, variant);
       // Float noise from the measurement is not kerning.
-      if (Math.abs(k) < 1e-4) k = 0;
-      this.kerns.set(key, k);
+      if (Math.abs(kerning) < 1e-4) kerning = 0;
+      this.kernings.set(key, kerning);
     }
-    return k;
+    return kerning;
   }
 
   /** Ascent and descent (em) of a variant's family, measured once per family. */
   metrics(variant: FontVariant): { ascent: number; descent: number } {
     const family = variantFamily(variant);
-    let m = this.vertical.get(family);
-    if (!m) {
-      this.ctx.font = cssFont(family * 4, MEASURE_SIZE);
+    let metrics = this.vertical.get(family);
+    if (!metrics) {
+      this.context.font = cssFont(family * 4, MEASURE_SIZE);
       this.currentVariant = family * 4;
-      const t = this.ctx.measureText('Hg');
-      m = t.fontBoundingBoxAscent
+      const measured = this.context.measureText('Hg');
+      metrics = measured.fontBoundingBoxAscent
         ? {
-            ascent: t.fontBoundingBoxAscent / MEASURE_SIZE,
-            descent: t.fontBoundingBoxDescent / MEASURE_SIZE,
+            ascent: measured.fontBoundingBoxAscent / MEASURE_SIZE,
+            descent: measured.fontBoundingBoxDescent / MEASURE_SIZE,
           }
         : { ascent: this.ascent, descent: this.descent };
-      this.vertical.set(family, m);
+      this.vertical.set(family, metrics);
     }
-    return m;
+    return metrics;
   }
 
   /** Call after fonts finish loading: cached metrics belong to the fallback font. */
   clear(): void {
     this.advances.clear();
-    this.kerns.clear();
+    this.kernings.clear();
     this.vertical.clear();
     this.currentVariant = -1;
     this.updateVerticalMetrics();
@@ -104,18 +104,18 @@ export class CanvasFontMeasurer implements FontMeasurer {
 
   private measure(text: string, variant: FontVariant): number {
     if (this.currentVariant !== variant) {
-      this.ctx.font = cssFont(variant, MEASURE_SIZE);
+      this.context.font = cssFont(variant, MEASURE_SIZE);
       this.currentVariant = variant;
     }
-    return this.ctx.measureText(text).width / MEASURE_SIZE;
+    return this.context.measureText(text).width / MEASURE_SIZE;
   }
 
   private updateVerticalMetrics(): void {
-    this.ctx.font = cssFont(0, MEASURE_SIZE);
-    const m = this.ctx.measureText('Hg');
-    if (m.fontBoundingBoxAscent) {
-      this.ascent = m.fontBoundingBoxAscent / MEASURE_SIZE;
-      this.descent = m.fontBoundingBoxDescent / MEASURE_SIZE;
+    this.context.font = cssFont(0, MEASURE_SIZE);
+    const measured = this.context.measureText('Hg');
+    if (measured.fontBoundingBoxAscent) {
+      this.ascent = measured.fontBoundingBoxAscent / MEASURE_SIZE;
+      this.descent = measured.fontBoundingBoxDescent / MEASURE_SIZE;
     }
     this.currentVariant = 0;
   }
@@ -125,13 +125,32 @@ export type GlyphRasterizer = (cluster: string, variant: FontVariant, size: numb
 
 /** SDF value at the outline. Shared by the rasterizer and the shader. */
 export const SDF_CUTOFF = 0.25;
-/** SDF padding around the glyph for a raster size (integer, as TinySDF rounds it). */
-const sdfBuffer = (size: number) => Math.ceil(size / 8);
-
 /**
- * Single-channel SDF glyphs at any raster size. The distance range scales with the
- * size, so every tier antialiases identically in the shader.
+ * How far the shaders move a glyph outline inwards, in screen pixels. Sampled bilinearly, the
+ * distance field draws glyphs about 10 % heavier than the browser draws the same font, which
+ * reads as smudged; a tenth of a pixel brings the ink within a few percent of the browser's
+ * (measured against DOM text at 13–64 px).
  */
+export const TEXT_THINNING = 0.1;
+/**
+ * Most samples per axis the text shaders take in a pixel when glyphs are drawn smaller than
+ * their raster (zoomed out): up to 6 x 6, one per two atlas texels or so.
+ */
+export const TEXT_MAX_SAMPLES = 6;
+/**
+ * Largest SDF distance range, in texels. The shader only needs distances a few pixels around
+ * the outline (it antialiases with screen-space derivatives, the same at every tier), and the
+ * field has 256 levels: a range growing with the tier (a quarter of its size, 128 texels at
+ * 512) left steps of 2/3 texel, and fully zoomed in, glyphs drawn bigger than their tier came
+ * out with jagged, wobbly edges. 16 texels keep steps under 1/15 texel.
+ */
+const SDF_MAX_RADIUS = 16;
+/** SDF distance range for a raster size, in texels. */
+const sdfRadius = (size: number) => Math.min(size / 4, SDF_MAX_RADIUS);
+/** SDF padding around the glyph for a raster size (integer, as TinySDF rounds it). */
+const sdfBuffer = (size: number) => Math.ceil(sdfRadius(size) / 2);
+
+/** Single-channel SDF glyphs at any raster size. */
 export function createSdfRasterizer(): GlyphRasterizer {
   const instances = new Map<string, TinySDF>();
   return (cluster, variant, size) => {
@@ -142,7 +161,7 @@ export function createSdfRasterizer(): GlyphRasterizer {
       sdf = new TinySDF({
         fontSize: size,
         buffer: sdfBuffer(size),
-        radius: size / 4,
+        radius: sdfRadius(size),
         cutoff: SDF_CUTOFF,
         fontFamily: familyCss(variant),
         fontWeight: weight,
@@ -150,56 +169,56 @@ export function createSdfRasterizer(): GlyphRasterizer {
       });
       instances.set(key, sdf);
     }
-    const g = sdf.draw(cluster);
+    const glyph = sdf.draw(cluster);
     return {
-      data: g.data,
-      width: g.width,
-      height: g.height,
-      left: g.glyphLeft - sdfBuffer(size),
-      top: g.glyphTop + sdfBuffer(size),
+      data: glyph.data,
+      width: glyph.width,
+      height: glyph.height,
+      left: glyph.glyphLeft - sdfBuffer(size),
+      top: glyph.glyphTop + sdfBuffer(size),
     };
   };
 }
 
 /** RGBA bitmaps (premultiplied) for color glyphs: emoji, flags. */
 export function createColorRasterizer(): GlyphRasterizer {
-  let ctx: Ctx2D | null = null;
+  let context: Context2D | null = null;
   return (cluster, variant, size) => {
-    const pad = 2;
-    ctx ??= createContext(8, 8);
-    ctx.font = cssFont(variant, size);
-    const m = ctx.measureText(cluster);
+    const padding = 2;
+    context ??= createContext(8, 8);
+    context.font = cssFont(variant, size);
+    const measured = context.measureText(cluster);
     // Real glyphs extend a couple of em at most; anything beyond (stacked combining marks…)
     // is clipped, so a single cluster can't allocate a huge bitmap or overflow the atlas.
-    const reach = (v: number) => Math.min(Math.ceil(v), size * 2);
-    const bl = reach(m.actualBoundingBoxLeft);
-    const br = reach(m.actualBoundingBoxRight);
-    const asc = reach(m.actualBoundingBoxAscent);
-    const desc = reach(m.actualBoundingBoxDescent);
-    const width = bl + br + pad * 2;
-    const height = asc + desc + pad * 2;
-    if (!(width > pad * 2) || !(height > pad * 2)) {
+    const reach = (value: number) => Math.min(Math.ceil(value), size * 2);
+    const reachLeft = reach(measured.actualBoundingBoxLeft);
+    const reachRight = reach(measured.actualBoundingBoxRight);
+    const ascent = reach(measured.actualBoundingBoxAscent);
+    const descent = reach(measured.actualBoundingBoxDescent);
+    const width = reachLeft + reachRight + padding * 2;
+    const height = ascent + descent + padding * 2;
+    if (!(width > padding * 2) || !(height > padding * 2)) {
       return { data: new Uint8Array(0), width: 0, height: 0, left: 0, top: 0 };
     }
-    const canvas = ctx.canvas;
+    const canvas = context.canvas;
     if (canvas.width < width || canvas.height < height) {
       canvas.width = Math.max(canvas.width, width);
       canvas.height = Math.max(canvas.height, height);
-      ctx.font = cssFont(variant, size); // resizing resets the context state
+      context.font = cssFont(variant, size); // resizing resets the context state
     }
-    ctx.clearRect(0, 0, width, height);
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = '#000';
-    ctx.fillText(cluster, pad + bl, pad + asc);
-    const img = ctx.getImageData(0, 0, width, height).data;
-    const data = new Uint8Array(img.length);
-    for (let i = 0; i < img.length; i += 4) {
-      const a = img[i + 3]!;
-      data[i] = (img[i]! * a + 127) / 255;
-      data[i + 1] = (img[i + 1]! * a + 127) / 255;
-      data[i + 2] = (img[i + 2]! * a + 127) / 255;
-      data[i + 3] = a;
+    context.clearRect(0, 0, width, height);
+    context.textBaseline = 'alphabetic';
+    context.fillStyle = '#000';
+    context.fillText(cluster, padding + reachLeft, padding + ascent);
+    const pixels = context.getImageData(0, 0, width, height).data;
+    const data = new Uint8Array(pixels.length);
+    for (let offset = 0; offset < pixels.length; offset += 4) {
+      const alpha = pixels[offset + 3]!;
+      data[offset] = (pixels[offset]! * alpha + 127) / 255;
+      data[offset + 1] = (pixels[offset + 1]! * alpha + 127) / 255;
+      data[offset + 2] = (pixels[offset + 2]! * alpha + 127) / 255;
+      data[offset + 3] = alpha;
     }
-    return { data, width, height, left: -bl - pad, top: asc + pad };
+    return { data, width, height, left: -reachLeft - padding, top: ascent + padding };
   };
 }
