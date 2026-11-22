@@ -2,15 +2,17 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import { defineConfig } from 'tsdown';
 
 /**
- * One package, three entries. The workspace packages (`@apeiro/*`, TypeScript sources) are
- * bundled in; shared code goes into common chunks, so `apeiro`, `apeiro/react` and
- * `apeiro/sync` see the same classes. react and yjs stay peer dependencies.
+ * One package, five entries. The workspace packages (`@apeiro/*`, TypeScript sources) are
+ * bundled in; shared code goes into common chunks, so `apeiro` and `apeiro/react` see the
+ * same classes. React and collaboration dependencies stay external.
  */
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
     react: 'src/react.ts',
-    sync: 'src/sync.ts',
+    yjs: 'src/yjs.ts',
+    'socket.io': 'src/socket.io.ts',
+    'socket.io-server': 'src/socket.io-server.ts',
   },
   format: 'esm',
   platform: 'browser',
@@ -22,11 +24,13 @@ export default defineConfig({
     neverBundle: [
       /^react($|\/)/,
       /^react-dom($|\/)/,
+      '@mapbox/tiny-sdf',
       /^yjs($|\/)/,
       /^y-protocols($|\/)/,
-      '@mapbox/tiny-sdf',
+      /^socket\.io($|\/)/,
+      /^socket\.io-client($|\/)/,
     ],
-    alwaysBundle: [/^@apeiro\//],
+    alwaysBundle: [/^@apeiro\//, /^lib0\//],
   },
   outputOptions: {
     chunkFileNames: 'chunks/[name]-[hash].js',

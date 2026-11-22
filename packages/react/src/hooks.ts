@@ -1,47 +1,63 @@
-import type { BoardElement, Box, SceneChanges, Vec2 } from '@apeiro/core';
+import type { BoardElement, Box, SceneChanges } from '@apeiro/core';
 import type {
-  BoardDraft,
   BoardEditor,
   BoardEditorEvent,
-  NormalizedDraft,
-  BoardSync,
   BoardThemeName,
-  Peer,
-  SyncState,
+  NormalizedDraft,
+  TextFormatState,
   Tool,
 } from '@apeiro/editor';
-import { useCallback, useContext, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+} from 'react';
 import { useChangeListener, type BoardChangeListener } from './changes';
-import { boardApi } from './board-api';
-import { BoardContext, useEditor } from './editor-context';
-import { idSet, sameDeps, storeOf, touches, type BoardStore, type Dep } from './board-store';
+import { useBoard } from './editor-context';
+import {
+  idSet,
+  sameDependencies,
+  storeOf,
+  touches,
+  type BoardStore,
+  type Dependency,
+} from './board-store';
 
 type Subscribe = (onChange: () => void) => () => void;
-type Equal<T> = (a: T, b: T) => boolean;
+type Equal<T> = (first: T, second: T) => boolean;
 
-const isPlainObject = (v: object): boolean => {
-  const proto = Object.getPrototypeOf(v) as unknown;
-  return proto === Object.prototype || proto === null;
+const isPlainObject = (value: object): boolean => {
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
 };
 
 /**
  * Equal values, or arrays / plain objects whose items are equal (`Object.is`). The default
  * comparison of `useBoardState`, so a selector may return a fresh array or object.
  */
-export function shallowEqual(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true;
-  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+function shallowEqual(first: unknown, second: unknown): boolean {
+  if (Object.is(first, second)) return true;
+  if (typeof first !== 'object' || typeof second !== 'object' || first === null || second === null)
+    return false;
+  if (Array.isArray(first) || Array.isArray(second)) {
+    if (!Array.isArray(first) || !Array.isArray(second) || first.length !== second.length)
+      return false;
+    for (let i = 0; i < first.length; i++) if (!Object.is(first[i], second[i])) return false;
     return true;
   }
-  if (!isPlainObject(a) || !isPlainObject(b)) return false;
-  const ka = Object.keys(a);
-  if (ka.length !== Object.keys(b).length) return false;
-  const ra = a as Record<string, unknown>;
-  const rb = b as Record<string, unknown>;
-  return ka.every((k) => Object.hasOwn(rb, k) && Object.is(ra[k], rb[k]));
+  if (!isPlainObject(first) || !isPlainObject(second)) return false;
+  const firstKeys = Object.keys(first);
+  if (firstKeys.length !== Object.keys(second).length) return false;
+  const firstRecord = first as Record<string, unknown>;
+  const secondRecord = second as Record<string, unknown>;
+  return firstKeys.every(
+    (key) => Object.hasOwn(secondRecord, key) && Object.is(firstRecord[key], secondRecord[key]),
+  );
 }
 
 /**
@@ -52,8 +68,8 @@ function useStoreValue<T>(subscribe: Subscribe, select: () => T, isEqual: Equal<
   const last = useRef<{ value: T } | null>(null);
   const get = (): T => {
     const value = select();
-    const prev = last.current;
-    if (prev && isEqual(prev.value, value)) return prev.value;
+    const previous = last.current;
+    if (previous && isEqual(previous.value, value)) return previous.value;
     last.current = { value };
     return value;
   };
@@ -62,26 +78,29 @@ function useStoreValue<T>(subscribe: Subscribe, select: () => T, isEqual: Equal<
 
 /** The editor of the surrounding board and its store. */
 function useStore(): [BoardEditor, BoardStore] {
-  const editor = useEditor();
+  const editor = useBoard();
   return [editor, storeOf(editor)];
 }
 
 /** A subscription to fixed dependencies, stable for the store. */
-function useWatch(store: BoardStore, ...deps: Dep[]): Subscribe {
-  const key = deps.join(',');
-  return useCallback((onChange) => store.watch(key.split(',') as Dep[], onChange), [store, key]);
+function useWatch(store: BoardStore, ...dependencies: Dependency[]): Subscribe {
+  const key = dependencies.join(',');
+  return useCallback(
+    (onChange) => store.watch(key.split(',') as Dependency[], onChange),
+    [store, key],
+  );
 }
 
 /** A watcher whose dependencies follow what the selector last read. */
 interface Tracked<T> {
   store: BoardStore;
   /** What the selector read the last time it ran. */
-  deps: ReadonlySet<Dep> | null;
+  dependencies: ReadonlySet<Dependency> | null;
   /** What the subscription listens to now. */
-  watched: ReadonlySet<Dep> | null;
+  watched: ReadonlySet<Dependency> | null;
   /** React's callback while subscribed. */
   onChange: (() => void) | null;
-  off: (() => void) | null;
+  unsubscribe: (() => void) | null;
   last: { value: T } | null;
   /** The selector that produced `last`: a new one (new props…) runs again. */
   select: ((editor: BoardEditor) => T) | null;
@@ -89,44 +108,48 @@ interface Tracked<T> {
   stale: boolean;
   /** Inside React's render: subscriptions are switched in an effect then, not here. */
   rendering: boolean;
+  /** The misuse warning was shown (see `get` in `useBoardState`). */
+  warned: boolean;
 }
 
 /**
- * Any state of the board, picked by `select` from the editor; re-renders only when the
- * picked value changes (`isEqual`, shallow by default: arrays and plain objects are
- * compared item by item).
+ * Any state of the board, picked by `select`; re-renders only when the picked value
+ * changes (`isEqual`, shallow by default: arrays and plain objects are compared item by
+ * item, so a selector may return a fresh one).
  *
- * `select` runs again only when something it read can have changed: reading `b.tool`
- * listens to tool changes, `b.view` to the camera, `b.scene` or `b.getElements()` to the
- * content… Read the state through the argument (not an editor from a closure) for this to
- * work; a selector that reads nothing known runs on every change.
+ * `select` runs again only when something it read can have changed: reading
+ * `board.tools.current` listens to tool changes, `board.camera.zoom` to the camera,
+ * `board.scene.get(id)` to that element… Read the state through the argument (not a
+ * board from a closure) for this to work: a selector that reads nothing through it runs on
+ * every change, and warns once when its value changes anyway.
  *
  * ```tsx
- * const zoom = useBoardState((board) => board.view.zoom);
+ * const zoom = useBoardState((board) => board.camera.zoom);
  * const stickies = useBoardState((board) =>
- *   board.selectedElements().filter((el) => el.type === 'sticky'),
+ *   board.selection.elements().filter((element) => element.type === 'sticky'),
  * );
  * ```
  */
 export function useBoardState<T>(
   select: (editor: BoardEditor) => T,
-  isEqual: (a: T, b: T) => boolean = shallowEqual,
+  isEqual: (first: T, second: T) => boolean = shallowEqual,
 ): T {
   const [, store] = useStore();
-  const ref = useRef<Tracked<T> | null>(null);
+  const reference = useRef<Tracked<T> | null>(null);
   const state =
-    ref.current?.store === store
-      ? ref.current
-      : (ref.current = {
+    reference.current?.store === store
+      ? reference.current
+      : (reference.current = {
           store,
-          deps: null,
+          dependencies: null,
           watched: null,
           onChange: null,
-          off: null,
+          unsubscribe: null,
           last: null,
           select: null,
           stale: true,
           rendering: false,
+          warned: false,
         });
 
   const listen = useCallback(() => {
@@ -136,11 +159,12 @@ export function useBoardState<T>(
 
   /** Listens to what the selector read last; true if that changed. */
   const rewatch = useCallback((): boolean => {
-    const deps = state.deps;
-    if (!state.onChange || !deps || sameDeps(state.watched, deps)) return false;
-    state.off?.();
-    state.off = store.watch(deps, listen);
-    state.watched = deps;
+    const dependencies = state.dependencies;
+    if (!state.onChange || !dependencies || sameDependencies(state.watched, dependencies))
+      return false;
+    state.unsubscribe?.();
+    state.unsubscribe = store.watch(dependencies, listen);
+    state.watched = dependencies;
     return true;
   }, [store, state, listen]);
 
@@ -152,8 +176,8 @@ export function useBoardState<T>(
       // Something may have changed between rendering and subscribing.
       state.stale = true;
       return () => {
-        state.off?.();
-        state.off = null;
+        state.unsubscribe?.();
+        state.unsubscribe = null;
         state.watched = null;
         state.onChange = null;
       };
@@ -166,16 +190,28 @@ export function useBoardState<T>(
   // React a new value each time a selector builds fresh objects, and loop.
   const get = (): T => {
     if (!state.stale && state.last && state.select === select) return state.last.value;
-    const { value, deps } = store.track(select);
+    const { value, dependencies, untracked } = store.track(select);
+    const previous = state.last;
+    // The same selector read nothing through its argument, yet its value changed: it reads a
+    // board from a closure, which can't be tracked (so it runs on every change).
+    if (untracked && previous && state.select === select && !state.warned) {
+      if (!isEqual(previous.value, value)) {
+        state.warned = true;
+        console.warn(
+          'apeiro: a useBoardState selector changed without reading the board from its ' +
+            'argument, so it runs on every change. Read the state through the argument: ' +
+            'useBoardState((board) => board.selection.ids).',
+        );
+      }
+    }
     state.stale = false;
     state.select = select;
-    if (!sameDeps(state.deps, deps)) {
-      state.deps = deps;
+    if (!sameDependencies(state.dependencies, dependencies)) {
+      state.dependencies = dependencies;
       // After a change (not while rendering): listen to what it reads now right away.
       if (!state.rendering) rewatch();
     }
-    const prev = state.last;
-    if (prev && isEqual(prev.value, value)) return prev.value;
+    if (previous && isEqual(previous.value, value)) return previous.value;
     state.last = { value };
     return value;
   };
@@ -201,18 +237,18 @@ export function useBoardState<T>(
  */
 export function useBoardEvent(
   event: BoardEditorEvent,
-  handler: (editor: BoardEditor) => void,
+  handler: (board: BoardEditor) => void,
 ): void {
-  const editor = useEditor();
-  const ref = useRef(handler);
-  ref.current = handler;
-  useEffect(() => editor.on(event, () => ref.current(editor)), [editor, event]);
+  const editor = useBoard();
+  const reference = useRef(handler);
+  reference.current = handler;
+  useEffect(() => editor.on(event, () => reference.current(editor)), [editor, event]);
 }
 
 /**
- * Calls `onChange` when the board's content changes, like `<Board onChange>` but from any
- * component below the board or its provider (an autosave, a "saved" badge…). Changes made
- * together are reported once, a drag or a stroke when it ends, each origin separately.
+ * Calls `onChange` when the board's content changes, like `onChange` of the config but from
+ * any component below the board or its provider (an autosave, a "saved" badge…). Changes
+ * made together are reported once, a drag or a stroke when it ends, each origin separately.
  *
  * ```tsx
  * function Autosave({ boardId }: { boardId: string }) {
@@ -222,21 +258,19 @@ export function useBoardEvent(
  * ```
  */
 export function useBoardChange(onChange: BoardChangeListener): void {
-  useChangeListener(useEditor(), onChange);
+  useChangeListener(useBoard(), onChange);
 }
 
-/** Current tool and a setter. */
-export function useTool(): [Tool, (tool: Tool) => void] {
+/** The active tool (`board.tools.current`); pick one with `board.tools.activate`. */
+export function useTool(): Tool {
   const [editor, store] = useStore();
-  const tool = useStoreValue(useWatch(store, 'tool'), () => editor.tool);
-  const set = useCallback((t: Tool) => editor.setTool(t), [editor]);
-  return [tool, set];
+  return useStoreValue(useWatch(store, 'tool'), () => editor.tools.current);
 }
 
 /** Ids of the selected elements (same array until the selection changes). */
 export function useSelectedIds(): readonly string[] {
   const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'selection'), () => editor.selection);
+  return useStoreValue(useWatch(store, 'selection'), () => editor.selection.ids);
 }
 
 /** Listens to the selection and to scene changes of selected elements only. */
@@ -247,8 +281,8 @@ function useSelectionWatch(store: BoardStore, onSelectionChange?: () => void): S
         onSelectionChange?.();
         onChange();
       });
-      const offScene = store.onScene((c: SceneChanges) => {
-        if (!touches(c, idSet(store.editor.selection))) return;
+      const offScene = store.onScene((changes: SceneChanges) => {
+        if (!touches(changes, idSet(store.editor.selection.ids))) return;
         onSelectionChange?.();
         onChange();
       });
@@ -264,7 +298,7 @@ function useSelectionWatch(store: BoardStore, onSelectionChange?: () => void): S
 /** The selected elements, updated when they change (other elements' changes are skipped). */
 export function useSelectedElements(): readonly BoardElement[] {
   const [editor, store] = useStore();
-  return useStoreValue(useSelectionWatch(store), () => editor.selectedElements(), shallowEqual);
+  return useStoreValue(useSelectionWatch(store), () => editor.selection.elements(), shallowEqual);
 }
 
 /** One element by id (undefined if it doesn't exist), updated when it changes. */
@@ -277,103 +311,95 @@ export function useElement(id: string | null | undefined): BoardElement | undefi
   return useStoreValue(subscribe, () => (id ? editor.scene.get(id) : undefined));
 }
 
-/** Number of elements on the board. */
-export function useElementCount(): number {
-  const [editor, store] = useStore();
-  const subscribe = useCallback<Subscribe>(
-    (onChange) =>
-      store.onScene((c) => {
-        if (c.added.length > 0 || c.removed.length > 0) onChange();
-      }),
-    [store],
-  );
-  return useStoreValue(subscribe, () => editor.scene.size);
-}
-
 export interface HistoryState {
   /** There is something to undo and the board isn't read-only. */
   canUndo: boolean;
   canRedo: boolean;
-  undo: () => void;
-  redo: () => void;
 }
 
-/** Undo/redo availability and actions (both unavailable on a read-only board). */
+/** Whether undo and redo are available, for toolbar buttons (`board.history.undo`…). */
 export function useHistory(): HistoryState {
   const [editor, store] = useStore();
-  const { canUndo, canRedo } = useStoreValue(
+  return useStoreValue(
     useWatch(store, 'history', 'readOnly'),
-    () => ({
-      canUndo: editor.canUndo && !editor.readOnly,
-      canRedo: editor.canRedo && !editor.readOnly,
-    }),
+    () => ({ canUndo: editor.history.canUndo, canRedo: editor.history.canRedo }),
     shallowEqual,
   );
-  const { undo, redo } = boardApi(editor).history;
-  return useMemo(() => ({ canUndo, canRedo, undo, redo }), [canUndo, canRedo, undo, redo]);
 }
 
-/** Camera position and zoom (updates on every pan and zoom: keep the subscriber small). */
-export function useCamera(): Readonly<{ x: number; y: number; zoom: number }> {
+export interface ClipboardState {
+  /** Something is selected (`board.clipboard.copy`). */
+  canCopy: boolean;
+  /** Something is selected and the board isn't read-only (`cut`, `duplicate`). */
+  canCut: boolean;
+  /** The board isn't read-only (`paste`). */
+  canPaste: boolean;
+  /** This board copied something (the system clipboard may hold more: `paste` reads it). */
+  hasCopy: boolean;
+}
+
+/** What copy, cut, paste and duplicate can do now, for toolbar buttons (`board.clipboard`…). */
+export function useClipboard(): ClipboardState {
   const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'camera'), () => editor.view);
+  return useStoreValue(
+    useWatch(store, 'selection', 'clipboard', 'readOnly'),
+    () => {
+      const canCopy = editor.selection.ids.length > 0;
+      return {
+        canCopy,
+        canCut: canCopy && !editor.readOnly,
+        canPaste: !editor.readOnly,
+        hasCopy: editor.clipboard.content !== null,
+      };
+    },
+    shallowEqual,
+  );
 }
 
-export interface ZoomState {
-  /** Whole percent, for showing it: `83`. */
-  percent: number;
-  /** The same zoom as a factor, the unit of `editor.zoomTo(…)`: `0.83`. */
-  zoom: number;
+/** The draft being previewed (`board.preview.show`), or null. */
+export function usePreview(): NormalizedDraft | null {
+  const [editor, store] = useStore();
+  return useStoreValue(useWatch(store, 'preview'), () => editor.preview.draft);
 }
 
 /**
- * The zoom rounded to whole percent: re-renders only when the shown number changes, not on
- * every frame of an animated zoom. The exact zoom: `useCamera().zoom`.
+ * The zoom in whole percent (`83`): re-renders only when that number changes, not on every
+ * frame of an animated zoom. The exact zoom: `useBoardState((board) => board.camera.zoom)`.
  *
  * ```tsx
- * const { percent } = useZoom();
- * <button onClick={() => editor.zoomTo('reset')}>{percent}%</button>
+ * const percent = useZoomPercent();
+ * <button onClick={() => board.camera.zoomTo('reset')}>{percent}%</button>
  * ```
  */
-export function useZoom(): ZoomState {
+export function useZoomPercent(): number {
   const [editor, store] = useStore();
-  const percent = useStoreValue(useWatch(store, 'camera'), () =>
-    Math.round(editor.camera.zoom * 100),
-  );
-  return useMemo(() => ({ percent, zoom: percent / 100 }), [percent]);
+  return useStoreValue(useWatch(store, 'camera'), () => Math.round(editor.camera.zoom * 100));
 }
 
-/** Id of the element whose text is being edited, or null. */
-export function useEditingId(): string | null {
+/**
+ * How the board is drawn now: `'light'` or `'dark'` (`'system'` resolved). The theme is
+ * set by `theme` of the config.
+ */
+export function useBoardTheme(): BoardThemeName {
   const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'editing'), () => editor.editing);
-}
-
-/** The board theme and a setter. */
-export function useBoardTheme(): [BoardThemeName, (theme: BoardThemeName) => void] {
-  const [editor, store] = useStore();
-  const theme = useStoreValue(useWatch(store, 'theme'), () => editor.theme);
-  const set = useCallback((t: BoardThemeName) => editor.setTheme(t), [editor]);
-  return [theme, set];
-}
-
-/** Whether the renderer runs (false on the server, before hydration and after unmount). */
-export function useIsBoardReady(): boolean {
-  const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'mount'), () => editor.isMounted);
+  return useStoreValue(useWatch(store, 'theme'), () => editor.theme);
 }
 
 /**
  * Screen box of the selection relative to the board's box (CSS pixels), for placing a
- * floating toolbar above it; null without a selection. Follows pans, zooms and edits.
+ * floating toolbar above it (see `useFloating`); null without a selection. Follows pans,
+ * zooms and edits.
  */
 export function useSelectionScreenBounds(): Box | null {
   const [editor, store] = useStore();
   // World bounds change with the selection and its elements only; a pan or zoom just
   // projects them again (O(1) instead of a pass over the selection).
-  const worldRef = useRef<{ box: Box | null; valid: boolean; store: BoardStore } | null>(null);
-  if (worldRef.current?.store !== store) worldRef.current = { box: null, valid: false, store };
-  const world = worldRef.current;
+  const worldReference = useRef<{ box: Box | null; valid: boolean; store: BoardStore } | null>(
+    null,
+  );
+  if (worldReference.current?.store !== store)
+    worldReference.current = { box: null, valid: false, store };
+  const world = worldReference.current;
   const invalidate = useCallback(() => {
     world.valid = false;
   }, [world]);
@@ -393,23 +419,19 @@ export function useSelectionScreenBounds(): Box | null {
   );
   const compute = (): Box | null => {
     if (!world.valid) {
-      world.box = editor.selectionBounds();
+      world.box = editor.selection.bounds();
       world.valid = true;
     }
-    const b = world.box;
-    if (!b) return null;
-    const a = editor.camera.worldToScreen({ x: b.minX, y: b.minY });
-    const c = editor.camera.worldToScreen({ x: b.maxX, y: b.maxY });
-    return { minX: a.x, minY: a.y, maxX: c.x, maxY: c.y };
+    return world.box ? toScreen(editor, world.box) : null;
   };
   return useStoreValue(subscribe, compute, shallowEqual);
 }
 
 /** A world box projected to the board's box (CSS pixels). */
-function toScreen(editor: BoardEditor, b: Box): Box {
-  const a = editor.camera.worldToScreen({ x: b.minX, y: b.minY });
-  const c = editor.camera.worldToScreen({ x: b.maxX, y: b.maxY });
-  return { minX: a.x, minY: a.y, maxX: c.x, maxY: c.y };
+function toScreen(editor: BoardEditor, bounds: Box): Box {
+  const topLeft = editor.camera.worldToScreen({ x: bounds.minX, y: bounds.minY });
+  const bottomRight = editor.camera.worldToScreen({ x: bounds.maxX, y: bounds.maxY });
+  return { minX: topLeft.x, minY: topLeft.y, maxX: bottomRight.x, maxY: bottomRight.y };
 }
 
 /**
@@ -436,148 +458,126 @@ export function useElementScreenBounds(id: string | null | undefined): Box | nul
     [store, id],
   );
   const compute = (): Box | null => {
-    const b = id ? editor.scene.getBounds(id) : undefined;
-    return b ? toScreen(editor, b) : null;
+    const bounds = id ? editor.scene.getBounds(id) : undefined;
+    return bounds ? toScreen(editor, bounds) : null;
   };
   return useStoreValue(subscribe, compute, shallowEqual);
 }
 
-/**
- * A world point (e.g. where a comment was pinned) on screen, relative to the board's box
- * (CSS pixels); null for null. Follows pans and zooms.
- */
-export function useScreenPoint(at: Vec2 | null | undefined): Vec2 | null {
-  const [editor, store] = useStore();
-  const x = at?.x;
-  const y = at?.y;
-  const compute = (): Vec2 | null =>
-    x === undefined || y === undefined ? null : editor.camera.worldToScreen({ x, y });
-  return useStoreValue(useWatch(store, 'camera', 'mount'), compute, shallowEqual);
-}
-
-/** Whether the board is read-only here (a viewer; see the `readOnly` prop). */
-export function useIsReadOnly(): boolean {
-  const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'readOnly'), () => editor.readOnly);
-}
-
-export interface PreviewState {
-  /** The draft being previewed (as applying it would change the board), or null. */
-  draft: NormalizedDraft | null;
-  /** Shows a draft over the board for this user only; throws if it is invalid. */
-  show: (draft: BoardDraft) => void;
-  /** Applies the draft as one undo step; returns the ids added and changed. */
-  apply: () => string[];
-  /** Drops the draft. */
-  discard: () => void;
+/** The text being edited, for a formatting toolbar (see `useTextEditing`). */
+export interface TextEditing {
+  /** Id of the element whose text is edited. */
+  id: string;
+  /** Formatting at the caret or selection; change it with `board.text.apply`. */
+  format: TextFormatState;
+  /** Screen box of the element relative to the board's box (CSS pixels). */
+  bounds: Box;
 }
 
 /**
- * Proposed changes shown before they are made, e.g. an AI assistant's result: `show` it,
- * then let the user `apply` or `discard` it. Until applied, nobody else sees it.
+ * The text being edited, or null: its element, its formatting and where it is on screen.
+ * Everything a formatting toolbar needs (the board has none of its own): place it with
+ * `useFloating(editing?.bounds)`, change the text with `board.text.apply`, and put it inside
+ * `data-ap-text-controls` so pressing it keeps the text open.
  *
  * ```tsx
- * const preview = usePreview();
- * // after the AI answered: preview.show({ add: stickers });
- * {preview.draft && <><button onClick={preview.apply}>Apply</button>
- *   <button onClick={preview.discard}>Discard</button></>}
- * ```
- */
-export function usePreview(): PreviewState {
-  const [editor, store] = useStore();
-  const draft = useStoreValue(useWatch(store, 'preview'), () => editor.preview);
-  const { show, apply, discard } = boardApi(editor).preview;
-  return useMemo(() => ({ draft, show, apply, discard }), [draft, show, apply, discard]);
-}
-
-/** Other participants of a shared board (see `sync`). */
-export function usePeers(): readonly Peer[] {
-  const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'presence'), () => editor.peers);
-}
-
-/**
- * Who holds element `id` on a shared board (it can't be selected or edited here meanwhile),
- * or null. See the `lock` option of `createSync`.
- */
-export function useLockedBy(id: string | null | undefined): Peer | null {
-  const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'presence'), () => (id ? editor.lockedBy(id) : null));
-}
-
-/** Every element others hold, with who holds it. */
-export function useLocks(): ReadonlyMap<string, Peer> {
-  const [editor, store] = useStore();
-  return useStoreValue(useWatch(store, 'presence'), () => editor.locks);
-}
-
-export interface ClipboardState {
-  /** Something is selected. */
-  canCopy: boolean;
-  /** This board copied something (the system clipboard may hold more: `paste` reads it). */
-  hasCopy: boolean;
-  /** Something is selected and the board isn't read-only (also for `duplicate`). */
-  canCut: boolean;
-  /** The board isn't read-only. */
-  canPaste: boolean;
-  copy: () => void;
-  cut: () => void;
-  /** Pastes from the system clipboard (asks the browser), else what this board copied. */
-  paste: () => void;
-  duplicate: () => void;
-}
-
-/** Copy, cut, paste and duplicate, for toolbar buttons (the keyboard shortcuts work anyway). */
-export function useClipboard(): ClipboardState {
-  const [editor, store] = useStore();
-  const { canCopy, hasCopy, readOnly } = useStoreValue(
-    useWatch(store, 'selection', 'clipboard', 'readOnly'),
-    () => ({
-      canCopy: editor.selection.length > 0,
-      hasCopy: editor.clipboard !== null,
-      readOnly: editor.readOnly,
-    }),
-    shallowEqual,
-  );
-  const api = boardApi(editor).clipboard;
-  return useMemo(
-    () => ({
-      canCopy,
-      hasCopy,
-      canCut: canCopy && !readOnly,
-      canPaste: !readOnly,
-      copy: api.copy,
-      cut: api.cut,
-      paste: () => void api.paste(),
-      duplicate: api.duplicate,
-    }),
-    [api, canCopy, hasCopy, readOnly],
-  );
-}
-
-const noSync = () => () => undefined;
-const noState = () => null;
-
-/**
- * The state of the board's sync (`<Board sync={sync}>`), or of `sync` when given (e.g.
- * outside the board): for indicators like "offline", "saving…", "view only". Null when the
- * board isn't shared. Re-renders only when the state changes.
- *
- * ```tsx
- * function SyncStatus() {
- *   const state = useSyncState();
- *   if (!state) return null;
- *   return <span>{state.status === 'offline' ? 'Offline' : state.saving ? 'Saving…' : 'Saved'}</span>;
+ * function TextToolbar() {
+ *   const editing = useTextEditing();
+ *   const floating = useFloating(editing?.bounds);
+ *   const board = useBoard();
+ *   if (!editing) return null;
+ *   return (
+ *     <div ref={floating.ref} style={floating.style} data-ap-text-controls>
+ *       <button
+ *         aria-pressed={editing.format.bold}
+ *         onClick={() => board.text.apply({ type: 'toggle', style: 'bold' })}
+ *       >
+ *         B
+ *       </button>
+ *     </div>
+ *   );
  * }
  * ```
  */
-export function useSyncState(sync?: BoardSync | null): SyncState | null {
-  const context = useContext(BoardContext);
-  const source = sync ?? context?.sync ?? null;
-  const subscribe = useCallback(
-    (onChange: () => void) => (source ? source.subscribe(onChange) : noSync()),
-    [source],
+export function useTextEditing(): TextEditing | null {
+  const [editor, store] = useStore();
+  const id = useStoreValue(useWatch(store, 'editing'), () => editor.text.editing);
+  const format = useStoreValue(useWatch(store, 'textFormat', 'mount'), () => editor.text.format);
+  const bounds = useElementScreenBounds(id);
+  return useMemo(
+    () => (id && format && bounds ? { id, format, bounds } : null),
+    [id, format, bounds],
   );
-  const getState = useCallback(() => (source ? source.getState() : noState()), [source]);
-  return useSyncExternalStore(subscribe, getState, getState);
+}
+
+export interface FloatingOptions {
+  /** Above the anchor (default) or below it; flips to the other side when there's no room. */
+  placement?: 'top' | 'bottom';
+  /** Space between the anchor and the element (CSS pixels, default 12). */
+  gap?: number;
+  /** Space kept from the board's edges (CSS pixels, default 8). */
+  margin?: number;
+}
+
+export interface Floating {
+  /** Give it to the floating element. */
+  ref: (element: HTMLElement | null) => void;
+  /** Its position: absolute, next to the anchor, inside the board. */
+  style: CSSProperties;
+}
+
+/**
+ * Places an element of yours (a toolbar, a menu) next to a box on the board: centered above
+ * it, below when there's no room, and kept inside the board. For a child of `<Board>`, with
+ * `useSelectionScreenBounds`, `useElementScreenBounds` or `useTextEditing`; hidden while
+ * `anchor` is null.
+ *
+ * ```tsx
+ * const floating = useFloating(useSelectionScreenBounds());
+ * <div ref={floating.ref} style={floating.style}>…</div>
+ * ```
+ */
+export function useFloating(
+  anchor: Box | null | undefined,
+  options: FloatingOptions = {},
+): Floating {
+  const { placement = 'top', gap = 12, margin = 8 } = options;
+  const [element, setElement] = useState<HTMLElement | null>(null);
+  const [size, setSize] = useState({ width: 0, height: 0, boardWidth: 0, boardHeight: 0 });
+  // Measured before the browser paints, so the element never shows at a wrong place.
+  useLayoutEffect(() => {
+    if (!element) return;
+    const parent = element.offsetParent;
+    const next = {
+      width: element.offsetWidth,
+      height: element.offsetHeight,
+      boardWidth: parent?.clientWidth ?? 0,
+      boardHeight: parent?.clientHeight ?? 0,
+    };
+    setSize((current) =>
+      current.width === next.width &&
+      current.height === next.height &&
+      current.boardWidth === next.boardWidth &&
+      current.boardHeight === next.boardHeight
+        ? current
+        : next,
+    );
+  });
+  if (!anchor) return { ref: setElement, style: { position: 'absolute', display: 'none' } };
+  const { width, height, boardWidth, boardHeight } = size;
+  const above = anchor.minY - gap - height;
+  const below = anchor.maxY + gap;
+  let top =
+    placement === 'top'
+      ? above >= margin
+        ? above
+        : below
+      : below + height <= boardHeight - margin || boardHeight === 0
+        ? below
+        : above;
+  if (boardHeight > 0) top = Math.max(margin, Math.min(top, boardHeight - height - margin));
+  const centered = (anchor.minX + anchor.maxX) / 2 - width / 2;
+  const left =
+    boardWidth > 0 ? Math.max(margin, Math.min(centered, boardWidth - width - margin)) : centered;
+  return { ref: setElement, style: { position: 'absolute', left, top } };
 }

@@ -3,19 +3,22 @@ import {
   connectorCrossesBox,
   hitTestConnector,
   resolveConnector,
+  translateGeometry,
   type ConnectorElement,
   type ConnectorGeometry,
 } from '../connectors';
 import {
   elementBounds,
   isShape,
+  patchedElement,
   type BoardElement,
   type ElementPatch,
   type ShapeElement,
 } from '../elements/element';
 import { hitTestElement } from '../elements/hit-test';
 import { validateElement } from '../elements/validation';
-import { boxContainsBox, boxIntersects, boxUnion, type Box, type Vec2 } from '../geometry/math';
+import { boxAroundPoint, boxContainsBox, boxIntersects, boxUnion, type Box } from '../geometry/box';
+import type { Vec2 } from '../geometry/vector';
 import { SpatialIndex, type SpatialIndexOptions } from '../geometry/spatial-index';
 
 /** Origin of the batches `History` applies itself; never recorded. */
@@ -67,7 +70,7 @@ export interface SceneOptions {
 
 /**
  * In-memory source of truth for what is drawn. Knows nothing about rendering
- * or networking: the renderer and the sync adapter both subscribe to it.
+ * or networking: the renderer and the editor subscribe to it.
  *
  * Connector geometry is derived here: when a shape changes, connectors attached to it
  * (and elbow routes it may now block or unblock) are recomputed in the same batch.
@@ -89,9 +92,17 @@ export class Scene {
   private dirtyRoutes = new Set<string>();
   /** Areas where shapes appeared/moved/vanished: elbow routes there may need a re-route. */
   private dirtyAreas: Box[] = [];
+  /**
+   * How each shape moved since routes were last settled, if it only moved (same size,
+   * rotation and outline); null if it changed otherwise, appeared or went away. A connector
+   * between two shapes that moved alike is shifted with them instead of resolved again.
+   */
+  private moves = new Map<string, Vec2 | null>();
+  /** Connectors whose own data changed since routes were last settled: resolved again. */
+  private changedConnectors = new Set<string>();
   private readonly getShape = (id: string): ShapeElement | undefined => {
-    const el = this.elements.get(id);
-    return el && isShape(el) ? el : undefined;
+    const element = this.elements.get(id);
+    return element && isShape(element) ? element : undefined;
   };
 
   /**
@@ -112,6 +123,7 @@ export class Scene {
   private zMax: number | null = 0;
   private readonly freeze: boolean;
   private guard: ((id: string) => boolean) | null = null;
+  private editGuards = new Set<(id: string, origin: string | undefined) => boolean>();
 
   constructor(options: SceneOptions = {}) {
     this.index = new SpatialIndex(options.index);
@@ -136,13 +148,13 @@ export class Scene {
 
   /**
    * Groups several mutations into one change event. Nestable; `origin` of the outermost
-   * call tags the event (sync adapters pass e.g. 'remote' so undo history ignores it).
+   * call tags the event (e.g. `load` passes one so the undo history ignores it).
    */
-  transact<T>(fn: () => T, origin?: string): T {
+  transact<T>(action: () => T, origin?: string): T {
     if (this.depth === 0) this.origin = origin;
     this.depth++;
     try {
-      return fn();
+      return action();
     } finally {
       this.depth--;
       if (this.depth === 0) this.flush();
@@ -150,92 +162,105 @@ export class Scene {
   }
 
   /**
-   * Refuses local edits of some elements, e.g. ones another participant is working on, or
-   * all of them on a read-only board: while `canEdit(id)` is false, `add`, `update` and
-   * `remove` of that element change nothing (the last two return false) in local batches
-   * (no origin, or the undo history's). Tagged batches (remote changes, loading) are not
-   * checked. `null` removes the guard.
+   * Refuses local edits of some elements, e.g. all of them on a read-only board: while
+   * `canEdit(id)` is false, `add`, `update` and `remove` of that element change nothing
+   * (the last two return false) in local batches (no origin, or the undo history's).
+   * Tagged batches (e.g. loading) are not checked. `null` removes the guard.
    */
   setEditGuard(canEdit: ((id: string) => boolean) | null): void {
     this.guard = canEdit;
   }
 
+  /** Adds an independent guard, including for tagged batches. Returns its disposer. */
+  addEditGuard(canEdit: (id: string, origin: string | undefined) => boolean): () => void {
+    this.editGuards.add(canEdit);
+    return () => {
+      this.editGuards.delete(canEdit);
+    };
+  }
+
   /** Whether the edit guard refuses changing `id` in the current batch. */
   private blocked(id: string): boolean {
-    if (!this.guard) return false;
     const origin = this.depth === 0 ? undefined : this.origin;
-    return (origin === undefined || origin === HISTORY_ORIGIN) && !this.guard(id);
+    for (const canEdit of this.editGuards) if (!canEdit(id, origin)) return true;
+    return !!this.guard && (origin === undefined || origin === HISTORY_ORIGIN) && !this.guard(id);
   }
 
   /**
    * Adds an element. Throws if the id exists or the element is invalid (see
    * `validateElement`); does nothing if the edit guard refuses it (see `setEditGuard`).
    */
-  add(el: BoardElement): void {
-    if (this.blocked(el.id)) return;
-    if (this.elements.has(el.id)) throw new Error(`Element ${el.id} already exists`);
-    const problem = validateElement(el);
-    if (problem) throw new Error(`Invalid element ${el.id}: ${problem}`);
+  add(element: BoardElement): void {
+    if (this.blocked(element.id)) return;
+    if (this.elements.has(element.id)) throw new Error(`Element ${element.id} already exists`);
+    const problem = validateElement(element);
+    if (problem) throw new Error(`Invalid element ${element.id}: ${problem}`);
     this.transact(() => {
-      this.remember(el.id);
-      const snapshot = this.snapshot({ ...el });
-      this.elements.set(el.id, snapshot);
+      this.remember(element.id);
+      const snapshot = this.snapshot({ ...element });
+      this.elements.set(element.id, snapshot);
       this.joinGroup(snapshot.id, snapshot.groupId);
       if (this.zMax !== null && snapshot.z > this.zMax) this.zMax = snapshot.z;
       if (snapshot.type === 'connector') {
         this.attach(snapshot);
-        this.dirtyRoutes.add(el.id);
+        this.dirtyRoutes.add(element.id);
+        this.changedConnectors.add(element.id);
       } else {
         this.placeShape(snapshot);
+        this.moves.set(element.id, null);
       }
-      const removed = this.pendingRemoved.get(el.id);
+      const removed = this.pendingRemoved.get(element.id);
       if (removed) {
-        // Removed and re-added in one batch (undo, a sync layer replacing it): consumers
+        // Removed and re-added in one batch (undo, a whole element replaced): consumers
         // see an update, so a different z or type must force a re-sort.
-        this.pendingRemoved.delete(el.id);
-        this.pending.set(el.id, 'updated');
+        this.pendingRemoved.delete(element.id);
+        this.pending.set(element.id, 'updated');
         if (removed.z !== snapshot.z || removed.type !== snapshot.type) this.orderChanged = true;
       } else {
-        this.pending.set(el.id, 'added');
+        this.pending.set(element.id, 'added');
       }
-      if (isShape(snapshot)) this.shapeChanged(el.id, undefined);
+      if (isShape(snapshot)) this.shapeChanged(element.id, undefined);
     });
   }
 
   /**
-   * Applies a patch. Unknown ids are ignored and reported via the return value.
+   * Applies a patch. Unknown ids are ignored and reported via the return value. A patch
+   * that changes nothing is no change: no event, no undo step.
    * Throws, changing nothing, if the result would be invalid.
    */
   update(id: string, patch: ElementPatch): boolean {
-    const prev = this.elements.get(id);
-    if (!prev) return false;
+    const previous = this.elements.get(id);
+    if (!previous) return false;
     if (this.blocked(id)) return false;
-    const next = { ...prev, ...patch, id: prev.id, type: prev.type } as BoardElement;
+    const next = patchedElement(previous, patch);
+    if (sameFields(previous, next)) return true;
     const problem = validateElement(next);
     if (problem) throw new Error(`Invalid update of ${id}: ${problem}`);
     this.transact(() => {
       this.snapshot(next);
       this.remember(id);
-      const prevBox = this.index.getBox(id);
+      const previousBox = this.index.getBox(id);
       this.elements.set(id, next);
-      if (prev.groupId !== next.groupId) {
-        this.leaveGroup(id, prev.groupId);
+      if (previous.groupId !== next.groupId) {
+        this.leaveGroup(id, previous.groupId);
         this.joinGroup(id, next.groupId);
       }
       if (next.type === 'connector') {
-        if (prev.type === 'connector') this.detach(prev);
+        if (previous.type === 'connector') this.detach(previous);
         this.attach(next);
         this.dirtyRoutes.add(id);
-      } else if (isShape(prev) && shapeGeometryChanged(prev, next)) {
+        this.changedConnectors.add(id);
+      } else if (isShape(previous) && shapeGeometryChanged(previous, next)) {
         this.placeShape(next);
-        this.shapeChanged(id, prevBox);
+        this.noteMove(id, previous, next);
+        this.shapeChanged(id, previousBox);
       }
       this.markUpdated(id);
-      if (next.z !== prev.z) {
+      if (next.z !== previous.z) {
         this.orderChanged = true;
         if (this.zMax !== null) {
           if (next.z > this.zMax) this.zMax = next.z;
-          else if (prev.z === this.zMax) this.zMax = null;
+          else if (previous.z === this.zMax) this.zMax = null;
         }
       }
     });
@@ -243,27 +268,29 @@ export class Scene {
   }
 
   remove(id: string): boolean {
-    const el = this.elements.get(id);
-    if (!el) return false;
+    const element = this.elements.get(id);
+    if (!element) return false;
     if (this.blocked(id)) return false;
     this.transact(() => {
       this.remember(id);
-      const prevBox = this.index.getBox(id);
+      const previousBox = this.index.getBox(id);
       this.elements.delete(id);
       this.index.delete(id);
-      this.leaveGroup(id, el.groupId);
-      if (el.z === this.zMax) this.zMax = null;
-      if (el.type === 'connector') {
-        this.detach(el);
+      this.leaveGroup(id, element.groupId);
+      if (element.z === this.zMax) this.zMax = null;
+      if (element.type === 'connector') {
+        this.detach(element);
         this.geometry.delete(id);
         this.elbows.delete(id);
         this.dirtyRoutes.delete(id);
+      } else {
+        this.moves.set(id, null);
       }
       const was = this.pending.get(id);
       this.pending.delete(id);
       // Added and removed within one batch: consumers never need to hear about it.
-      if (was !== 'added') this.pendingRemoved.set(id, el);
-      if (isShape(el)) this.shapeChanged(id, prevBox);
+      if (was !== 'added') this.pendingRemoved.set(id, element);
+      if (isShape(element)) this.shapeChanged(id, previousBox);
     });
     return true;
   }
@@ -272,7 +299,8 @@ export class Scene {
   removeWithConnectors(ids: Iterable<string>): void {
     this.transact(() => {
       for (const id of ids) {
-        for (const c of this.connectorsOf(id)) this.remove(c);
+        if (this.blocked(id)) continue;
+        for (const connectorId of this.connectorsOf(id)) this.remove(connectorId);
         this.remove(id);
       }
     });
@@ -319,7 +347,10 @@ export class Scene {
   sortedByZ(): BoardElement[] {
     if (!this.zOrder) {
       const elements = [...this.elements.values()].sort(compareZ);
-      this.zOrder = { elements, index: new Map(elements.map((el, i) => [el.id, i])) };
+      this.zOrder = {
+        elements,
+        index: new Map(elements.map((element, index) => [element.id, index])),
+      };
     }
     return this.zOrder.elements.slice();
   }
@@ -332,13 +363,13 @@ export class Scene {
       this.zOrder = null;
       return;
     }
-    for (const el of changes.updated) {
-      const i = cache.index.get(el.id);
-      if (i === undefined) {
+    for (const element of changes.updated) {
+      const index = cache.index.get(element.id);
+      if (index === undefined) {
         this.zOrder = null;
         return;
       }
-      cache.elements[i] = el;
+      cache.elements[index] = element;
     }
   }
 
@@ -346,49 +377,37 @@ export class Scene {
   maxZ(): number {
     if (this.zMax === null) {
       let z = 0;
-      for (const el of this.elements.values()) if (el.z > z) z = el.z;
+      for (const element of this.elements.values()) if (element.z > z) z = element.z;
       this.zMax = z;
     }
     return Math.max(0, this.zMax);
   }
 
   /** Topmost element under the point, or undefined. */
-  hitTest(p: Vec2, tolerance = 0): BoardElement | undefined {
+  hitTest(point: Vec2, tolerance = 0): BoardElement | undefined {
     this.settle();
-    const pad = tolerance;
-    const candidates = this.index.query({
-      minX: p.x - pad,
-      minY: p.y - pad,
-      maxX: p.x + pad,
-      maxY: p.y + pad,
-    });
+    const candidates = this.index.query(boxAroundPoint(point, tolerance));
     let best: BoardElement | undefined;
     for (const id of candidates) {
-      const el = this.elements.get(id)!;
-      if (best && compareZ(el, best) <= 0) continue;
-      if (this.hits(el, p, tolerance)) best = el;
+      const element = this.elements.get(id)!;
+      if (best && compareZ(element, best) <= 0) continue;
+      if (this.hits(element, point, tolerance)) best = element;
     }
     return best;
   }
 
   /** Topmost shape under the point, ignoring connectors (e.g. to attach a connector end). */
   hitTestShape(
-    p: Vec2,
+    point: Vec2,
     tolerance = 0,
     exclude?: (id: string) => boolean,
   ): ShapeElement | undefined {
     let best: ShapeElement | undefined;
-    const r = tolerance;
-    for (const id of this.index.query({
-      minX: p.x - r,
-      minY: p.y - r,
-      maxX: p.x + r,
-      maxY: p.y + r,
-    })) {
-      const el = this.elements.get(id)!;
-      if (!isShape(el) || exclude?.(id)) continue;
-      if (best && compareZ(el, best) <= 0) continue;
-      if (hitTestElement(el, p, tolerance)) best = el;
+    for (const id of this.index.query(boxAroundPoint(point, tolerance))) {
+      const element = this.elements.get(id)!;
+      if (!isShape(element) || exclude?.(id)) continue;
+      if (best && compareZ(element, best) <= 0) continue;
+      if (hitTestElement(element, point, tolerance)) best = element;
     }
     return best;
   }
@@ -396,13 +415,12 @@ export class Scene {
   /** Elements in a box, e.g. for marquee selection or culling. Unordered. */
   queryBox(box: Box, mode: BoxQueryMode = 'intersect'): BoardElement[] {
     this.settle();
-    const out: BoardElement[] = [];
+    const found: BoardElement[] = [];
     for (const id of this.index.query(box)) {
-      const el = this.elements.get(id)!;
       if (mode === 'contain' && !boxContainsBox(box, this.index.getBox(id)!)) continue;
-      out.push(el);
+      found.push(this.elements.get(id)!);
     }
-    return out;
+    return found;
   }
 
   getBounds(id: string): Box | undefined {
@@ -426,42 +444,75 @@ export class Scene {
     return () => this.listeners.delete(listener);
   }
 
-  private hits(el: BoardElement, p: Vec2, tolerance: number): boolean {
-    if (isShape(el)) return hitTestElement(el, p, tolerance);
-    const g = this.geometry.get(el.id);
-    return !!g && hitTestConnector(el, g, p, tolerance);
+  private hits(element: BoardElement, point: Vec2, tolerance: number): boolean {
+    if (isShape(element)) return hitTestElement(element, point, tolerance);
+    const geometry = this.geometry.get(element.id);
+    return !!geometry && hitTestConnector(element, geometry, point, tolerance);
   }
 
-  private placeShape(el: ShapeElement): void {
-    this.index.set(el.id, elementBounds(el));
+  private placeShape(element: ShapeElement): void {
+    this.index.set(element.id, elementBounds(element));
   }
 
   /** Recomputes a connector's geometry (routing elbows around nearby shapes) and indexes it. */
-  private placeConnector(el: ConnectorElement): void {
-    const ends = new Set(attachedIds(el));
-    const g = resolveConnector(el, this.getShape, (area) => {
-      const out: Box[] = [];
+  private placeConnector(element: ConnectorElement): void {
+    const ends = new Set(attachedIds(element));
+    const geometry = resolveConnector(element, this.getShape, (area) => {
+      const obstacles: Box[] = [];
       for (const id of this.index.query(area)) {
         if (ends.has(id)) continue;
         const other = this.elements.get(id);
-        if (other && isShape(other)) out.push(this.index.getBox(id)!);
+        if (other && isShape(other)) obstacles.push(this.index.getBox(id)!);
       }
-      return out;
+      return obstacles;
     });
-    this.geometry.set(el.id, g);
-    if (g) this.index.set(el.id, g.bounds);
-    else this.index.delete(el.id);
-    if (el.route === 'elbow') this.elbows.add(el.id);
-    else this.elbows.delete(el.id);
+    this.geometry.set(element.id, geometry);
+    if (geometry) this.index.set(element.id, geometry.bounds);
+    else this.index.delete(element.id);
+    if (element.route === 'elbow') this.elbows.add(element.id);
+    else this.elbows.delete(element.id);
   }
 
-  /** A shape was added, moved/resized, or removed (`prevBox`: where it was). */
-  private shapeChanged(id: string, prevBox: Box | undefined): void {
-    const deps = this.attachments.get(id);
-    if (deps) for (const cid of deps) if (this.elements.has(cid)) this.dirtyRoutes.add(cid);
+  /** Records how a shape moved (see `moves`). */
+  private noteMove(id: string, previous: ShapeElement, next: ShapeElement): void {
+    const known = this.moves.get(id);
+    if (known === null) return;
+    if (!onlyMoved(previous, next)) {
+      this.moves.set(id, null);
+      return;
+    }
+    const deltaX = next.x - previous.x + (known?.x ?? 0);
+    const deltaY = next.y - previous.y + (known?.y ?? 0);
+    this.moves.set(id, { x: deltaX, y: deltaY });
+  }
+
+  /**
+   * Shifts a connector's geometry with its shapes when both moved by the same offset and the
+   * connector itself didn't change: its route is then the same, only moved. Not for elbows,
+   * whose routes also depend on the shapes around them. False if it must be resolved.
+   */
+  private shiftConnector(connector: ConnectorElement): boolean {
+    if (connector.route === 'elbow' || this.changedConnectors.has(connector.id)) return false;
+    if (connector.start.kind !== 'element' || connector.end.kind !== 'element') return false;
+    const geometry = this.geometry.get(connector.id);
+    const start = this.moves.get(connector.start.id);
+    const end = this.moves.get(connector.end.id);
+    if (!geometry || !start || !end || start.x !== end.x || start.y !== end.y) return false;
+    const shifted = translateGeometry(geometry, start.x, start.y);
+    this.geometry.set(connector.id, shifted);
+    this.index.set(connector.id, shifted.bounds);
+    return true;
+  }
+
+  /** A shape was added, moved/resized, or removed (`previousBox`: where it was). */
+  private shapeChanged(id: string, previousBox: Box | undefined): void {
+    const attached = this.attachments.get(id);
+    if (attached)
+      for (const connectorId of attached)
+        if (this.elements.has(connectorId)) this.dirtyRoutes.add(connectorId);
     if (this.elbows.size === 0) return;
     // Routes near where the shape was (may straighten) and where it is now (may need a detour).
-    if (prevBox) this.dirtyAreas.push(prevBox);
+    if (previousBox) this.dirtyAreas.push(previousBox);
     const box = this.index.getBox(id);
     if (box && this.elements.has(id)) this.dirtyAreas.push(box);
   }
@@ -474,8 +525,9 @@ export class Scene {
       // Only routes the change can affect: ones it now blocks, or detours that may straighten.
       const check = (id: string, area: Box) => {
         if (!this.elbows.has(id) || this.dirtyRoutes.has(id)) return;
-        const g = this.geometry.get(id);
-        if (g && (g.routed || connectorCrossesBox(g, area))) this.dirtyRoutes.add(id);
+        const geometry = this.geometry.get(id);
+        if (geometry && (geometry.routed || connectorCrossesBox(geometry, area)))
+          this.dirtyRoutes.add(id);
       };
       if (areas.length <= this.elbows.size) {
         for (const area of areas) for (const id of this.index.query(area)) check(id, area);
@@ -483,27 +535,29 @@ export class Scene {
         // Many changed shapes (e.g. dragging a big selection): index the areas and test
         // each elbow once against the areas near it instead of querying the scene per area.
         const areaIndex = new SpatialIndex<number>();
-        areas.forEach((a, i) => areaIndex.set(i, a));
+        areas.forEach((area, index) => areaIndex.set(index, area));
         for (const id of this.elbows) {
-          const g = this.geometry.get(id);
-          if (!g) continue;
-          for (const i of areaIndex.query(g.bounds)) {
+          const geometry = this.geometry.get(id);
+          if (!geometry) continue;
+          for (const index of areaIndex.query(geometry.bounds)) {
             if (this.dirtyRoutes.has(id)) break;
-            const area = areas[i]!;
-            if (boxIntersects(area, g.bounds)) check(id, area);
+            const area = areas[index]!;
+            if (boxIntersects(area, geometry.bounds)) check(id, area);
           }
         }
       }
     }
-    if (this.dirtyRoutes.size === 0) return;
     const ids = [...this.dirtyRoutes];
     this.dirtyRoutes.clear();
     for (const id of ids) {
-      const c = this.elements.get(id);
-      if (!c || c.type !== 'connector') continue;
-      this.placeConnector(c);
+      const connector = this.elements.get(id);
+      if (!connector || connector.type !== 'connector') continue;
+      if (!this.shiftConnector(connector)) this.placeConnector(connector);
       this.markUpdated(id);
     }
+    // Geometry is current: later moves are relative to it.
+    this.moves.clear();
+    this.changedConnectors.clear();
   }
 
   private settle(): void {
@@ -519,23 +573,20 @@ export class Scene {
     if (this.pending.get(id) !== 'added') this.pending.set(id, 'updated');
   }
 
-  private attach(c: ConnectorElement): void {
-    for (const id of attachedIds(c)) {
-      let set = this.attachments.get(id);
-      if (!set) {
-        set = new Set();
-        this.attachments.set(id, set);
-      }
-      set.add(c.id);
+  private attach(connector: ConnectorElement): void {
+    for (const id of attachedIds(connector)) {
+      let connectors = this.attachments.get(id);
+      if (!connectors) this.attachments.set(id, (connectors = new Set()));
+      connectors.add(connector.id);
     }
   }
 
-  private detach(c: ConnectorElement): void {
-    for (const id of attachedIds(c)) {
-      const set = this.attachments.get(id);
-      if (!set) continue;
-      set.delete(c.id);
-      if (set.size === 0) this.attachments.delete(id);
+  private detach(connector: ConnectorElement): void {
+    for (const id of attachedIds(connector)) {
+      const connectors = this.attachments.get(id);
+      if (!connectors) continue;
+      connectors.delete(connector.id);
+      if (connectors.size === 0) this.attachments.delete(id);
     }
   }
 
@@ -568,44 +619,66 @@ export class Scene {
     // A failing listener must not leave the others out of sync: notify all, then rethrow.
     let failed = false;
     let error: unknown;
-    for (const l of this.listeners) {
+    for (const listener of this.listeners) {
       try {
-        l(changes);
-      } catch (e) {
-        if (!failed) error = e;
+        listener(changes);
+      } catch (failure) {
+        if (!failed) error = failure;
         failed = true;
       }
     }
     if (failed) throw error;
   }
 
-  private snapshot<T extends BoardElement>(el: T): T {
-    return this.freeze ? deepFreeze(el) : el;
+  private snapshot<T extends BoardElement>(element: T): T {
+    return this.freeze ? deepFreeze(element) : element;
   }
 }
 
-export function compareZ(a: BoardElement, b: BoardElement): number {
-  return a.z - b.z || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+export function compareZ(first: BoardElement, second: BoardElement): number {
+  return first.z - second.z || (first.id < second.id ? -1 : first.id > second.id ? 1 : 0);
+}
+
+/** The shape moved and nothing else about its contour changed. */
+function onlyMoved(first: ShapeElement, second: ShapeElement): boolean {
+  return (
+    first.width === second.width &&
+    first.height === second.height &&
+    first.rotation === second.rotation &&
+    first.strokeWidth === second.strokeWidth &&
+    first.radius === second.radius &&
+    first.sides === second.sides
+  );
+}
+
+/** Same value for every field (an absent field and `undefined` are the same). */
+function sameFields(first: BoardElement, second: BoardElement): boolean {
+  const firstFields = first as unknown as Record<string, unknown>;
+  const secondFields = second as unknown as Record<string, unknown>;
+  for (const key in firstFields) if (!Object.is(firstFields[key], secondFields[key])) return false;
+  for (const key in secondFields)
+    if (!(key in firstFields) && secondFields[key] !== undefined) return false;
+  return true;
 }
 
 /** Only contour changes affect the spatial index and attached/nearby connector routes. */
-function shapeGeometryChanged(a: ShapeElement, b: ShapeElement): boolean {
+function shapeGeometryChanged(first: ShapeElement, second: ShapeElement): boolean {
   return (
-    a.x !== b.x ||
-    a.y !== b.y ||
-    a.w !== b.w ||
-    a.h !== b.h ||
-    a.rotation !== b.rotation ||
-    a.strokeWidth !== b.strokeWidth ||
-    a.radius !== b.radius ||
-    a.sides !== b.sides
+    first.x !== second.x ||
+    first.y !== second.y ||
+    first.width !== second.width ||
+    first.height !== second.height ||
+    first.rotation !== second.rotation ||
+    first.strokeWidth !== second.strokeWidth ||
+    first.radius !== second.radius ||
+    first.sides !== second.sides
   );
 }
 
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
     Object.freeze(value);
-    for (const v of Object.values(value)) deepFreeze(v);
+    for (const child of Object.values(value)) deepFreeze(child);
   }
   return value;
 }

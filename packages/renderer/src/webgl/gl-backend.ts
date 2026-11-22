@@ -1,8 +1,8 @@
 import type { BackendContext, FrameParams, RenderBackend } from '../backend';
 import { byteRuns } from '../layers/buffer-upload';
+import { INSTANCE_STRIDE, SHAPE_LAYOUT } from '../layers/instance-store';
 import { GlMedia } from './gl-media';
-import { compileProgram, uniforms } from './gl-utils';
-import { INSTANCE_STRIDE } from '../layers/instance-store';
+import { bindInstanceAttributes, compileProgram, createUnitQuad, uniforms } from './gl-utils';
 import { LinePass } from './line-pass';
 import { GRID_FRAGMENT, GRID_VERTEX, SHAPE_FRAGMENT, SHAPE_VERTEX } from './shaders';
 import { TextPass } from './text-pass';
@@ -13,68 +13,74 @@ interface Resources {
   quadBuffer: WebGLBuffer;
   instanceBuffer: WebGLBuffer;
   instanceCapacity: number;
-  shapeU: Record<'u_camera' | 'u_viewport' | 'u_depthOnly', WebGLUniformLocation | null>;
+  shapeUniforms: Record<'u_camera' | 'u_viewport' | 'u_depthOnly', WebGLUniformLocation | null>;
   gridProgram: WebGLProgram;
   gridVao: WebGLVertexArrayObject;
-  gridU: Record<
+  gridUniforms: Record<
     'u_camera' | 'u_dpr' | 'u_heightPx' | 'u_spacing' | 'u_fade' | 'u_dotColor' | 'u_lines',
     WebGLUniformLocation | null
   >;
 }
 
 /** The WebGL2 backend. Throws when WebGL2 is not available. */
-export function createWebGlBackend(ctx: BackendContext): RenderBackend {
-  return new WebGlBackend(ctx);
+export function createWebGlBackend(context: BackendContext): RenderBackend {
+  return new WebGlBackend(context);
 }
 
 class WebGlBackend implements RenderBackend {
   readonly kind = 'webgl';
   private readonly gl: WebGL2RenderingContext;
-  private res: Resources | null = null;
+  private resources: Resources | null = null;
   private readonly textPass: TextPass;
   private readonly linePass: LinePass;
   private readonly media: GlMedia;
   private uploadedBytes = 0;
   private disposers: Array<() => void> = [];
 
-  constructor(private readonly ctx: BackendContext) {
-    const gl = ctx.canvas.getContext('webgl2', {
+  constructor(private readonly context: BackendContext) {
+    const gl = context.canvas.getContext('webgl2', {
       antialias: false, // shapes are antialiased analytically in the shader
-      alpha: ctx.transparent,
+      alpha: context.transparent,
       depth: true, // keeps text behind shapes that are above its element
       premultipliedAlpha: true,
-      preserveDrawingBuffer: ctx.preserveDrawingBuffer,
+      preserveDrawingBuffer: context.preserveDrawingBuffer,
       powerPreference: 'high-performance',
     });
     if (!gl) throw new Error('WebGL2 is not supported');
     this.gl = gl;
-    this.textPass = new TextPass(gl, ctx.sdfAtlas, ctx.colorAtlas, ctx.textLayer, ctx.sdfEdge);
-    this.linePass = new LinePass(gl, ctx.lineLayer);
+    this.textPass = new TextPass(
+      gl,
+      context.sdfAtlas,
+      context.colorAtlas,
+      context.textLayer,
+      context.sdfEdge,
+    );
+    this.linePass = new LinePass(gl, context.lineLayer);
     this.media = new GlMedia(gl);
-    this.init();
+    this.initialize();
 
-    const lost = (e: Event) => {
-      e.preventDefault(); // allows the browser to restore the context
-      this.res = null;
+    const lost = (event: Event) => {
+      event.preventDefault(); // allows the browser to restore the context
+      this.resources = null;
       this.textPass.lose();
       this.linePass.lose();
       this.media.lose();
-      ctx.onLost();
+      context.onLost();
     };
     const restored = () => {
-      this.init();
-      ctx.onRestored();
+      this.initialize();
+      context.onRestored();
     };
-    ctx.canvas.addEventListener('webglcontextlost', lost);
-    ctx.canvas.addEventListener('webglcontextrestored', restored);
+    context.canvas.addEventListener('webglcontextlost', lost);
+    context.canvas.addEventListener('webglcontextrestored', restored);
     this.disposers.push(
-      () => ctx.canvas.removeEventListener('webglcontextlost', lost),
-      () => ctx.canvas.removeEventListener('webglcontextrestored', restored),
+      () => context.canvas.removeEventListener('webglcontextlost', lost),
+      () => context.canvas.removeEventListener('webglcontextrestored', restored),
     );
   }
 
   get ready(): boolean {
-    return this.res !== null;
+    return this.resources !== null;
   }
 
   get textures(): GlMedia {
@@ -82,23 +88,23 @@ class WebGlBackend implements RenderBackend {
   }
 
   takeUploadedBytes(): number {
-    const n = this.uploadedBytes + this.linePass.uploadedBytes + this.textPass.uploadedBytes;
+    const total = this.uploadedBytes + this.linePass.uploadedBytes + this.textPass.uploadedBytes;
     this.uploadedBytes = this.linePass.uploadedBytes = this.textPass.uploadedBytes = 0;
-    return n;
+    return total;
   }
 
-  render(f: FrameParams): void {
-    const res = this.res;
-    if (!res) return;
+  render(frame: FrameParams): void {
+    const resources = this.resources;
+    if (!resources) return;
     const gl = this.gl;
-    const store = this.ctx.store;
-    this.uploadShapes(res);
+    const store = this.context.store;
+    this.uploadShapes(resources);
 
-    gl.viewport(0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
-    const [r, g, b, a] = f.background;
+    gl.viewport(0, 0, this.context.canvas.width, this.context.canvas.height);
+    const [red, green, blue, alpha] = frame.background;
     // Premultiplied, like everything drawn over it.
-    if (this.ctx.transparent) gl.clearColor(r * a, g * a, b * a, a);
-    else gl.clearColor(r, g, b, 1);
+    if (this.context.transparent) gl.clearColor(red * alpha, green * alpha, blue * alpha, alpha);
+    else gl.clearColor(red, green, blue, 1);
     gl.clearDepth(1);
     gl.depthMask(true);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -106,7 +112,7 @@ class WebGlBackend implements RenderBackend {
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
     gl.disable(gl.DEPTH_TEST);
-    if (f.grid) this.drawGrid(res, f, f.grid);
+    if (frame.grid) this.drawGrid(resources, frame, frame.grid);
 
     // Shapes: painter's order from the buffer, in two passes. Color first, without
     // touching depth; then depth only, for mostly-opaque pixels. A translucent pixel of
@@ -115,16 +121,16 @@ class WebGlBackend implements RenderBackend {
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.ALWAYS);
     if (store.count > 0) {
-      gl.useProgram(res.shapeProgram);
-      gl.uniform3f(res.shapeU.u_camera, f.x, f.y, f.zoom);
-      gl.uniform2f(res.shapeU.u_viewport, f.viewportW, f.viewportH);
-      gl.bindVertexArray(res.shapeVao);
+      gl.useProgram(resources.shapeProgram);
+      gl.uniform3f(resources.shapeUniforms.u_camera, frame.x, frame.y, frame.zoom);
+      gl.uniform2f(resources.shapeUniforms.u_viewport, frame.viewportWidth, frame.viewportHeight);
+      gl.bindVertexArray(resources.shapeVao);
       gl.depthMask(false);
-      gl.uniform1f(res.shapeU.u_depthOnly, 0);
+      gl.uniform1f(resources.shapeUniforms.u_depthOnly, 0);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, store.count);
       gl.depthMask(true);
       gl.colorMask(false, false, false, false);
-      gl.uniform1f(res.shapeU.u_depthOnly, 1);
+      gl.uniform1f(resources.shapeUniforms.u_depthOnly, 1);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, store.count);
       gl.colorMask(true, true, true, true);
       gl.bindVertexArray(null);
@@ -132,63 +138,78 @@ class WebGlBackend implements RenderBackend {
 
     // Images and audio players: same depth rules as shapes, drawn on top of the shape pass.
     gl.depthFunc(gl.LEQUAL);
-    this.media.draw(f.media, f.x, f.y, f.zoom, f.viewportW, f.viewportH);
+    this.media.draw(
+      frame.media,
+      frame.x,
+      frame.y,
+      frame.zoom,
+      frame.viewportWidth,
+      frame.viewportHeight,
+    );
 
     // Connectors: hidden under shapes above them, drawn over shapes below. LEQUAL lets
-    // segments of the same connector overlap at joints without seams.
+    // segments of the same connector overlap at joints without seams. Depth of their opaque
+    // pixels first, then color (see LinePass): lines cross without seams too.
     gl.depthFunc(gl.LEQUAL);
-    this.linePass.draw(f.x, f.y, f.zoom, f.viewportW, f.viewportH);
+    this.linePass.draw(frame.x, frame.y, frame.zoom, frame.viewportWidth, frame.viewportHeight);
 
     // Text: hidden wherever a shape or connector above its element was drawn.
-    if (f.drawText) {
+    if (frame.drawText) {
       gl.depthFunc(gl.LESS);
       gl.depthMask(false);
-      this.textPass.draw(f.x, f.y, f.zoom, f.viewportW, f.viewportH);
+      this.textPass.draw(
+        frame.x,
+        frame.y,
+        frame.zoom,
+        frame.viewportWidth,
+        frame.viewportHeight,
+        frame.pixelRatio,
+      );
       gl.depthMask(true);
     }
     gl.disable(gl.DEPTH_TEST);
   }
 
   destroy(): void {
-    for (const d of this.disposers) d();
+    for (const dispose of this.disposers) dispose();
     this.disposers = [];
-    const res = this.res;
-    this.res = null; // not ready: a late requestRender must not draw with deleted objects
-    if (res) {
+    const resources = this.resources;
+    this.resources = null; // not ready: a late requestRender must not draw with deleted objects
+    if (resources) {
       const gl = this.gl;
-      gl.deleteBuffer(res.instanceBuffer);
-      gl.deleteBuffer(res.quadBuffer);
-      gl.deleteVertexArray(res.shapeVao);
-      gl.deleteVertexArray(res.gridVao);
-      gl.deleteProgram(res.shapeProgram);
-      gl.deleteProgram(res.gridProgram);
+      gl.deleteBuffer(resources.instanceBuffer);
+      gl.deleteBuffer(resources.quadBuffer);
+      gl.deleteVertexArray(resources.shapeVao);
+      gl.deleteVertexArray(resources.gridVao);
+      gl.deleteProgram(resources.shapeProgram);
+      gl.deleteProgram(resources.gridProgram);
     }
     this.textPass.dispose();
     this.linePass.dispose();
     this.media.dispose();
-    this.res = null;
+    this.resources = null;
   }
 
   /** (Re)creates every GL object and marks all CPU data for upload. */
-  private init(): void {
-    this.res = this.createResources();
-    this.textPass.init();
-    this.linePass.init();
-    this.media.init();
-    this.ctx.store.markFull();
+  private initialize(): void {
+    this.resources = this.createResources();
+    this.textPass.initialize();
+    this.linePass.initialize();
+    this.media.initialize();
+    this.context.store.markFull();
   }
 
-  private uploadShapes(res: Resources): void {
-    const store = this.ctx.store;
+  private uploadShapes(resources: Resources): void {
+    const store = this.context.store;
     const dirty = store.takeDirty();
     if (dirty.kind === 'none') return;
     const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, res.instanceBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, resources.instanceBuffer);
     const data = store.data;
 
-    if (dirty.kind === 'all' || store.capacity !== res.instanceCapacity) {
+    if (dirty.kind === 'all' || store.capacity !== resources.instanceCapacity) {
       gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
-      res.instanceCapacity = store.capacity;
+      resources.instanceCapacity = store.capacity;
       this.uploadedBytes += data.byteLength;
     } else {
       const bytes = new Uint8Array(data);
@@ -200,18 +221,22 @@ class WebGlBackend implements RenderBackend {
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
   }
 
-  private drawGrid(res: Resources, f: FrameParams, grid: NonNullable<FrameParams['grid']>): void {
+  private drawGrid(
+    resources: Resources,
+    frame: FrameParams,
+    grid: NonNullable<FrameParams['grid']>,
+  ): void {
     const gl = this.gl;
-    gl.useProgram(res.gridProgram);
-    gl.bindVertexArray(res.gridVao);
-    gl.uniform3f(res.gridU.u_camera, f.x, f.y, f.zoom);
-    gl.uniform1f(res.gridU.u_dpr, f.dpr);
-    gl.uniform1f(res.gridU.u_heightPx, this.ctx.canvas.height);
-    gl.uniform4f(res.gridU.u_dotColor, ...grid.color);
-    gl.uniform1f(res.gridU.u_lines, grid.lines ? 1 : 0);
+    gl.useProgram(resources.gridProgram);
+    gl.bindVertexArray(resources.gridVao);
+    gl.uniform3f(resources.gridUniforms.u_camera, frame.x, frame.y, frame.zoom);
+    gl.uniform1f(resources.gridUniforms.u_dpr, frame.pixelRatio);
+    gl.uniform1f(resources.gridUniforms.u_heightPx, this.context.canvas.height);
+    gl.uniform4f(resources.gridUniforms.u_dotColor, ...grid.color);
+    gl.uniform1f(resources.gridUniforms.u_lines, grid.lines ? 1 : 0);
     for (const { spacing, fade } of grid.levels) {
-      gl.uniform1f(res.gridU.u_spacing, spacing);
-      gl.uniform1f(res.gridU.u_fade, fade);
+      gl.uniform1f(resources.gridUniforms.u_spacing, spacing);
+      gl.uniform1f(resources.gridUniforms.u_fade, fade);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     gl.bindVertexArray(null);
@@ -225,24 +250,10 @@ class WebGlBackend implements RenderBackend {
     const shapeVao = gl.createVertexArray()!;
     gl.bindVertexArray(shapeVao);
 
-    const quad = gl.createBuffer()!;
-    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-
+    const quad = createUnitQuad(gl);
     const instanceBuffer = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
-    const attr = (loc: number, size: number, type: number, normalized: boolean, offset: number) => {
-      gl.enableVertexAttribArray(loc);
-      gl.vertexAttribPointer(loc, size, type, normalized, INSTANCE_STRIDE, offset);
-      gl.vertexAttribDivisor(loc, 1);
-    };
-    attr(1, 4, gl.FLOAT, false, 0);
-    attr(2, 4, gl.FLOAT, false, 16);
-    attr(3, 4, gl.UNSIGNED_BYTE, true, 32);
-    attr(4, 4, gl.UNSIGNED_BYTE, true, 36);
-    attr(5, 1, gl.FLOAT, false, 40);
+    bindInstanceAttributes(gl, SHAPE_LAYOUT);
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
@@ -254,10 +265,10 @@ class WebGlBackend implements RenderBackend {
       quadBuffer: quad,
       instanceBuffer,
       instanceCapacity: -1, // forces the first upload to allocate
-      shapeU: uniforms(gl, shapeProgram, ['u_camera', 'u_viewport', 'u_depthOnly'] as const),
+      shapeUniforms: uniforms(gl, shapeProgram, ['u_camera', 'u_viewport', 'u_depthOnly'] as const),
       gridProgram,
       gridVao,
-      gridU: uniforms(gl, gridProgram, [
+      gridUniforms: uniforms(gl, gridProgram, [
         'u_camera',
         'u_dpr',
         'u_heightPx',

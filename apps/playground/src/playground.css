@@ -1,0 +1,171 @@
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  font:
+    13px system-ui,
+    sans-serif;
+}
+.app {
+  --bg: rgb(255 255 255 / 0.94);
+  --fg: #1f2937;
+  --muted: #555;
+  --border: #ccc;
+  --control: white;
+  --hover: #eef2f7;
+  --accent: #2563eb;
+  height: 100%;
+  color: var(--fg);
+}
+.app.dark {
+  --bg: rgb(30 30 34 / 0.94);
+  --fg: #ddd;
+  --muted: #aaa;
+  --border: #444;
+  --control: #2a2a30;
+  --hover: #34343c;
+}
+/* `<Board>` is `position: relative` (inline): it takes its size from here. */
+.board {
+  height: 100%;
+}
+.fallback {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--muted);
+}
+
+.bar,
+.text-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 0.15);
+}
+.bar {
+  position: fixed;
+  z-index: 10;
+  align-items: center;
+}
+.tools {
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+}
+.panel {
+  top: 12px;
+  right: 12px;
+}
+button,
+select,
+input {
+  font: inherit;
+  color: inherit;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--control);
+}
+button {
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  background: var(--hover);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+button.active,
+button.active:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+.sep {
+  align-self: stretch;
+  width: 1px;
+  margin: 2px;
+  background: var(--border);
+}
+.zoom {
+  min-width: 56px;
+  font-variant-numeric: tabular-nums;
+}
+.stats {
+  min-width: 150px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+/* Formatting toolbar over the text being edited (the board has none of its own). */
+.text-toolbar {
+  position: absolute;
+  flex-direction: column;
+  white-space: nowrap;
+  color: var(--fg);
+}
+.text-toolbar .row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.text-toolbar button {
+  min-width: 30px;
+  height: 30px;
+  padding: 0 6px;
+  border-color: transparent;
+  background: transparent;
+  font-weight: 600;
+}
+.text-toolbar button.active {
+  background: var(--hover);
+  color: var(--accent);
+}
+.text-toolbar button[data-style='italic'] {
+  font-style: italic;
+}
+.text-toolbar button[data-style='underline'] {
+  text-decoration: underline;
+}
+.text-toolbar button[data-style='strike'] {
+  text-decoration: line-through;
+}
+.text-toolbar .swatch {
+  min-width: 20px;
+  width: 20px;
+  height: 20px;
+  margin: 0 2px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+}
+.text-toolbar .swatch.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.text-toolbar select {
+  max-width: 120px;
+  height: 30px;
+}
+.text-toolbar .size {
+  width: 68px;
+  height: 30px;
+  box-sizing: border-box;
+  text-align: center;
+}
+.text-toolbar .link {
+  flex: 1;
+  min-width: 240px;
+  height: 30px;
+  box-sizing: border-box;
+}
+.text-toolbar .link.invalid {
+  border-color: #dc2626;
+  outline: 1px solid #dc2626;
+}

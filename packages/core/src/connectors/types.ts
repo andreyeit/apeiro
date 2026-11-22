@@ -1,4 +1,5 @@
-import type { Box, Vec2 } from '../geometry/math';
+import type { Box } from '../geometry/box';
+import type { Vec2 } from '../geometry/vector';
 import type { ConnectorArc } from './rounding';
 
 /** A free end at a world point. */
@@ -50,7 +51,7 @@ export interface ConnectorElement {
   cornerRadius?: number;
   /**
    * Group the element belongs to (any element with the same id is in it). Grouped
-   * elements are selected, moved and transformed together; see `group.ts`.
+   * elements are selected, moved and transformed together; see `scene/groups.ts`.
    */
   groupId?: string;
 }
@@ -67,8 +68,8 @@ export interface ConnectorGeometry {
   /** Polyline from start to end (curves are flattened). At least 2 points. */
   points: Vec2[];
   /** Unit direction the line arrives at each end, pointing outwards (for caps). */
-  startDir: Vec2;
-  endDir: Vec2;
+  startDirection: Vec2;
+  endDirection: Vec2;
   /** World AABB including stroke and caps. */
   bounds: Box;
   /** Bend handle, or null if this route has none (an L-shaped elbow). */

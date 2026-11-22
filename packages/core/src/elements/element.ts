@@ -1,28 +1,32 @@
 import type { ConnectorElement, LineDash } from '../connectors/types';
-import type { CropRect, ImageFit } from './image-fit';
-import type { MediaInfo } from './media';
-import type { Box } from '../geometry/math';
-import { polygonSides, polygonTextBox } from './shape-geometry';
+import type { Box } from '../geometry/box';
 import type { TextBlock } from '../text/text-block';
+import type { CropRectangle, ImageFit } from './image-fit';
+import type { MediaFile } from './media';
+import { polygonSides, polygonTextBox } from './shape-geometry';
 
 /**
+ * Every kind of shape.
  * `text` is a frameless text box: drawn like a rect, usually with a transparent fill.
  * `polygon` is a regular polygon with `sides` corners stretched to the box (3 = triangle).
  * `ink` is a freehand pen stroke: a polyline (`points`) in the box, drawn with `stroke`.
  */
-export type ShapeKind =
-  | 'rect'
-  | 'ellipse'
-  | 'polygon'
-  | 'sticky'
-  | 'text'
-  | 'image'
-  | 'audio'
-  | 'ink';
+export const SHAPE_KINDS = [
+  'rect',
+  'ellipse',
+  'polygon',
+  'sticky',
+  'text',
+  'image',
+  'audio',
+  'ink',
+] as const;
+
+export type ShapeKind = (typeof SHAPE_KINDS)[number];
 
 /**
  * A board element. Plain data: the engine never stores behaviour on elements,
- * so they map 1:1 to whatever the sync layer (Yjs) persists.
+ * so they serialize 1:1 to JSON.
  *
  * Geometry: (x, y) is the top-left corner of the unrotated box,
  * rotation is in radians around the box center.
@@ -32,8 +36,8 @@ export interface ShapeElement {
   type: ShapeKind;
   x: number;
   y: number;
-  w: number;
-  h: number;
+  width: number;
+  height: number;
   rotation: number;
   /** Paint order. Higher is drawn on top. Fractional values allow inserting between neighbours. */
   z: number;
@@ -57,11 +61,11 @@ export interface ShapeElement {
    */
   text?: TextBlock;
   /** File behind an `image` or `audio` element. */
-  media?: MediaInfo;
+  media?: MediaFile;
   /** How an `image` fills its box (default `fill`), see `image-fit.ts`. */
   imageFit?: ImageFit;
   /** Part of the image an `image` in `crop` mode shows. */
-  crop?: CropRect;
+  crop?: CropRectangle;
   /** Playback volume of an `audio` element, 0..1. */
   volume?: number;
   /**
@@ -72,18 +76,12 @@ export interface ShapeElement {
   points?: readonly number[];
   /**
    * Group the element belongs to (any element with the same id is in it). Grouped
-   * elements are selected, moved and transformed together; see `group.ts`.
+   * elements are selected, moved and transformed together; see `scene/groups.ts`.
    */
   groupId?: string;
 }
 
-export const isMedia = (el: BoardElement): el is ShapeElement & { media: MediaInfo } =>
-  (el.type === 'image' || el.type === 'audio') && 'media' in el && !!el.media;
-
 export type BoardElement = ShapeElement | ConnectorElement;
-
-export const isShape = (el: BoardElement): el is ShapeElement => el.type !== 'connector';
-export const isConnector = (el: BoardElement): el is ConnectorElement => el.type === 'connector';
 
 /**
  * Fields that can be changed with `Scene.update`. `id` and `type` are immutable.
@@ -91,6 +89,27 @@ export const isConnector = (el: BoardElement): el is ConnectorElement => el.type
  */
 export type ElementPatch = Partial<Omit<ShapeElement, 'id' | 'type'>> &
   Partial<Omit<ConnectorElement, 'id' | 'type'>>;
+
+export const isShape = (element: BoardElement): element is ShapeElement =>
+  element.type !== 'connector';
+
+export const isConnector = (element: BoardElement): element is ConnectorElement =>
+  element.type === 'connector';
+
+export const isMedia = (element: BoardElement): element is ShapeElement & { media: MediaFile } =>
+  (element.type === 'image' || element.type === 'audio') && 'media' in element && !!element.media;
+
+/** Shapes whose text can be typed into: not images, audio players or pen strokes. */
+export const canHoldText = (element: BoardElement | null | undefined): element is ShapeElement =>
+  !!element &&
+  isShape(element) &&
+  element.type !== 'image' &&
+  element.type !== 'audio' &&
+  element.type !== 'ink';
+
+/** `element` with `patch` applied; its `id` and `type` never change. */
+export const patchedElement = (element: BoardElement, patch: ElementPatch): BoardElement =>
+  ({ ...element, ...patch, id: element.id, type: element.type }) as BoardElement;
 
 const TEXT_PADDING: Record<ShapeKind, number> = {
   sticky: 16,
@@ -107,51 +126,56 @@ const TEXT_PADDING: Record<ShapeKind, number> = {
  * Area available for text, relative to the element's top-left corner (unrotated).
  * Ellipses use the inscribed rectangle, polygons a box that fits inside them.
  */
-export function textArea(el: ShapeElement): Box {
-  const pad = TEXT_PADDING[el.type] + el.strokeWidth / 2;
-  let insetX = pad;
-  let insetY = pad;
-  if (el.type === 'polygon') {
-    const t = polygonTextBox(polygonSides(el));
-    const minX = el.w * t.x0 + pad;
-    const minY = el.h * t.y0 + pad;
+export function textArea(element: ShapeElement): Box {
+  const padding = TEXT_PADDING[element.type] + element.strokeWidth / 2;
+  if (element.type === 'polygon') {
+    const textBox = polygonTextBox(polygonSides(element));
+    const minX = element.width * textBox.left + padding;
+    const minY = element.height * textBox.top + padding;
     return {
       minX,
       minY,
-      maxX: Math.max(minX, el.w * t.x1 - pad),
-      maxY: Math.max(minY, el.h * t.y1 - pad),
+      maxX: Math.max(minX, element.width * textBox.right - padding),
+      maxY: Math.max(minY, element.height * textBox.bottom - padding),
     };
   }
-  if (el.type === 'ellipse') {
-    const k = (1 - Math.SQRT1_2) / 2;
-    insetX += el.w * k;
-    insetY += el.h * k;
+  let insetX = padding;
+  let insetY = padding;
+  if (element.type === 'ellipse') {
+    const inset = (1 - Math.SQRT1_2) / 2;
+    insetX += element.width * inset;
+    insetY += element.height * inset;
   }
   return {
     minX: insetX,
     minY: insetY,
-    maxX: Math.max(insetX, el.w - insetX),
-    maxY: Math.max(insetY, el.h - insetY),
+    maxX: Math.max(insetX, element.width - insetX),
+    maxY: Math.max(insetY, element.height - insetY),
   };
 }
 
 /** World-space AABB of a shape, including rotation and stroke. */
-export function elementBounds(el: ShapeElement): Box {
-  const half = el.strokeWidth / 2;
-  if (el.rotation === 0) {
+export function elementBounds(element: ShapeElement): Box {
+  const halfStroke = element.strokeWidth / 2;
+  if (element.rotation === 0) {
     return {
-      minX: el.x - half,
-      minY: el.y - half,
-      maxX: el.x + el.w + half,
-      maxY: el.y + el.h + half,
+      minX: element.x - halfStroke,
+      minY: element.y - halfStroke,
+      maxX: element.x + element.width + halfStroke,
+      maxY: element.y + element.height + halfStroke,
     };
   }
   // Rotated half-extents avoid allocating and rotating four corners on every move.
-  const cos = Math.abs(Math.cos(el.rotation));
-  const sin = Math.abs(Math.sin(el.rotation));
-  const halfW = (el.w * cos + el.h * sin) / 2 + half;
-  const halfH = (el.w * sin + el.h * cos) / 2 + half;
-  const cx = el.x + el.w / 2;
-  const cy = el.y + el.h / 2;
-  return { minX: cx - halfW, minY: cy - halfH, maxX: cx + halfW, maxY: cy + halfH };
+  const cosine = Math.abs(Math.cos(element.rotation));
+  const sine = Math.abs(Math.sin(element.rotation));
+  const halfWidth = (element.width * cosine + element.height * sine) / 2 + halfStroke;
+  const halfHeight = (element.width * sine + element.height * cosine) / 2 + halfStroke;
+  const centerX = element.x + element.width / 2;
+  const centerY = element.y + element.height / 2;
+  return {
+    minX: centerX - halfWidth,
+    minY: centerY - halfHeight,
+    maxX: centerX + halfWidth,
+    maxY: centerY + halfHeight,
+  };
 }

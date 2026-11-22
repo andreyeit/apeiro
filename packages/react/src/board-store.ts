@@ -2,104 +2,134 @@ import type { SceneChanges } from '@apeiro/core';
 import type { BoardEditor, BoardEditorEvent } from '@apeiro/editor';
 
 /** What a hook can depend on: an editor event, or the scene's content. */
-export type Dep = BoardEditorEvent | 'scene' | 'selectionScene' | 'sceneSize' | `element:${string}`;
+export type Dependency =
+  | BoardEditorEvent
+  | 'scene'
+  | 'selectionScene'
+  | 'sceneSize'
+  | `element:${string}`;
 
 type Listener = () => void;
 type SceneListener = (changes: SceneChanges) => void;
+/** What a member reads; `null`: anything (commands, which a selector shouldn't call). */
+type Dependencies = readonly Dependency[] | null;
+
+/** The groups of the editor's API (`editor.selection`…), tracked member by member. */
+type GroupName =
+  | 'tools'
+  | 'selection'
+  | 'elements'
+  | 'text'
+  | 'history'
+  | 'camera'
+  | 'clipboard'
+  | 'preview';
 
 /**
  * Which state each public member of `BoardEditor` reads, for `useBoardState`'s dependency
- * tracking; `null`: anything (commands, which a selector shouldn't call). A member missing
- * here is a type error, so new editor API has to say what it depends on.
+ * tracking. A member missing here is a type error, so new editor API has to say what it
+ * depends on.
  */
-const MEMBER_DEPS: Record<keyof BoardEditor, readonly Dep[] | null> = {
-  scene: ['scene'],
-  getElements: ['scene'],
-  camera: ['camera'],
-  animator: ['camera'],
-  view: ['camera'],
-  viewCenter: ['camera', 'mount'],
-  clientToWorld: ['camera', 'mount'],
-  tools: ['tool'],
-  tool: ['tool'],
-  history: ['history'],
-  canUndo: ['history'],
-  canRedo: ['history'],
-  selection: ['selection'],
-  selectedElements: ['selection', 'selectionScene'],
-  selectionBounds: ['selection', 'selectionScene'],
-  editing: ['editing'],
-  theme: ['theme'],
-  labels: [],
-  isInteracting: ['gesture'],
-  pointer: ['pointer'],
-  peers: ['presence'],
-  locks: ['presence'],
-  lockedBy: ['presence'],
-  renderer: ['mount'],
-  overlay: ['mount'],
-  isMounted: ['mount'],
-  isDestroyed: [],
-  clipboard: ['clipboard'],
-  readOnly: ['readOnly'],
-  preview: ['preview'],
-  // Commands.
-  setReadOnly: null,
-  exportImage: null,
-  showPreview: null,
-  applyPreview: null,
-  discardPreview: null,
-  setHistory: null,
-  setTool: null,
-  setConnectorStyle: null,
-  setPenStyle: null,
-  select: null,
-  selectAll: null,
-  clearSelection: null,
-  setTheme: null,
-  setPresence: null,
-  on: null,
-  undo: null,
-  redo: null,
-  batch: null,
-  addElements: null,
-  updateElements: null,
-  updateSelection: null,
-  deleteSelection: null,
-  removeElements: null,
-  reorderSelection: null,
-  group: null,
-  ungroup: null,
-  zoomTo: null,
-  place: null,
-  addText: null,
-  editText: null,
-  stopEditing: null,
-  addFiles: null,
-  copy: null,
-  cut: null,
-  paste: null,
-  pasteFromClipboard: null,
-  duplicate: null,
-  pasteText: null,
-  cropImage: null,
-  load: null,
-  mount: null,
-  unmount: null,
-  destroy: null,
+const MEMBER_DEPENDENCIES: { readonly [K in Exclude<keyof BoardEditor, GroupName>]: Dependencies } =
+  {
+    scene: ['scene'],
+    theme: ['theme'],
+    readOnly: ['readOnly'],
+    isElementLocked: ['locks'],
+    setLockedElements: null,
+    isInteracting: ['gesture'],
+    pointer: ['pointer'],
+    renderer: ['mount'],
+    overlay: ['mount'],
+    isMounted: ['mount'],
+    isDestroyed: [],
+    setTheme: null,
+    setReadOnly: null,
+    on: null,
+    exportImage: null,
+    mount: null,
+    unmount: null,
+    destroy: null,
+  };
+
+const GROUP_DEPENDENCIES: {
+  readonly [G in GroupName]: { readonly [K in keyof BoardEditor[G]]: Dependencies };
+} = {
+  tools: {
+    current: ['tool'],
+    getDefaults: ['tool'],
+    activate: null,
+    setDefaults: null,
+    register: null,
+  },
+  selection: {
+    ids: ['selection'],
+    elements: ['selection', 'selectionScene'],
+    bounds: ['selection', 'selectionScene'],
+    set: null,
+    all: null,
+    clear: null,
+    update: null,
+    delete: null,
+    reorder: null,
+    group: null,
+    ungroup: null,
+  },
+  elements: {
+    getAll: ['scene'],
+    create: null,
+    createText: null,
+    add: null,
+    addFiles: null,
+    update: null,
+    remove: null,
+    load: null,
+    crop: null,
+  },
+  text: {
+    editing: ['editing'],
+    format: ['textFormat', 'mount'],
+    edit: null,
+    stop: null,
+    apply: null,
+  },
+  history: {
+    canUndo: ['history', 'readOnly'],
+    canRedo: ['history', 'readOnly'],
+    undo: null,
+    redo: null,
+    batch: null,
+    replace: null,
+  },
+  camera: {
+    x: ['camera'],
+    y: ['camera'],
+    zoom: ['camera'],
+    center: ['camera', 'mount'],
+    clientToWorld: ['camera', 'mount'],
+    worldToScreen: ['camera', 'mount'],
+    screenToWorld: ['camera', 'mount'],
+    set: null,
+    zoomTo: null,
+  },
+  clipboard: { content: ['clipboard'], copy: null, cut: null, paste: null, duplicate: null },
+  preview: { draft: ['preview'], show: null, apply: null, discard: null },
 };
 
+const isGroup = (property: PropertyKey): property is GroupName =>
+  typeof property === 'string' && Object.hasOwn(GROUP_DEPENDENCIES, property);
+
 /** Every dependency there is (a selector that reads something unknown). */
-const ALL: ReadonlySet<Dep> = new Set<Dep>([
+const ALL: ReadonlySet<Dependency> = new Set<Dependency>([
   'mount',
   'tool',
   'selection',
   'history',
   'camera',
   'editing',
+  'textFormat',
   'theme',
   'pointer',
-  'presence',
   'clipboard',
   'gesture',
   'readOnly',
@@ -109,12 +139,20 @@ const ALL: ReadonlySet<Dep> = new Set<Dep>([
 
 /** The dependencies being collected by `track`, and how many members were read. */
 let tracking: {
-  deps: Set<Dep>;
+  dependencies: Set<Dependency>;
   reads: number;
   unknown: boolean;
   sceneRead: boolean;
   sceneObserved: boolean;
 } | null = null;
+
+/** Records a read of a member that depends on `dependencies`. */
+function record(dependencies: Dependencies | undefined): void {
+  if (!tracking) return;
+  tracking.reads++;
+  if (dependencies) for (const dependency of dependencies) tracking.dependencies.add(dependency);
+  else tracking.unknown = true;
+}
 
 /**
  * The hooks' view of one editor: a single subscription per editor event and to the scene,
@@ -136,62 +174,77 @@ export class BoardStore {
     const sceneMethods = new Map<PropertyKey, unknown>();
     const elementReads = new Set<PropertyKey>(['get', 'has', 'getBounds', 'connectorGeometry']);
     const scene = new Proxy(editor.scene, {
-      get(target, prop) {
-        const value: unknown = Reflect.get(target, prop, target);
-        if (prop === 'size') {
+      get(target, property) {
+        const value: unknown = Reflect.get(target, property, target);
+        if (property === 'size') {
           if (tracking) {
             tracking.sceneObserved = true;
-            tracking.deps.add('sceneSize');
+            tracking.dependencies.add('sceneSize');
           }
           return value;
         }
-        if (!elementReads.has(prop) && tracking) {
+        if (!elementReads.has(property) && tracking) {
           tracking.sceneObserved = true;
-          tracking.deps.add('scene');
+          tracking.dependencies.add('scene');
         }
         if (typeof value !== 'function') return value;
-        let method = sceneMethods.get(prop);
+        let method = sceneMethods.get(property);
         if (!method) {
           method = (...args: unknown[]) => {
-            if (elementReads.has(prop) && tracking) {
+            if (elementReads.has(property) && tracking) {
               tracking.sceneObserved = true;
-              tracking.deps.add(`element:${String(args[0])}`);
+              tracking.dependencies.add(`element:${String(args[0])}`);
             }
             return Reflect.apply(value, target, args) as unknown;
           };
-          sceneMethods.set(prop, method);
+          sceneMethods.set(property, method);
         }
         return method;
       },
     });
+    // Each group read member by member; its functions are bound already.
+    const groups = new Map<GroupName, object>();
+    const groupOf = (name: GroupName): object => {
+      let tracked = groups.get(name);
+      if (!tracked) {
+        const dependencies = GROUP_DEPENDENCIES[name] as Readonly<
+          Record<PropertyKey, Dependencies>
+        >;
+        tracked = new Proxy(editor[name], {
+          get(target, property) {
+            record(Object.hasOwn(dependencies, property) ? dependencies[property] : null);
+            return Reflect.get(target, property, target) as unknown;
+          },
+        });
+        groups.set(name, tracked);
+      }
+      return tracked;
+    };
     this.tracked = new Proxy(editor, {
-      get(target, prop) {
-        if (prop === 'scene') {
+      get(target, property) {
+        if (property === 'scene') {
           if (tracking) {
             tracking.reads++;
             tracking.sceneRead = true;
           }
           return scene;
         }
-        if (tracking) {
-          tracking.reads++;
-          const deps =
-            typeof prop === 'string' && Object.hasOwn(MEMBER_DEPS, prop)
-              ? MEMBER_DEPS[prop as keyof BoardEditor]
-              : null;
-          if (deps) for (const d of deps) tracking.deps.add(d);
-          else tracking.unknown = true;
-        }
-        const value: unknown = Reflect.get(target, prop, target);
+        if (isGroup(property)) return groupOf(property);
+        record(
+          typeof property === 'string' && Object.hasOwn(MEMBER_DEPENDENCIES, property)
+            ? MEMBER_DEPENDENCIES[property as keyof typeof MEMBER_DEPENDENCIES]
+            : null,
+        );
+        const value: unknown = Reflect.get(target, property, target);
         if (typeof value !== 'function') return value;
         // Methods run on the editor itself, so their internals aren't tracked.
-        let fn = bound.get(prop);
-        if (!fn) bound.set(prop, (fn = (value as (...a: unknown[]) => unknown).bind(target)));
-        return fn;
+        let method = bound.get(property);
+        if (!method)
+          bound.set(property, (method = (value as (...args: unknown[]) => unknown).bind(target)));
+        return method;
       },
     });
   }
-
   /** Listens to an editor event. */
   on(event: BoardEditorEvent, listener: Listener): () => void {
     let set = this.events.get(event);
@@ -201,7 +254,7 @@ export class BoardStore {
       this.offEvents.set(
         event,
         this.editor.on(event, () => {
-          for (const l of listeners) l();
+          for (const listener of listeners) listener();
         }),
       );
     }
@@ -240,31 +293,31 @@ export class BoardStore {
 
   /** Listens to several dependencies at once; `onScene` (default: any change) for `scene`. */
   watch(
-    deps: Iterable<Dep>,
+    dependencies: Iterable<Dependency>,
     listener: Listener,
     onScene: SceneListener = () => listener(),
   ): () => void {
-    const offs: Array<() => void> = [];
-    for (const d of deps) {
-      if (d === 'scene') offs.push(this.onScene(onScene));
-      else if (d === 'selectionScene')
-        offs.push(
+    const unsubscribers: Array<() => void> = [];
+    for (const dependency of dependencies) {
+      if (dependency === 'scene') unsubscribers.push(this.onScene(onScene));
+      else if (dependency === 'selectionScene')
+        unsubscribers.push(
           this.onScene((changes) => {
-            if (touches(changes, idSet(this.editor.selection))) listener();
+            if (touches(changes, idSet(this.editor.selection.ids))) listener();
           }),
         );
-      else if (d === 'sceneSize')
-        offs.push(
+      else if (dependency === 'sceneSize')
+        unsubscribers.push(
           this.onScene((changes) => {
             if (changes.added.length > 0 || changes.removed.length > 0) listener();
           }),
         );
-      else if (d.startsWith('element:'))
-        offs.push(this.onElement(d.slice('element:'.length), listener));
-      else offs.push(this.on(d as BoardEditorEvent, listener));
+      else if (dependency.startsWith('element:'))
+        unsubscribers.push(this.onElement(dependency.slice('element:'.length), listener));
+      else unsubscribers.push(this.on(dependency as BoardEditorEvent, listener));
     }
     return () => {
-      for (const off of offs) off();
+      for (const unsubscribe of unsubscribers) unsubscribe();
     };
   }
 
@@ -273,10 +326,15 @@ export class BoardStore {
    * for its result to stay current. Reading nothing known (e.g. an editor captured from a
    * closure instead of the argument) depends on everything.
    */
-  track<T>(select: (editor: BoardEditor) => T): { value: T; deps: ReadonlySet<Dep> } {
+  track<T>(select: (editor: BoardEditor) => T): {
+    value: T;
+    dependencies: ReadonlySet<Dependency>;
+    /** Nothing was read through the argument. */
+    untracked: boolean;
+  } {
     const outer = tracking;
     const current = {
-      deps: new Set<Dep>(),
+      dependencies: new Set<Dependency>(),
       reads: 0,
       unknown: false,
       sceneRead: false,
@@ -285,8 +343,12 @@ export class BoardStore {
     tracking = current;
     try {
       const value = select(this.tracked);
-      if (current.sceneRead && !current.sceneObserved) current.deps.add('scene');
-      return { value, deps: current.unknown || current.reads === 0 ? ALL : current.deps };
+      if (current.sceneRead && !current.sceneObserved) current.dependencies.add('scene');
+      return {
+        value,
+        dependencies: current.unknown || current.reads === 0 ? ALL : current.dependencies,
+        untracked: current.reads === 0,
+      };
     } finally {
       tracking = outer;
     }
@@ -304,15 +366,15 @@ export class BoardStore {
   }
 
   private readonly dispatchScene = (changes: SceneChanges): void => {
-    for (const l of this.sceneListeners) l(changes);
+    for (const listener of this.sceneListeners) listener(changes);
     const byId = this.elementListeners;
     if (byId.size === 0) return;
     const fire = (id: string) => {
       const set = byId.get(id);
-      if (set) for (const l of set) l();
+      if (set) for (const listener of set) listener();
     };
-    for (const el of changes.added) fire(el.id);
-    for (const el of changes.updated) fire(el.id);
+    for (const element of changes.added) fire(element.id);
+    for (const element of changes.updated) fire(element.id);
     for (const id of changes.removed) fire(id);
   };
 }
@@ -327,25 +389,28 @@ export function storeOf(editor: BoardEditor): BoardStore {
 }
 
 /** Same dependencies (by content). */
-export function sameDeps(a: ReadonlySet<Dep> | null, b: ReadonlySet<Dep>): boolean {
-  if (a === b) return true;
-  if (!a || a.size !== b.size) return false;
-  for (const d of a) if (!b.has(d)) return false;
+export function sameDependencies(
+  first: ReadonlySet<Dependency> | null,
+  second: ReadonlySet<Dependency>,
+): boolean {
+  if (first === second) return true;
+  if (!first || first.size !== second.size) return false;
+  for (const dependency of first) if (!second.has(dependency)) return false;
   return true;
 }
 
 /** Whether a batch touches any of `ids` (e.g. the selection). */
 export function touches(changes: SceneChanges, ids: ReadonlySet<string>): boolean {
   if (ids.size === 0) return false;
-  for (const el of changes.updated) if (ids.has(el.id)) return true;
+  for (const element of changes.updated) if (ids.has(element.id)) return true;
   for (const id of changes.removed) if (ids.has(id)) return true;
-  for (const el of changes.added) if (ids.has(el.id)) return true;
+  for (const element of changes.added) if (ids.has(element.id)) return true;
   return false;
 }
 
 const idSets = new WeakMap<readonly string[], ReadonlySet<string>>();
 
-/** A set of the ids of an array that is replaced, never mutated (`editor.selection`). */
+/** A set of the ids of an array that is replaced, never mutated (`editor.selection.ids`). */
 export function idSet(ids: readonly string[]): ReadonlySet<string> {
   let set = idSets.get(ids);
   if (!set) idSets.set(ids, (set = new Set(ids)));

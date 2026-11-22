@@ -1,5 +1,6 @@
+import { worldToLocal } from '../geometry/frame';
+import type { Vec2 } from '../geometry/vector';
 import type { ShapeElement } from './element';
-import type { Vec2 } from '../geometry/math';
 import { inkDistance } from './ink';
 import { shapeSdf } from './shape-geometry';
 
@@ -8,37 +9,21 @@ import { shapeSdf } from './shape-geometry';
  * `tolerance` (world units) expands the shape, so thin or tiny elements stay clickable
  * when zoomed out. Callers usually pass `screenTolerancePx / camera.zoom`.
  */
-export function hitTestElement(el: ShapeElement, p: Vec2, tolerance = 0): boolean {
+export function hitTestElement(element: ShapeElement, point: Vec2, tolerance = 0): boolean {
   // A pen stroke is hit near its line, not anywhere in its box.
-  if (el.type === 'ink') return inkDistance(el, p) <= el.strokeWidth / 2 + tolerance;
-  // Move the point into the element's local, unrotated frame centered at the box center.
-  const hw = el.w / 2;
-  const hh = el.h / 2;
-  let lx = p.x - (el.x + hw);
-  let ly = p.y - (el.y + hh);
-  if (el.rotation !== 0) {
-    const c = Math.cos(-el.rotation);
-    const s = Math.sin(-el.rotation);
-    const rx = lx * c - ly * s;
-    ly = lx * s + ly * c;
-    lx = rx;
+  if (element.type === 'ink')
+    return inkDistance(element, point) <= element.strokeWidth / 2 + tolerance;
+  const local = worldToLocal(element, point);
+  const reach = element.strokeWidth / 2 + tolerance;
+  if (element.type === 'ellipse') {
+    // Exact for the grown ellipse (the distance approximation is only good near the outline).
+    const radiusX = element.width / 2 + reach;
+    const radiusY = element.height / 2 + reach;
+    if (radiusX <= 0 || radiusY <= 0) return false;
+    return (
+      (local.x * local.x) / (radiusX * radiusX) + (local.y * local.y) / (radiusY * radiusY) <= 1
+    );
   }
-  const pad = el.strokeWidth / 2 + tolerance;
-
-  if (el.type === 'ellipse') {
-    const rx = hw + pad;
-    const ry = hh + pad;
-    if (rx <= 0 || ry <= 0) return false;
-    return (lx * lx) / (rx * rx) + (ly * ly) / (ry * ry) <= 1;
-  }
-
-  if (el.type === 'polygon') return shapeSdf(el, { x: lx, y: ly }) <= pad;
-
-  // Rounded rectangle SDF; same formula as the fragment shader so hits match pixels.
-  const r = Math.min(el.radius, hw, hh);
-  const qx = Math.abs(lx) - (hw - r);
-  const qy = Math.abs(ly) - (hh - r);
-  const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
-  const inside = Math.min(Math.max(qx, qy), 0);
-  return outside + inside - r <= pad;
+  // The same distance the fragment shader draws with, so hits match pixels.
+  return shapeSdf(element, local) <= reach;
 }

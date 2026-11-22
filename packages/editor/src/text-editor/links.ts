@@ -1,27 +1,32 @@
-import { textArea, type ShapeElement, type TextLayout, type Vec2 } from '@apeiro/core';
-import { worldToLocal } from '../overlay/handles';
+import {
+  textArea,
+  worldToLocal,
+  type ShapeElement,
+  type TextLayout,
+  type Vec2,
+} from '@apeiro/core';
 
 /** The link of an element's laid out text under a world point, or null. */
 export function linkAtPoint(
-  el: ShapeElement,
+  element: ShapeElement,
   layout: TextLayout | undefined,
   world: Vec2,
   slop = 0,
 ): string | null {
   if (!layout || layout.links.length === 0) return null;
-  const local = worldToLocal(el, world);
-  const area = textArea(el);
+  const local = worldToLocal(element, world);
+  const area = textArea(element);
   // Text-box coordinates: from the top-left of the text area, unrotated.
-  const x = local.x + el.w / 2 - area.minX;
-  const y = local.y + el.h / 2 - area.minY;
-  for (const l of layout.links) {
+  const x = local.x + element.width / 2 - area.minX;
+  const y = local.y + element.height / 2 - area.minY;
+  for (const link of layout.links) {
     if (
-      x >= l.x - slop &&
-      x <= l.x + l.width + slop &&
-      y >= l.y - slop &&
-      y <= l.y + l.height + slop
+      x >= link.x - slop &&
+      x <= link.x + link.width + slop &&
+      y >= link.y - slop &&
+      y <= link.y + link.height + slop
     )
-      return l.href;
+      return link.href;
   }
   return null;
 }

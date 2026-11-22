@@ -27,156 +27,172 @@ import { eraseAlong, extendInk } from './ink';
 import type { ModeOf } from './modes';
 import { dragStep, resizeStep, type SnapContext } from './transform-gestures';
 
-const moveEnd = (end: ConnectorEnd, dx: number, dy: number): ConnectorEnd =>
-  end.kind === 'point' ? { kind: 'point', x: end.x + dx, y: end.y + dy } : end;
+const moveEnd = (end: ConnectorEnd, deltaX: number, deltaY: number): ConnectorEnd =>
+  end.kind === 'point' ? { kind: 'point', x: end.x + deltaX, y: end.y + deltaY } : end;
 
-const snapContext = (c: InputContext): SnapContext => ({
-  zoom: c.camera.zoom,
-  snapping: !!c.hooks.snapping,
-  shift: c.modifiers.shift,
-  alt: c.modifiers.alt,
-  deep: c.modifiers.deep,
+const snapContext = (context: InputContext): SnapContext => ({
+  zoom: context.camera.zoom,
+  snapping: !!context.hooks.snapping,
+  shift: context.modifiers.shift,
+  alt: context.modifiers.alt,
+  deep: context.modifiers.deep,
 });
 
 /** Moves the dragged elements with the pointer, snapping to smart guides and the grid. */
-function drag(c: InputContext, m: ModeOf<'drag'>, p: Vec2): void {
-  if (!m.moved && c.screenDist(p, m.start) >= CLICK_SLOP_PX) m.moved = true;
+function drag(context: InputContext, mode: ModeOf<'drag'>, point: Vec2): void {
+  if (!mode.moved && context.screenDistance(point, mode.start) >= CLICK_SLOP_PX) mode.moved = true;
   // Smart guides and the grid; Ctrl/⌘ held places freely.
-  const step = dragStep(m.start, c.world(p), m.box, m.targets, m.moved, snapContext(c));
-  c.overlay.guides = step.guides;
-  c.overlay.spacing = step.spacing;
-  const { dx, dy } = step;
-  c.scene.transact(() => {
-    for (const [id, o] of m.origin) {
+  const step = dragStep(
+    mode.start,
+    context.world(point),
+    mode.box,
+    mode.targets,
+    mode.moved,
+    snapContext(context),
+  );
+  context.overlay.guides = step.guides;
+  context.overlay.spacing = step.spacing;
+  const { deltaX, deltaY } = step;
+  context.scene.transact(() => {
+    for (const [id, origin] of mode.origin) {
       // Attached connector ends follow their shapes by themselves; only free ends move.
-      if (o.kind === 'shape') c.scene.update(id, { x: o.x + dx, y: o.y + dy });
-      else c.scene.update(id, { start: moveEnd(o.start, dx, dy), end: moveEnd(o.end, dx, dy) });
+      if (origin.kind === 'shape')
+        context.scene.update(id, { x: origin.x + deltaX, y: origin.y + deltaY });
+      else
+        context.scene.update(id, {
+          start: moveEnd(origin.start, deltaX, deltaY),
+          end: moveEnd(origin.end, deltaX, deltaY),
+        });
     }
   });
 }
 
-function crop(c: InputContext, m: ModeOf<'crop'>, p: Vec2): void {
-  const l = worldToFrame(m.frame, c.world(p));
-  const delta = { x: l.x - m.start.x, y: l.y - m.start.y };
-  const size = imageSize(m.original);
+function crop(context: InputContext, mode: ModeOf<'crop'>, point: Vec2): void {
+  const local = worldToFrame(mode.frame, context.world(point));
+  const delta = { x: local.x - mode.start.x, y: local.y - mode.start.y };
+  const size = imageSize(mode.original);
   const patch =
-    m.action === 'pan'
-      ? cropPan(m.original, size, delta)
-      : m.action === 'scale'
-        ? cropScale(m.original, size, m.signs, delta)
-        : cropResize(m.original, size, m.signs, delta, c.px(4));
-  c.scene.update(m.original.id, patch);
+    mode.action === 'pan'
+      ? cropPan(mode.original, size, delta)
+      : mode.action === 'scale'
+        ? cropScale(mode.original, size, mode.signs, delta)
+        : cropResize(mode.original, size, mode.signs, delta, context.pixelsToWorld(4));
+  context.scene.update(mode.original.id, patch);
 }
 
-function marquee(c: InputContext, m: ModeOf<'marquee'>, p: Vec2): void {
-  const box = boxFromPoints(m.start, c.world(p));
-  c.overlay.marquee = box;
-  const next = new Set(m.base);
+function marquee(context: InputContext, mode: ModeOf<'marquee'>, point: Vec2): void {
+  const box = boxFromPoints(mode.start, context.world(point));
+  context.overlay.marquee = box;
+  const next = new Set(mode.base);
   // Touching one element of a group selects the whole group; with Ctrl/⌘ (deep select)
   // only the elements touched.
-  const hits = c.scene.queryBox(box, 'intersect').map((hit) => hit.id);
-  for (const id of c.modifiers.deep ? hits : expandToGroups(c.scene, hits)) next.add(id);
-  c.overlay.selection = next;
+  const hits = context.scene.queryBox(box, 'intersect').map((hit) => hit.id);
+  for (const id of context.modifiers.deep ? hits : expandToGroups(context.scene, hits))
+    if (!context.isLocked(id)) next.add(id);
+  context.overlay.selection = next;
 }
 
-function radius(c: InputContext, m: ModeOf<'radius'>, p: Vec2): void {
-  const el = c.getShape(m.id);
-  if (!el) return;
-  const along = alongBisector(el, c.world(p));
-  const r = radiusAfterDrag(el, m.startRadius, along - m.startAlong);
+function radius(context: InputContext, mode: ModeOf<'radius'>, point: Vec2): void {
+  const element = context.getShape(mode.id);
+  if (!element) return;
+  const along = alongBisector(element, context.world(point));
+  const radius = radiusAfterDrag(element, mode.startRadius, along - mode.startAlong);
   // Whole units like Figma, but keep fractions on tiny shapes (zoomed in a lot).
-  const rounded = maxCornerRadius(el) >= 20 ? Math.round(r) : r;
-  if (rounded !== el.radius) c.scene.update(m.id, { radius: rounded });
+  const rounded = maxCornerRadius(element) >= 20 ? Math.round(radius) : radius;
+  if (rounded !== element.radius) context.scene.update(mode.id, { radius: rounded });
 }
 
-function count(c: InputContext, m: ModeOf<'count'>, p: Vec2): void {
-  const el = c.getShape(m.id);
-  if (!el) return;
-  const sides = countAtAngle(el, c.world(p));
-  c.overlay.countLabel = sides;
-  if (sides !== polygonSides(el)) c.scene.update(m.id, { sides });
+function count(context: InputContext, mode: ModeOf<'count'>, point: Vec2): void {
+  const element = context.getShape(mode.id);
+  if (!element) return;
+  const sides = countAtAngle(element, context.world(point));
+  context.overlay.countLabel = sides;
+  if (sides !== polygonSides(element)) context.scene.update(mode.id, { sides });
 }
 
-function rotate(c: InputContext, m: ModeOf<'rotate'>, p: Vec2): void {
-  const w = c.world(p);
-  let angle = Math.atan2(w.y - m.center.y, w.x - m.center.x) - m.startAngle;
-  if (c.modifiers.shift) angle = snapAngle(m.base + angle, Math.PI / 12) - m.base;
-  c.applyPatches(rotateElements(m.originals, m.center, angle));
-  const degrees = Math.round(((m.base + angle) * 180) / Math.PI);
-  c.overlay.badge = `${((degrees % 360) + 360) % 360}°`;
-  c.setCursor(ROTATE_CURSOR);
+function rotate(context: InputContext, mode: ModeOf<'rotate'>, point: Vec2): void {
+  const world = context.world(point);
+  let angle = Math.atan2(world.y - mode.center.y, world.x - mode.center.x) - mode.startAngle;
+  if (context.modifiers.shift) angle = snapAngle(mode.base + angle, Math.PI / 12) - mode.base;
+  context.applyPatches(rotateElements(mode.originals, mode.center, angle));
+  const degrees = Math.round(((mode.base + angle) * 180) / Math.PI);
+  context.overlay.badge = `${((degrees % 360) + 360) % 360}°`;
+  context.setCursor(ROTATE_CURSOR);
 }
 
-/** Applies the current gesture for a pointer at screen point `p`. */
-export function moveGesture(c: InputContext, p: Vec2): void {
-  const { mode: m, overlay } = c;
-  switch (m.kind) {
+/** Applies the current gesture for a pointer at screen `point`. */
+export function moveGesture(context: InputContext, point: Vec2): void {
+  const { mode, overlay } = context;
+  switch (mode.kind) {
     case 'drag':
-      drag(c, m, p);
+      drag(context, mode, point);
       break;
     case 'crop':
-      crop(c, m, p);
+      crop(context, mode, point);
       break;
     case 'textbox': {
       // The width of the text box being drawn (its height follows the text).
-      const dragged = Math.abs(p.x - m.down.x) >= TEXTBOX_DRAG_PX;
-      overlay.marquee = dragged ? boxFromPoints(m.start, c.world(p)) : null;
+      const dragged = Math.abs(point.x - mode.down.x) >= TEXTBOX_DRAG_PX;
+      overlay.marquee = dragged ? boxFromPoints(mode.start, context.world(point)) : null;
       break;
     }
     case 'marquee':
-      marquee(c, m, p);
+      marquee(context, mode, point);
       break;
     case 'bend': {
-      const connector = c.scene.get(m.id);
+      const connector = context.scene.get(mode.id);
       if (connector && isConnector(connector)) {
-        const patch = bendConnector(connector, c.world(p), c.getShape);
-        if (patch) c.scene.update(m.id, patch);
+        const patch = bendConnector(connector, context.world(point), context.getShape);
+        if (patch) context.scene.update(mode.id, patch);
       }
       break;
     }
     case 'seek': {
-      const el = c.getShape(m.id);
-      if (el) c.hooks.audio?.seek(m.id, audioSeekAt(el, c.world(p)));
+      const element = context.getShape(mode.id);
+      if (element) context.hooks.audio?.seek(mode.id, audioSeekAt(element, context.world(point)));
       return;
     }
     case 'volume': {
-      const el = c.getShape(m.id);
-      if (el) c.scene.update(m.id, { volume: audioVolumeAt(el, c.world(p)) });
+      const element = context.getShape(mode.id);
+      if (element)
+        context.scene.update(mode.id, { volume: audioVolumeAt(element, context.world(point)) });
       return;
     }
     case 'radius':
-      radius(c, m, p);
+      radius(context, mode, point);
       break;
     case 'count':
-      count(c, m, p);
+      count(context, mode, point);
       break;
     case 'resize': {
       const step = resizeStep(
-        m,
-        worldToFrame(m.frame, c.world(p)),
-        snapContext(c),
-        c.hooks.measurer,
+        mode,
+        worldToFrame(mode.frame, context.world(point)),
+        snapContext(context),
+        context.hooks.measurer,
       );
       overlay.guides = step.guides;
       overlay.badge = step.badge;
-      c.applyPatches(step.patches);
+      context.applyPatches(step.patches);
       break;
     }
     case 'rotate':
-      rotate(c, m, p);
+      rotate(context, mode, point);
       break;
     case 'connect':
-      updateDraggedEnd(c, m, p);
+      updateDraggedEnd(context, mode, point);
       break;
     case 'place':
       overlay.marquee =
-        c.screenDist(p, m.start) >= CLICK_SLOP_PX ? boxFromPoints(m.start, c.world(p)) : null;
+        context.screenDistance(point, mode.start) >= CLICK_SLOP_PX
+          ? boxFromPoints(mode.start, context.world(point))
+          : null;
       break;
     case 'ink':
-      if (!extendInk(c, m, [p])) return;
+      if (!extendInk(context, mode, [point])) return;
       break;
     case 'erase':
-      eraseAlong(c, m, p);
+      eraseAlong(context, mode, point);
       break;
     default:
       return;

@@ -8,10 +8,11 @@ import type {
   TextureHandle,
 } from '../backend';
 import { byteRuns, type BufferUpload } from '../layers/buffer-upload';
+import type { InstanceLayout } from '../layers/instance-layout';
+import { INSTANCE_STRIDE, SHAPE_LAYOUT } from '../layers/instance-store';
+import { LINE_LAYOUT, LINE_STRIDE } from '../layers/line-layer';
+import { GLYPH_LAYOUT, GLYPH_STRIDE } from '../layers/text-layer';
 import type { GlyphAtlas } from '../text/glyph-atlas';
-import { INSTANCE_STRIDE } from '../layers/instance-store';
-import { LINE_STRIDE } from '../layers/line-layer';
-import { GLYPH_STRIDE } from '../layers/text-layer';
 import { GRID_WGSL, LINE_WGSL, MEDIA_WGSL, MIPMAP_WGSL, SHAPE_WGSL, TEXT_WGSL } from './shaders';
 
 // The usage flags of the WebGPU spec (TypeScript's DOM types don't declare the globals).
@@ -48,14 +49,14 @@ export async function requestWebGpuBackend(
   try {
     const core = await createCore();
     if (!core) return null;
-    const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
-    if (!context) {
+    const canvasContext = canvas.getContext('webgpu') as GPUCanvasContext | null;
+    if (!canvasContext) {
       core.device.destroy();
       return null;
     }
-    return (ctx) => new WebGpuBackend(ctx, context, core);
-  } catch (e) {
-    console.warn('apeiro: WebGPU is unavailable, falling back to WebGL', e);
+    return (context) => new WebGpuBackend(context, canvasContext, core);
+  } catch (error) {
+    console.warn('apeiro: WebGPU is unavailable, falling back to WebGL', error);
     return null;
   }
 }
@@ -73,6 +74,7 @@ interface Core {
   shapeDepth: GPURenderPipeline;
   media: GPURenderPipeline;
   line: GPURenderPipeline;
+  lineDepth: GPURenderPipeline;
   text: GPURenderPipeline;
   mipmap: GPURenderPipeline;
   linearSampler: GPUSampler;
@@ -160,41 +162,9 @@ async function createCore(): Promise<Core | null> {
       },
     });
 
-  const instanced = (
-    arrayStride: number,
-    attributes: Array<[GPUVertexFormat, number]>,
-  ): GPUVertexBufferLayout[] => [
-    {
-      arrayStride,
-      stepMode: 'instance',
-      attributes: attributes.map(([format, offset], shaderLocation) => ({
-        format,
-        offset,
-        shaderLocation,
-      })),
-    },
-  ];
-  // Same layouts as the WebGL attribute pointers (see instance-store, line-layer, text-layer).
-  const shapeBuffers = instanced(INSTANCE_STRIDE, [
-    ['float32x4', 0],
-    ['float32x4', 16],
-    ['unorm8x4', 32],
-    ['unorm8x4', 36],
-    ['float32', 40],
-  ]);
-  const lineBuffers = instanced(LINE_STRIDE, [
-    ['float32x4', 0],
-    ['float32x4', 16],
-    ['float32x4', 32],
-    ['unorm8x4', 48],
-  ]);
-  const textBuffers = instanced(GLYPH_STRIDE, [
-    ['float32x4', 0],
-    ['float32x4', 16],
-    ['float32x4', 32],
-    ['float32', 48],
-    ['unorm8x4', 52],
-  ]);
+  const shapeBuffers = vertexBuffers(SHAPE_LAYOUT);
+  const lineBuffers = vertexBuffers(LINE_LAYOUT);
+  const textBuffers = vertexBuffers(GLYPH_LAYOUT);
 
   const frameOnly = layout(frameLayout);
   const core: Core = {
@@ -229,8 +199,14 @@ async function createCore(): Promise<Core | null> {
     line: pipeline(
       lineModule,
       frameOnly,
-      { compare: 'less-equal', write: true },
+      { compare: 'less-equal', write: false },
       { buffers: lineBuffers },
+    ),
+    lineDepth: pipeline(
+      lineModule,
+      frameOnly,
+      { compare: 'less-equal', write: true },
+      { buffers: lineBuffers, fragment: 'fsDepth', colorWrites: false },
     ),
     text: pipeline(
       textModule,
@@ -263,15 +239,32 @@ async function createCore(): Promise<Core | null> {
   const validation = await device.popErrorScope();
   const error = validation ?? internal;
   if (error) {
-    for (const m of modules) {
-      const info = await m.getCompilationInfo();
-      for (const msg of info.messages)
-        if (msg.type === 'error') console.error('WGSL:', msg.message);
+    for (const module of modules) {
+      const compilation = await module.getCompilationInfo();
+      for (const message of compilation.messages)
+        if (message.type === 'error') console.error('WGSL:', message.message);
     }
     device.destroy();
     throw new Error(`WebGPU pipeline setup failed: ${error.message}`);
   }
   return core;
+}
+
+/** The instance buffer of a CPU layer, as WebGPU reads it (shader locations 0, 1, …). */
+function vertexBuffers(layout: InstanceLayout): GPUVertexBufferLayout[] {
+  return [
+    {
+      arrayStride: layout.stride,
+      stepMode: 'instance',
+      attributes: layout.attributes.map((attribute, shaderLocation) => ({
+        format: (attribute.components === 1
+          ? attribute.format
+          : `${attribute.format}x${attribute.components}`) as GPUVertexFormat,
+        offset: attribute.offset,
+        shaderLocation,
+      })),
+    },
+  ];
 }
 
 /** A media texture of this backend. */
@@ -322,11 +315,11 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
   private drawStaging = new ArrayBuffer(DRAW_UNIFORM_ALIGN * 16);
 
   constructor(
-    private readonly ctx: BackendContext,
-    private readonly context: GPUCanvasContext,
+    private readonly context: BackendContext,
+    private readonly canvasContext: GPUCanvasContext,
     core: Core,
   ) {
-    this.state = this.init(core);
+    this.state = this.initialize(core);
   }
 
   get ready(): boolean {
@@ -342,32 +335,34 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
   }
 
   takeUploadedBytes(): number {
-    const n = this.uploadedBytes;
+    const total = this.uploadedBytes;
     this.uploadedBytes = 0;
-    return n;
+    return total;
   }
 
-  render(f: FrameParams): void {
-    const s = this.state;
-    if (!s) return;
-    const { device } = s.core;
-    const { store, lineLayer, textLayer } = this.ctx;
+  render(frame: FrameParams): void {
+    const state = this.state;
+    if (!state) return;
+    const { device } = state.core;
+    const { store, lineLayer, textLayer } = this.context;
 
-    this.uploadShapes(s);
+    this.uploadShapes(state);
     this.uploadedBytes += uploadInstances(
       device,
-      s.lines,
+      state.lines,
       lineLayer.data,
       lineLayer.count,
       LINE_STRIDE,
       lineLayer.takeUpload(),
     );
-    if (f.drawText) {
-      if (this.uploadAtlas(s, this.ctx.sdfAtlas, s.sdf, 'r8unorm')) s.textGroup = null;
-      if (this.uploadAtlas(s, this.ctx.colorAtlas, s.color, 'rgba8unorm')) s.textGroup = null;
+    if (frame.drawText) {
+      if (this.uploadAtlas(state, this.context.sdfAtlas, state.sdf, 'r8unorm'))
+        state.textGroup = null;
+      if (this.uploadAtlas(state, this.context.colorAtlas, state.color, 'rgba8unorm'))
+        state.textGroup = null;
       this.uploadedBytes += uploadInstances(
         device,
-        s.glyphs,
+        state.glyphs,
         textLayer.data,
         textLayer.count,
         GLYPH_STRIDE,
@@ -375,11 +370,11 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
       );
     }
 
-    const width = this.ctx.canvas.width;
-    const height = this.ctx.canvas.height;
-    if (!s.depth || s.depth.width !== width || s.depth.height !== height) {
-      s.depth?.destroy();
-      s.depth = device.createTexture({
+    const width = this.context.canvas.width;
+    const height = this.context.canvas.height;
+    if (!state.depth || state.depth.width !== width || state.depth.height !== height) {
+      state.depth?.destroy();
+      state.depth = device.createTexture({
         size: [width, height],
         format: DEPTH_FORMAT,
         usage: TEXTURE_RENDER_ATTACHMENT,
@@ -387,83 +382,96 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
     }
 
     device.queue.writeBuffer(
-      s.frameBuffer,
+      state.frameBuffer,
       0,
-      new Float32Array([f.x, f.y, f.zoom, f.dpr, f.viewportW, f.viewportH, this.ctx.sdfEdge, 0]),
+      new Float32Array([
+        frame.x,
+        frame.y,
+        frame.zoom,
+        frame.pixelRatio,
+        frame.viewportWidth,
+        frame.viewportHeight,
+        this.context.sdfEdge,
+        0,
+      ]),
     );
-    const offsets = this.writeDrawUniforms(s, f);
+    const offsets = this.writeDrawUniforms(state, frame);
 
     const encoder = device.createCommandEncoder();
-    const [r, g, b, a] = f.background;
+    const [red, green, blue, alpha] = frame.background;
     // Premultiplied, like everything drawn over it.
-    const clearValue = this.ctx.transparent
-      ? { r: r * a, g: g * a, b: b * a, a }
-      : { r, g, b, a: 1 };
+    const clearValue = this.context.transparent
+      ? { r: red * alpha, g: green * alpha, b: blue * alpha, a: alpha }
+      : { r: red, g: green, b: blue, a: 1 };
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: this.context.getCurrentTexture().createView(),
+          view: this.canvasContext.getCurrentTexture().createView(),
           clearValue,
           loadOp: 'clear',
           storeOp: 'store',
         },
       ],
       depthStencilAttachment: {
-        view: s.depth.createView(),
+        view: state.depth.createView(),
         depthClearValue: 1,
         depthLoadOp: 'clear',
         depthStoreOp: 'discard',
       },
     });
-    pass.setBindGroup(0, s.frameGroup);
+    pass.setBindGroup(0, state.frameGroup);
     let next = 0;
 
-    if (f.grid && s.drawGroup) {
-      pass.setPipeline(s.core.grid);
-      for (let i = 0; i < f.grid.levels.length; i++) {
-        pass.setBindGroup(1, s.drawGroup, [offsets[next++]!]);
+    if (frame.grid && state.drawGroup) {
+      pass.setPipeline(state.core.grid);
+      for (let i = 0; i < frame.grid.levels.length; i++) {
+        pass.setBindGroup(1, state.drawGroup, [offsets[next++]!]);
         pass.draw(3);
       }
     }
 
     // Shapes: color without depth writes, then depth only for mostly-opaque pixels (see
     // the WebGL backend for why).
-    if (store.count > 0 && s.shapes.buffer) {
-      pass.setVertexBuffer(0, s.shapes.buffer);
-      pass.setPipeline(s.core.shape);
+    if (store.count > 0 && state.shapes.buffer) {
+      pass.setVertexBuffer(0, state.shapes.buffer);
+      pass.setPipeline(state.core.shape);
       pass.draw(4, store.count);
-      pass.setPipeline(s.core.shapeDepth);
+      pass.setPipeline(state.core.shapeDepth);
       pass.draw(4, store.count);
     }
 
-    if (f.media.length > 0 && s.drawGroup) {
-      pass.setPipeline(s.core.media);
-      for (const q of f.media) {
-        pass.setBindGroup(1, s.drawGroup, [offsets[next++]!]);
-        const texture = (q.texture as GpuTexture | null) ?? s.emptyTexture;
+    if (frame.media.length > 0 && state.drawGroup) {
+      pass.setPipeline(state.core.media);
+      for (const quad of frame.media) {
+        pass.setBindGroup(1, state.drawGroup, [offsets[next++]!]);
+        const texture = (quad.texture as GpuTexture | null) ?? state.emptyTexture;
         pass.setBindGroup(2, texture.bindGroup);
         pass.draw(4);
       }
     }
 
-    if (lineLayer.count > 0 && s.lines.buffer) {
-      pass.setPipeline(s.core.line);
-      pass.setVertexBuffer(0, s.lines.buffer);
+    // Lines: depth of their opaque pixels first, then color without depth writes (see the
+    // WebGL backend for why).
+    if (lineLayer.count > 0 && state.lines.buffer) {
+      pass.setVertexBuffer(0, state.lines.buffer);
+      pass.setPipeline(state.core.lineDepth);
+      pass.draw(4, lineLayer.count);
+      pass.setPipeline(state.core.line);
       pass.draw(4, lineLayer.count);
     }
 
-    if (f.drawText && textLayer.count > 0 && s.glyphs.buffer) {
-      s.textGroup ??= device.createBindGroup({
-        layout: s.core.textLayout,
+    if (frame.drawText && textLayer.count > 0 && state.glyphs.buffer) {
+      state.textGroup ??= device.createBindGroup({
+        layout: state.core.textLayout,
         entries: [
-          { binding: 0, resource: s.core.linearSampler },
-          { binding: 1, resource: s.sdf.texture.createView() },
-          { binding: 2, resource: s.color.texture.createView() },
+          { binding: 0, resource: state.core.linearSampler },
+          { binding: 1, resource: state.sdf.texture.createView() },
+          { binding: 2, resource: state.color.texture.createView() },
         ],
       });
-      pass.setPipeline(s.core.text);
-      pass.setBindGroup(1, s.textGroup);
-      pass.setVertexBuffer(0, s.glyphs.buffer);
+      pass.setPipeline(state.core.text);
+      pass.setBindGroup(1, state.textGroup);
+      pass.setVertexBuffer(0, state.glyphs.buffer);
       pass.draw(4, textLayer.count);
     }
 
@@ -473,33 +481,36 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
 
   destroy(): void {
     this.destroyed = true;
-    const s = this.state;
+    const state = this.state;
     this.state = null;
-    if (!s) return;
-    this.context.unconfigure();
-    s.core.device.destroy(); // frees every buffer and texture of the device
+    if (!state) return;
+    this.canvasContext.unconfigure();
+    state.core.device.destroy(); // frees every buffer and texture of the device
   }
 
   // --- Media textures -------------------------------------------------------------
 
   upload(source: MediaSource, mipmaps: boolean, previous?: TextureHandle): TextureHandle {
-    const s = this.state!;
-    const { device } = s.core;
+    const state = this.state!;
+    const { device } = state.core;
     const width = Math.max(1, source.width);
     const height = Math.max(1, source.height);
-    let tex = previous as GpuTexture | undefined;
-    if (tex && (tex.width !== width || tex.height !== height || tex.mipmaps !== mipmaps)) {
-      this.release(tex);
-      tex = undefined;
+    let texture = previous as GpuTexture | undefined;
+    if (
+      texture &&
+      (texture.width !== width || texture.height !== height || texture.mipmaps !== mipmaps)
+    ) {
+      this.release(texture);
+      texture = undefined;
     }
-    tex ??= this.createMediaTexture(s, width, height, mipmaps);
+    texture ??= this.createMediaTexture(state, width, height, mipmaps);
     device.queue.copyExternalImageToTexture(
       { source },
-      { texture: tex.texture, premultipliedAlpha: true },
+      { texture: texture.texture, premultipliedAlpha: true },
       [width, height],
     );
-    if (mipmaps) this.generateMipmaps(s, tex.texture);
-    return tex;
+    if (mipmaps) this.generateMipmaps(state, texture.texture);
+    return texture;
   }
 
   release(texture: TextureHandle): void {
@@ -507,21 +518,21 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
   }
 
   private createMediaTexture(
-    s: State,
+    state: State,
     width: number,
     height: number,
     mipmaps: boolean,
   ): GpuTexture {
-    const texture = s.core.device.createTexture({
+    const texture = state.core.device.createTexture({
       size: [width, height],
       format: MEDIA_FORMAT,
       mipLevelCount: mipmaps ? Math.floor(Math.log2(Math.max(width, height))) + 1 : 1,
       usage: TEXTURE_BINDING | TEXTURE_COPY_DST | TEXTURE_RENDER_ATTACHMENT,
     });
-    const bindGroup = s.core.device.createBindGroup({
-      layout: s.core.textureLayout,
+    const bindGroup = state.core.device.createBindGroup({
+      layout: state.core.textureLayout,
       entries: [
-        { binding: 0, resource: mipmaps ? s.core.mipSampler : s.core.linearSampler },
+        { binding: 0, resource: mipmaps ? state.core.mipSampler : state.core.linearSampler },
         { binding: 1, resource: texture.createView() },
       ],
     });
@@ -529,14 +540,14 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
   }
 
   /** Each level is the previous one downsampled with linear filtering (a 2x2 box). */
-  private generateMipmaps(s: State, texture: GPUTexture): void {
-    const { device } = s.core;
+  private generateMipmaps(state: State, texture: GPUTexture): void {
+    const { device } = state.core;
     const encoder = device.createCommandEncoder();
     for (let level = 1; level < texture.mipLevelCount; level++) {
       const group = device.createBindGroup({
-        layout: s.core.textureLayout,
+        layout: state.core.textureLayout,
         entries: [
-          { binding: 0, resource: s.core.linearSampler },
+          { binding: 0, resource: state.core.linearSampler },
           {
             binding: 1,
             resource: texture.createView({ baseMipLevel: level - 1, mipLevelCount: 1 }),
@@ -552,7 +563,7 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
           },
         ],
       });
-      pass.setPipeline(s.core.mipmap);
+      pass.setPipeline(state.core.mipmap);
       pass.setBindGroup(0, group);
       pass.draw(3);
       pass.end();
@@ -562,19 +573,19 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
 
   // --- Setup and loss ---------------------------------------------------------------
 
-  private init(core: Core): State {
+  private initialize(core: Core): State {
     const { device } = core;
-    this.context.configure({
+    this.canvasContext.configure({
       device,
       format: core.format,
-      alphaMode: this.ctx.transparent ? 'premultiplied' : 'opaque',
+      alphaMode: this.context.transparent ? 'premultiplied' : 'opaque',
     });
-    device.addEventListener('uncapturederror', (e) => {
+    device.addEventListener('uncapturederror', (event) => {
       if (this.errorLogged) return;
       this.errorLogged = true;
-      console.error('apeiro: WebGPU error', (e as GPUUncapturedErrorEvent).error.message);
+      console.error('apeiro: WebGPU error', (event as GPUUncapturedErrorEvent).error.message);
     });
-    void device.lost.then((info) => this.onDeviceLost(device, info));
+    void device.lost.then((reason) => this.onDeviceLost(device, reason));
 
     const frameBuffer = device.createBuffer({
       size: FRAME_UNIFORM_BYTES,
@@ -609,19 +620,19 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
     };
     state.emptyTexture = this.createMediaTexture(state, 1, 1, false);
     // Everything must go to the new GPU objects.
-    this.ctx.store.markFull();
-    this.ctx.lineLayer.markUploadAll();
-    this.ctx.textLayer.markUploadAll();
-    this.ctx.sdfAtlas.markFullUpload();
-    this.ctx.colorAtlas.markFullUpload();
+    this.context.store.markFull();
+    this.context.lineLayer.markUploadAll();
+    this.context.textLayer.markUploadAll();
+    this.context.sdfAtlas.markFullUpload();
+    this.context.colorAtlas.markFullUpload();
     return state;
   }
 
-  private onDeviceLost(device: GPUDevice, info: GPUDeviceLostInfo): void {
+  private onDeviceLost(device: GPUDevice, reason: GPUDeviceLostInfo): void {
     if (this.destroyed || this.state?.core.device !== device) return;
-    console.warn('apeiro: WebGPU device lost, recreating it', info.message);
+    console.warn('apeiro: WebGPU device lost, recreating it', reason.message);
     this.state = null;
-    this.ctx.onLost();
+    this.context.onLost();
     void this.recover();
   }
 
@@ -634,78 +645,80 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
           core.device.destroy();
           return;
         }
-        this.state = this.init(core);
-        this.ctx.onRestored();
+        this.state = this.initialize(core);
+        this.context.onRestored();
         return;
-      } catch (e) {
-        console.error('apeiro: WebGPU device could not be recreated', e);
+      } catch (error) {
+        console.error('apeiro: WebGPU device could not be recreated', error);
       }
     }
   }
 
   // --- Uploads ----------------------------------------------------------------------
 
-  private uploadShapes(s: State): void {
-    const store = this.ctx.store;
+  private uploadShapes(state: State): void {
+    const store = this.context.store;
     const dirty = store.takeDirty();
     if (dirty.kind === 'none') return;
-    const { device } = s.core;
+    const { device } = state.core;
     const data = store.data;
-    if (dirty.kind === 'all' || store.capacity !== s.shapeCapacity || !s.shapes.buffer) {
+    if (dirty.kind === 'all' || store.capacity !== state.shapeCapacity || !state.shapes.buffer) {
       const size = Math.max(4, data.byteLength);
-      if (!s.shapes.buffer || s.shapes.bytes < size) {
-        s.shapes.buffer?.destroy();
-        s.shapes.buffer = device.createBuffer({ size, usage: BUFFER_VERTEX | BUFFER_COPY_DST });
-        s.shapes.bytes = size;
+      if (!state.shapes.buffer || state.shapes.bytes < size) {
+        state.shapes.buffer?.destroy();
+        state.shapes.buffer = device.createBuffer({ size, usage: BUFFER_VERTEX | BUFFER_COPY_DST });
+        state.shapes.bytes = size;
       }
-      if (data.byteLength > 0) device.queue.writeBuffer(s.shapes.buffer, 0, data);
-      s.shapeCapacity = store.capacity;
+      if (data.byteLength > 0) device.queue.writeBuffer(state.shapes.buffer, 0, data);
+      state.shapeCapacity = store.capacity;
       this.uploadedBytes += data.byteLength;
       return;
     }
     for (const [offset, length] of byteRuns(dirty, false, store.count, INSTANCE_STRIDE)) {
-      device.queue.writeBuffer(s.shapes.buffer, offset, data, offset, length);
+      device.queue.writeBuffer(state.shapes.buffer, offset, data, offset, length);
       this.uploadedBytes += length;
     }
   }
 
   /** Returns true when the texture was replaced (its bind group must be recreated). */
   private uploadAtlas(
-    s: State,
+    state: State,
     atlas: GlyphAtlas,
-    tex: AtlasTexture,
+    texture: AtlasTexture,
     format: GPUTextureFormat,
   ): boolean {
     const uploads = atlas.takeUploads();
     const size = atlas.size;
-    const resized = tex.size !== size;
-    if (!resized && !uploads.full && uploads.rects.length === 0) return false;
-    const { device } = s.core;
+    const resized = texture.size !== size;
+    if (!resized && !uploads.full && uploads.rectangles.length === 0) return false;
+    const { device } = state.core;
     if (resized) {
-      tex.texture.destroy();
-      tex.texture = device.createTexture({
+      texture.texture.destroy();
+      texture.texture = device.createTexture({
         size: [size, size],
         format,
         usage: TEXTURE_BINDING | TEXTURE_COPY_DST,
       });
-      tex.size = size;
+      texture.size = size;
     }
-    const c = atlas.channels;
+    const channels = atlas.channels;
     if (resized || uploads.full) {
-      device.queue.writeTexture({ texture: tex.texture }, atlas.data, { bytesPerRow: size * c }, [
-        size,
-        size,
-      ]);
+      device.queue.writeTexture(
+        { texture: texture.texture },
+        atlas.data,
+        { bytesPerRow: size * channels },
+        [size, size],
+      );
       this.uploadedBytes += atlas.data.byteLength;
     } else {
-      for (const r of uploads.rects) {
+      for (const upload of uploads.rectangles) {
         device.queue.writeTexture(
-          { texture: tex.texture, origin: [r.x, r.y] },
-          r.data,
-          { bytesPerRow: r.width * c },
-          [r.width, r.height],
+          { texture: texture.texture, origin: [upload.x, upload.y] },
+          upload.data,
+          { bytesPerRow: upload.width * channels },
+          [upload.width, upload.height],
         );
-        this.uploadedBytes += r.data.byteLength;
+        this.uploadedBytes += upload.data.byteLength;
       }
     }
     return resized;
@@ -716,9 +729,9 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
    * offsets): writes to a buffer all land before the frame's commands run, so one shared
    * uniform would leave every draw with the last value.
    */
-  private writeDrawUniforms(s: State, f: FrameParams): number[] {
-    const levels = f.grid?.levels ?? [];
-    const count = levels.length + f.media.length;
+  private writeDrawUniforms(state: State, frame: FrameParams): number[] {
+    const levels = frame.grid?.levels ?? [];
+    const count = levels.length + frame.media.length;
     if (count === 0) return [];
     const bytes = count * DRAW_UNIFORM_ALIGN;
     if (this.drawStaging.byteLength < bytes) this.drawStaging = new ArrayBuffer(bytes * 2);
@@ -731,27 +744,36 @@ class WebGpuBackend implements RenderBackend, MediaTextures {
       at += DRAW_UNIFORM_ALIGN;
     };
     for (const { spacing, fade } of levels) {
-      put([...f.grid!.color, spacing, fade, f.grid!.lines ? 1 : 0, 0]);
+      put([...frame.grid!.color, spacing, fade, frame.grid!.lines ? 1 : 0, 0]);
     }
-    for (const q of f.media) {
-      put([...q.rect, ...q.uv, q.rotation, q.depth, q.radius, q.texture ? 0 : 1]);
+    for (const quad of frame.media) {
+      put([
+        ...quad.box,
+        ...quad.textureCoordinates,
+        quad.rotation,
+        quad.depth,
+        quad.radius,
+        quad.texture ? 0 : 1,
+      ]);
     }
 
-    const { device } = s.core;
-    if (!s.draw.buffer || s.draw.bytes < bytes) {
-      s.draw.buffer?.destroy();
-      s.draw.bytes = Math.max(bytes * 2, DRAW_UNIFORM_ALIGN * 16);
-      s.draw.buffer = device.createBuffer({
-        size: s.draw.bytes,
+    const { device } = state.core;
+    if (!state.draw.buffer || state.draw.bytes < bytes) {
+      state.draw.buffer?.destroy();
+      state.draw.bytes = Math.max(bytes * 2, DRAW_UNIFORM_ALIGN * 16);
+      state.draw.buffer = device.createBuffer({
+        size: state.draw.bytes,
         usage: BUFFER_UNIFORM | BUFFER_COPY_DST,
       });
-      s.drawGroup = device.createBindGroup({
-        layout: s.core.drawLayout,
+      state.drawGroup = device.createBindGroup({
+        layout: state.core.drawLayout,
         // Each draw sees one slot of the buffer.
-        entries: [{ binding: 0, resource: { buffer: s.draw.buffer, size: DRAW_UNIFORM_ALIGN } }],
+        entries: [
+          { binding: 0, resource: { buffer: state.draw.buffer, size: DRAW_UNIFORM_ALIGN } },
+        ],
       });
     }
-    device.queue.writeBuffer(s.draw.buffer, 0, this.drawStaging, 0, bytes);
+    device.queue.writeBuffer(state.draw.buffer, 0, this.drawStaging, 0, bytes);
     return offsets;
   }
 }

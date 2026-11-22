@@ -9,7 +9,7 @@ export interface RasterGlyph {
   top: number;
 }
 
-export interface GlyphInfo {
+export interface AtlasGlyph {
   /** Atlas position in texels. */
   x: number;
   y: number;
@@ -50,13 +50,13 @@ const PADDING = 1; // texels between glyphs to avoid bleeding under linear filte
 export class GlyphAtlas {
   readonly channels: 1 | 4;
   private readonly maxSize: number;
-  private glyphs = new Map<string, GlyphInfo>();
+  private glyphs = new Map<string, AtlasGlyph>();
   private _size: number;
   private _data: Uint8Array;
   private _generation = 0;
   private shelfX = 0;
   private shelfY = 0;
-  private shelfH = 0;
+  private shelfHeight = 0;
   private uploads: AtlasUpload[] = [];
   private fullUpload = true;
 
@@ -81,16 +81,27 @@ export class GlyphAtlas {
     return this.glyphs.size;
   }
 
-  peek(key: string): GlyphInfo | undefined {
+  peek(key: string): AtlasGlyph | undefined {
     return this.glyphs.get(key);
+  }
+
+  /**
+   * Whether a `width` x `height` bitmap fits in the space left, without growing or resetting
+   * the atlas (both make every glyph position written so far stale).
+   */
+  hasRoom(width: number, height: number): boolean {
+    if (width + PADDING > this._size) return false;
+    const newShelf = this.shelfX + width + PADDING > this._size;
+    const top = newShelf ? this.shelfY + this.shelfHeight + PADDING : this.shelfY;
+    return top + height + PADDING <= this._size;
   }
 
   /**
    * Stores a bitmap under `key`. May grow the atlas, or reset it when full
    * (check `generation`). Returns the stored position.
    */
-  insert(key: string, raster: RasterGlyph, rasterSize: number): GlyphInfo {
-    const info: GlyphInfo = {
+  insert(key: string, raster: RasterGlyph, rasterSize: number): AtlasGlyph {
+    const glyph: AtlasGlyph = {
       x: 0,
       y: 0,
       width: raster.width,
@@ -103,23 +114,23 @@ export class GlyphAtlas {
     // A cluster that can't fit even an empty atlas (e.g. hundreds of stacked combining marks)
     // is stored as empty: text comes from users, it must never break rendering.
     if (fits && raster.width > 0 && raster.height > 0 && raster.data.length > 0) {
-      const pos = this.allocate(raster.width, raster.height);
-      info.x = pos.x;
-      info.y = pos.y;
-      this.blit(info.x, info.y, raster.width, raster.height, raster.data);
+      const position = this.allocate(raster.width, raster.height);
+      glyph.x = position.x;
+      glyph.y = position.y;
+      this.blit(glyph.x, glyph.y, raster.width, raster.height, raster.data);
     } else {
-      info.width = 0; // whitespace, unsupported or oversized: nothing to draw
-      info.height = 0;
+      glyph.width = 0; // whitespace, unsupported or oversized: nothing to draw
+      glyph.height = 0;
     }
-    this.glyphs.set(key, info);
-    return info;
+    this.glyphs.set(key, glyph);
+    return glyph;
   }
 
   /** Drops all glyphs, e.g. after a web font finished loading. */
   reset(): void {
     this.glyphs.clear();
     this._data.fill(0);
-    this.shelfX = this.shelfY = this.shelfH = 0;
+    this.shelfX = this.shelfY = this.shelfHeight = 0;
     this._generation++;
     this.uploads = [];
     this.fullUpload = true;
@@ -132,41 +143,41 @@ export class GlyphAtlas {
   }
 
   /** Pending texture updates since the last call. `full` means re-upload the whole texture. */
-  takeUploads(): { full: boolean; rects: AtlasUpload[] } {
-    const result = { full: this.fullUpload, rects: this.fullUpload ? [] : this.uploads };
+  takeUploads(): { full: boolean; rectangles: AtlasUpload[] } {
+    const result = { full: this.fullUpload, rectangles: this.fullUpload ? [] : this.uploads };
     this.uploads = [];
     this.fullUpload = false;
     return result;
   }
 
-  private allocate(w: number, h: number): { x: number; y: number } {
-    if (w + PADDING > this.maxSize || h + PADDING > this.maxSize) {
-      throw new Error(`Glyph ${w}x${h} does not fit an atlas of ${this.maxSize}`);
+  private allocate(width: number, height: number): { x: number; y: number } {
+    if (width + PADDING > this.maxSize || height + PADDING > this.maxSize) {
+      throw new Error(`Glyph ${width}x${height} does not fit an atlas of ${this.maxSize}`);
     }
-    if (this.shelfX + w + PADDING > this._size) {
-      this.shelfY += this.shelfH + PADDING;
+    if (this.shelfX + width + PADDING > this._size) {
+      this.shelfY += this.shelfHeight + PADDING;
       this.shelfX = 0;
-      this.shelfH = 0;
+      this.shelfHeight = 0;
     }
-    if (this.shelfY + h + PADDING > this._size) {
+    if (this.shelfY + height + PADDING > this._size) {
       if (this._size < this.maxSize) this.grow();
       else this.reset(); // full at max size: start over, consumers rebuild via `generation`
-      return this.allocate(w, h);
+      return this.allocate(width, height);
     }
-    const pos = { x: this.shelfX, y: this.shelfY };
-    this.shelfX += w + PADDING;
-    this.shelfH = Math.max(this.shelfH, h);
-    return pos;
+    const position = { x: this.shelfX, y: this.shelfY };
+    this.shelfX += width + PADDING;
+    this.shelfHeight = Math.max(this.shelfHeight, height);
+    return position;
   }
 
   /** Doubles width and height; existing glyph positions stay valid. */
   private grow(): void {
-    const c = this.channels;
+    const channels = this.channels;
     const next = this._size * 2;
-    const data = new Uint8Array(next * next * c);
-    const rowBytes = this._size * c;
+    const data = new Uint8Array(next * next * channels);
+    const rowBytes = this._size * channels;
     for (let row = 0; row < this._size; row++) {
-      data.set(this._data.subarray(row * rowBytes, (row + 1) * rowBytes), row * next * c);
+      data.set(this._data.subarray(row * rowBytes, (row + 1) * rowBytes), row * next * channels);
     }
     this._size = next;
     this._data = data;
@@ -177,25 +188,25 @@ export class GlyphAtlas {
   private blit(
     x: number,
     y: number,
-    w: number,
-    h: number,
-    src: Uint8ClampedArray | Uint8Array,
+    width: number,
+    height: number,
+    source: Uint8ClampedArray | Uint8Array,
   ): void {
-    const c = this.channels;
-    const rowBytes = w * c;
-    for (let row = 0; row < h; row++) {
+    const channels = this.channels;
+    const rowBytes = width * channels;
+    for (let row = 0; row < height; row++) {
       this._data.set(
-        src.subarray(row * rowBytes, (row + 1) * rowBytes),
-        ((y + row) * this._size + x) * c,
+        source.subarray(row * rowBytes, (row + 1) * rowBytes),
+        ((y + row) * this._size + x) * channels,
       );
     }
     if (!this.fullUpload) {
       this.uploads.push({
         x,
         y,
-        width: w,
-        height: h,
-        data: new Uint8Array(src.buffer, src.byteOffset, w * h * c),
+        width: width,
+        height: height,
+        data: new Uint8Array(source.buffer, source.byteOffset, width * height * channels),
       });
     }
   }

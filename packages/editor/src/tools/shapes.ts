@@ -1,18 +1,10 @@
-import {
-  hexColor,
-  type Scene,
-  type ShapeElement,
-  type ShapeKind,
-  type Vec2,
-  type LineDash,
-} from '@apeiro/core';
-import { newId } from '../ids';
+import { hexColor, type LineDash, type ShapeKind } from '@apeiro/core';
 
 /** What the "add shape" buttons create. */
 export interface ShapePreset {
   type: Extract<ShapeKind, 'rect' | 'ellipse' | 'polygon'>;
-  w: number;
-  h: number;
+  width: number;
+  height: number;
   sides?: number;
   fill: number;
   stroke: number;
@@ -22,37 +14,57 @@ export interface ShapePreset {
 }
 
 /**
+ * Size of a new sticky note (as in Miro) and of a new shape's box: shapes come as big as
+ * stickies.
+ * Polygons fit in the same square, keeping their own proportions.
+ */
+export const ELEMENT_SIZE = 180;
+
+/** Corner radius of a new sticky note and of new rectangles and polygons: all alike. */
+export const CORNER_RADIUS = 8;
+
+/** A new sticky note: Miro's classic light yellow, without a border. */
+export const STICKY_STYLE = Object.freeze({
+  width: ELEMENT_SIZE,
+  height: ELEMENT_SIZE,
+  fill: hexColor('#fff9b1'),
+  stroke: 0,
+  strokeWidth: 0,
+  radius: CORNER_RADIUS,
+});
+
+/**
  * New shapes look like the design's Canvas Block: white (color/background), a 1.5px border
- * in color/foreground; rectangles are 120×120 squares (as big as the circle) with radius/sm
- * (8) corners.
+ * in color/foreground; rectangles are squares (as big as the circle). Corners, polygons'
+ * too, are rounded by radius/sm (CORNER_RADIUS).
  */
 const BLOCK = { fill: hexColor('#ffffff'), stroke: hexColor('#18181b'), strokeWidth: 1.5 };
 
 export const SHAPE_PRESETS = {
-  rect: { type: 'rect', w: 120, h: 120, radius: 8, ...BLOCK },
-  ellipse: { type: 'ellipse', w: 120, h: 120, radius: 0, ...BLOCK },
-  triangle: { type: 'polygon', sides: 3, w: 132, h: 114, radius: 0, ...BLOCK },
-  polygon: { type: 'polygon', sides: 5, w: 126, h: 120, radius: 0, ...BLOCK },
+  rect: {
+    type: 'rect',
+    width: ELEMENT_SIZE,
+    height: ELEMENT_SIZE,
+    radius: CORNER_RADIUS,
+    ...BLOCK,
+  },
+  ellipse: { type: 'ellipse', width: ELEMENT_SIZE, height: ELEMENT_SIZE, radius: 0, ...BLOCK },
+  // Equilateral: as tall as √3/2 of its width.
+  triangle: {
+    type: 'polygon',
+    sides: 3,
+    width: ELEMENT_SIZE,
+    height: Math.round((ELEMENT_SIZE * Math.sqrt(3)) / 2),
+    radius: CORNER_RADIUS,
+    ...BLOCK,
+  },
+  // Regular pentagon: 0.951 as tall as wide.
+  polygon: {
+    type: 'polygon',
+    sides: 5,
+    width: ELEMENT_SIZE,
+    height: Math.round(ELEMENT_SIZE * 0.951),
+    radius: CORNER_RADIUS,
+    ...BLOCK,
+  },
 } satisfies Record<string, ShapePreset>;
-
-/** A new shape centered at `center`, above everything else. */
-export function createShape(scene: Scene, preset: ShapePreset, center: Vec2): ShapeElement {
-  const el: ShapeElement = {
-    id: newId('s'),
-    type: preset.type,
-    x: center.x - preset.w / 2,
-    y: center.y - preset.h / 2,
-    w: preset.w,
-    h: preset.h,
-    rotation: 0,
-    z: scene.maxZ() + 1,
-    fill: preset.fill,
-    stroke: preset.stroke,
-    strokeWidth: preset.strokeWidth,
-    ...(preset.strokeStyle !== undefined ? { strokeStyle: preset.strokeStyle } : {}),
-    radius: preset.radius,
-    ...(preset.sides !== undefined ? { sides: preset.sides } : {}),
-  };
-  scene.add(el);
-  return el;
-}

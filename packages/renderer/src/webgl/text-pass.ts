@@ -1,8 +1,13 @@
-import { uploadInstances } from '../layers/buffer-upload';
-import { compileProgram, uniforms } from './gl-utils';
+import { GLYPH_LAYOUT, GLYPH_STRIDE, type TextLayer } from '../layers/text-layer';
 import type { GlyphAtlas } from '../text/glyph-atlas';
+import {
+  bindInstanceAttributes,
+  compileProgram,
+  createUnitQuad,
+  uniforms,
+  uploadInstances,
+} from './gl-utils';
 import { TEXT_FRAGMENT, TEXT_VERTEX } from './shaders';
-import { GLYPH_STRIDE, type TextLayer } from '../layers/text-layer';
 
 interface AtlasTexture {
   texture: WebGLTexture;
@@ -17,15 +22,15 @@ interface Resources {
   instanceBytes: number;
   sdf: AtlasTexture;
   color: AtlasTexture;
-  u: Record<
-    'u_camera' | 'u_viewport' | 'u_sdf' | 'u_colorAtlas' | 'u_edge',
+  uniforms: Record<
+    'u_camera' | 'u_viewport' | 'u_pixelRatio' | 'u_sdf' | 'u_colorAtlas' | 'u_edge',
     WebGLUniformLocation | null
   >;
 }
 
 /** GL side of text: owns the atlas textures and the quad instance buffer. */
 export class TextPass {
-  private res: Resources | null = null;
+  private resources: Resources | null = null;
   uploadedBytes = 0;
 
   constructor(
@@ -38,34 +43,20 @@ export class TextPass {
   ) {}
 
   /** (Re)creates GL objects; safe to call after a context restore. */
-  init(): void {
+  initialize(): void {
     const gl = this.gl;
     const program = compileProgram(gl, TEXT_VERTEX, TEXT_FRAGMENT);
     const vao = gl.createVertexArray()!;
     gl.bindVertexArray(vao);
 
-    const quad = gl.createBuffer()!;
-    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-
+    const quad = createUnitQuad(gl);
     const instances = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, instances);
-    const attr = (loc: number, size: number, type: number, normalized: boolean, offset: number) => {
-      gl.enableVertexAttribArray(loc);
-      gl.vertexAttribPointer(loc, size, type, normalized, GLYPH_STRIDE, offset);
-      gl.vertexAttribDivisor(loc, 1);
-    };
-    attr(1, 4, gl.FLOAT, false, 0);
-    attr(2, 4, gl.FLOAT, false, 16);
-    attr(3, 4, gl.FLOAT, false, 32);
-    attr(4, 1, gl.FLOAT, false, 48);
-    attr(5, 4, gl.UNSIGNED_BYTE, true, 52);
+    bindInstanceAttributes(gl, GLYPH_LAYOUT);
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    this.res = {
+    this.resources = {
       program,
       vao,
       quad,
@@ -73,9 +64,10 @@ export class TextPass {
       instanceBytes: 0,
       sdf: { texture: this.createTexture(), size: 0 },
       color: { texture: this.createTexture(), size: 0 },
-      u: uniforms(gl, program, [
+      uniforms: uniforms(gl, program, [
         'u_camera',
         'u_viewport',
+        'u_pixelRatio',
         'u_sdf',
         'u_colorAtlas',
         'u_edge',
@@ -89,45 +81,53 @@ export class TextPass {
 
   /** Forget GL objects without deleting them (they died with a lost context). */
   lose(): void {
-    this.res = null;
+    this.resources = null;
   }
 
-  draw(x: number, y: number, zoom: number, viewportW: number, viewportH: number): void {
-    const res = this.res;
-    if (!res) return;
+  draw(
+    x: number,
+    y: number,
+    zoom: number,
+    viewportWidth: number,
+    viewportHeight: number,
+    pixelRatio: number,
+  ): void {
+    const resources = this.resources;
+    if (!resources) return;
     const gl = this.gl;
-    this.uploadAtlas(this.sdfAtlas, res.sdf);
-    this.uploadAtlas(this.colorAtlas, res.color);
-    this.uploadInstances(res);
+    this.uploadAtlas(this.sdfAtlas, resources.sdf);
+    this.uploadAtlas(this.colorAtlas, resources.color);
+    this.uploadInstances(resources);
     if (this.layer.count === 0) return;
 
-    gl.useProgram(res.program);
-    gl.uniform3f(res.u.u_camera, x, y, zoom);
-    gl.uniform2f(res.u.u_viewport, viewportW, viewportH);
-    gl.uniform1f(res.u.u_edge, this.edge);
+    gl.useProgram(resources.program);
+    gl.uniform3f(resources.uniforms.u_camera, x, y, zoom);
+    gl.uniform2f(resources.uniforms.u_viewport, viewportWidth, viewportHeight);
+    gl.uniform1f(resources.uniforms.u_pixelRatio, pixelRatio);
+    gl.uniform1f(resources.uniforms.u_edge, this.edge);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, res.sdf.texture);
-    gl.uniform1i(res.u.u_sdf, 0);
+    gl.bindTexture(gl.TEXTURE_2D, resources.sdf.texture);
+    gl.uniform1i(resources.uniforms.u_sdf, 0);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, res.color.texture);
-    gl.uniform1i(res.u.u_colorAtlas, 1);
-    gl.bindVertexArray(res.vao);
+    gl.bindTexture(gl.TEXTURE_2D, resources.color.texture);
+    gl.uniform1i(resources.uniforms.u_colorAtlas, 1);
+    gl.bindVertexArray(resources.vao);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.layer.count);
     gl.bindVertexArray(null);
     gl.activeTexture(gl.TEXTURE0);
   }
 
   dispose(): void {
-    const res = this.res;
-    if (!res) return;
+    const resources = this.resources;
+    if (!resources) return;
     const gl = this.gl;
-    gl.deleteProgram(res.program);
-    gl.deleteVertexArray(res.vao);
-    gl.deleteBuffer(res.quad);
-    gl.deleteBuffer(res.instances);
-    gl.deleteTexture(res.sdf.texture);
-    gl.deleteTexture(res.color.texture);
-    this.res = null;
+    gl.deleteProgram(resources.program);
+    gl.deleteVertexArray(resources.vao);
+    gl.deleteBuffer(resources.quad);
+    gl.deleteBuffer(resources.instances);
+    gl.deleteTexture(resources.sdf.texture);
+    gl.deleteTexture(resources.color.texture);
+    this.resources = null;
   }
 
   private createTexture(): WebGLTexture {
@@ -154,15 +154,15 @@ export class TextPass {
     return texture;
   }
 
-  private uploadAtlas(atlas: GlyphAtlas, tex: AtlasTexture): void {
+  private uploadAtlas(atlas: GlyphAtlas, texture: AtlasTexture): void {
     const gl = this.gl;
     const uploads = atlas.takeUploads();
-    const full = uploads.full || tex.size !== atlas.size;
-    if (!full && uploads.rects.length === 0) return;
-    const rgba = atlas.channels === 4;
-    const internal = rgba ? gl.RGBA8 : gl.R8;
-    const format = rgba ? gl.RGBA : gl.RED;
-    gl.bindTexture(gl.TEXTURE_2D, tex.texture);
+    const full = uploads.full || texture.size !== atlas.size;
+    if (!full && uploads.rectangles.length === 0) return;
+    const isColor = atlas.channels === 4;
+    const internal = isColor ? gl.RGBA8 : gl.R8;
+    const format = isColor ? gl.RGBA : gl.RED;
+    gl.bindTexture(gl.TEXTURE_2D, texture.texture);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     if (full) {
       const size = atlas.size;
@@ -177,31 +177,31 @@ export class TextPass {
         gl.UNSIGNED_BYTE,
         atlas.data,
       );
-      tex.size = size;
+      texture.size = size;
       this.uploadedBytes += atlas.data.byteLength;
     } else {
-      for (const r of uploads.rects) {
+      for (const upload of uploads.rectangles) {
         gl.texSubImage2D(
           gl.TEXTURE_2D,
           0,
-          r.x,
-          r.y,
-          r.width,
-          r.height,
+          upload.x,
+          upload.y,
+          upload.width,
+          upload.height,
           format,
           gl.UNSIGNED_BYTE,
-          r.data,
+          upload.data,
         );
-        this.uploadedBytes += r.data.byteLength;
+        this.uploadedBytes += upload.data.byteLength;
       }
     }
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
-  private uploadInstances(res: Resources): void {
+  private uploadInstances(resources: Resources): void {
     this.uploadedBytes += uploadInstances(
       this.gl,
-      res,
+      resources,
       this.layer.data,
       this.layer.count,
       GLYPH_STRIDE,

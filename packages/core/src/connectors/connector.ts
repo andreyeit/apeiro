@@ -1,11 +1,13 @@
 import { elementBounds, type ShapeElement } from '../elements/element';
-import type { Box, Vec2 } from '../geometry/math';
-import { autoControls, bendPoint, bezierMid, chord, curvePoints } from './curve';
-import { elbowLayout, elbowPoints, type ObstacleQuery, routeCrossesAny, simplify } from './elbow';
-import { clearBorder, isFloating, resolveEnd, resolveEnds } from './ends';
+import { boxOfPoints, inflateBox, type Box } from '../geometry/box';
+import { localToWorld, worldToLocal } from '../geometry/frame';
+import { distanceToSegment, midpoint, normalize, subtract, type Vec2 } from '../geometry/vector';
 import { anchorOf } from './anchors';
-import { norm, projectToOutline, sub, toLocal, toWorld, type ResolvedEnd } from './local-geometry';
-import { type ConnectorArc, roundCornersWithArcs } from './rounding';
+import { autoControls, bendPoint, bezierMiddle, chord, curvePoints } from './curve';
+import { elbowLayout, elbowPoints, routeCrossesAny, simplify, type ObstacleQuery } from './elbow';
+import { clearBorder, isFloating, resolveEnd, resolveEnds } from './ends';
+import { projectToOutline, type ResolvedEnd } from './local-geometry';
+import { roundCornersWithArcs, type ConnectorArc } from './rounding';
 import {
   capSize,
   type ConnectorElement,
@@ -14,89 +16,48 @@ import {
   type ConnectorHandle,
 } from './types';
 
+type ShapeLookup = (id: string) => ShapeElement | undefined;
+
+/** The route-specific part of a connector's geometry. */
+interface Route {
+  points: Vec2[];
+  handle: ConnectorHandle | null;
+  routed: boolean;
+  /** Elbows with rounded bends: the orthogonal polyline before rounding. */
+  path?: Vec2[];
+  arcs: ConnectorArc[];
+}
+
 /**
  * Computes a connector's polyline from its ends. Returns null if an attached shape
  * is missing (e.g. deleted concurrently): such connectors are not drawn.
  */
 export function resolveConnector(
-  c: ConnectorElement,
-  getShape: (id: string) => ShapeElement | undefined,
+  connector: ConnectorElement,
+  getShape: ShapeLookup,
   /** Other shapes to route elbows around; without it only the connected shapes are avoided. */
   findObstacles?: ObstacleQuery,
 ): ConnectorGeometry | null {
-  const ends = resolveEnds(c, getShape);
+  const ends = resolveEnds(connector, getShape);
   if (!ends) return null;
-  const [a, b] = ends;
-
-  let points: Vec2[];
-  let handle: ConnectorHandle | null;
-  let routed = false;
-  let path: Vec2[] | undefined;
-  let arcs: ConnectorArc[] = [];
-  if (c.route === 'elbow') {
-    const box = (end: ConnectorEnd) => {
-      const s = end.kind === 'element' ? getShape(end.id) : undefined;
-      return s && elementBounds(s);
-    };
-    ({ points, handle, routed } = elbowPoints(
-      a,
-      b,
-      c.elbowAt,
-      box(c.start),
-      box(c.end),
-      findObstacles,
-    ));
-    if ((c.cornerRadius ?? 0) > 0) {
-      path = points;
-      ({ points, arcs } = roundCornersWithArcs(points, c.cornerRadius!));
-    }
-  } else if (c.route === 'curve') {
-    if (c.curve) {
-      // The bend point is defined against the unbent ends; then floating ends slide
-      // along their outlines to face it, so the line bulges as one smooth arc.
-      const m = bendPoint(a, b, c.curve);
-      const slide = (end: ConnectorEnd, fallback: ResolvedEnd) => {
-        const r = resolveEnd(end, m, 'curve', getShape);
-        return r ? clearBorder(c, end, r, getShape) : fallback;
-      };
-      const a2 = isFloating(c.start) ? slide(c.start, a) : a;
-      const b2 = isFloating(c.end) ? slide(c.end, b) : b;
-      points = curvePoints(a2, b2, m);
-      handle = { point: m, kind: 'curve' };
-    } else {
-      points = curvePoints(a, b);
-      handle = { point: bendPoint(a, b), kind: 'curve' };
-    }
-  } else {
-    points = simplify([a.p, b.p]);
-    // Dragging the middle of a straight line turns it into a curve.
-    handle = { point: { x: (a.p.x + b.p.x) / 2, y: (a.p.y + b.p.y) / 2 }, kind: 'curve' };
-  }
+  const [start, end] = ends;
+  const route =
+    connector.route === 'elbow'
+      ? elbowRoute(connector, start, end, getShape, findObstacles)
+      : connector.route === 'curve'
+        ? curveRoute(connector, start, end, getShape)
+        : straightRoute(start, end);
+  const { points, handle, routed, path, arcs } = route;
 
   const first = points[0]!;
   const last = points[points.length - 1]!;
-  const startDir = norm(sub(first, points[1]!));
-  const endDir = norm(sub(last, points[points.length - 2]!));
-
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const p of points) {
-    if (p.x < minX) minX = p.x;
-    if (p.y < minY) minY = p.y;
-    if (p.x > maxX) maxX = p.x;
-    if (p.y > maxY) maxY = p.y;
-  }
-  const pad = Math.max(
-    c.strokeWidth / 2,
-    c.startCap !== 'none' || c.endCap !== 'none' ? capSize(c.strokeWidth) : 0,
-  );
+  const hasCaps = connector.startCap !== 'none' || connector.endCap !== 'none';
+  const margin = Math.max(connector.strokeWidth / 2, hasCaps ? capSize(connector.strokeWidth) : 0);
   return {
     points,
-    startDir,
-    endDir,
-    bounds: { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad },
+    startDirection: normalize(subtract(first, points[1]!)),
+    endDirection: normalize(subtract(last, points[points.length - 2]!)),
+    bounds: inflateBox(boxOfPoints(points), margin),
     handle,
     routed,
     ...(path ? { path } : {}),
@@ -104,9 +65,74 @@ export function resolveConnector(
   };
 }
 
+function elbowRoute(
+  connector: ConnectorElement,
+  start: ResolvedEnd,
+  end: ResolvedEnd,
+  getShape: ShapeLookup,
+  findObstacles: ObstacleQuery | undefined,
+): Route {
+  const boxOf = (connectorEnd: ConnectorEnd) => {
+    const shape = connectorEnd.kind === 'element' ? getShape(connectorEnd.id) : undefined;
+    return shape && elementBounds(shape);
+  };
+  const elbow = elbowPoints(
+    start,
+    end,
+    connector.elbowAt,
+    boxOf(connector.start),
+    boxOf(connector.end),
+    findObstacles,
+  );
+  const radius = connector.cornerRadius ?? 0;
+  if (radius <= 0) return { ...elbow, arcs: [] };
+  const rounded = roundCornersWithArcs(elbow.points, radius);
+  return { ...elbow, points: rounded.points, path: elbow.points, arcs: rounded.arcs };
+}
+
+function curveRoute(
+  connector: ConnectorElement,
+  start: ResolvedEnd,
+  end: ResolvedEnd,
+  getShape: ShapeLookup,
+): Route {
+  if (!connector.curve) {
+    return {
+      points: curvePoints(start, end),
+      handle: { point: bendPoint(start, end), kind: 'curve' },
+      routed: false,
+      arcs: [],
+    };
+  }
+  // The bend point is defined against the unbent ends; then floating ends slide
+  // along their outlines to face it, so the line bulges as one smooth arc.
+  const bend = bendPoint(start, end, connector.curve);
+  const slide = (connectorEnd: ConnectorEnd, fallback: ResolvedEnd) => {
+    if (!isFloating(connectorEnd)) return fallback;
+    const resolved = resolveEnd(connectorEnd, bend, 'curve', getShape);
+    return resolved ? clearBorder(connector, connectorEnd, resolved, getShape) : fallback;
+  };
+  return {
+    points: curvePoints(slide(connector.start, start), slide(connector.end, end), bend),
+    handle: { point: bend, kind: 'curve' },
+    routed: false,
+    arcs: [],
+  };
+}
+
+function straightRoute(start: ResolvedEnd, end: ResolvedEnd): Route {
+  return {
+    points: simplify([start.point, end.point]),
+    // Dragging the middle of a straight line turns it into a curve.
+    handle: { point: midpoint(start.point, end.point), kind: 'curve' },
+    routed: false,
+    arcs: [],
+  };
+}
+
 /** Whether a resolved connector's line runs through a box (e.g. a shape that just moved). */
-export function connectorCrossesBox(g: ConnectorGeometry, box: Box): boolean {
-  return routeCrossesAny(g.path ?? g.points, [box]);
+export function connectorCrossesBox(geometry: ConnectorGeometry, box: Box): boolean {
+  return routeCrossesAny(geometry.path ?? geometry.points, [box]);
 }
 
 /**
@@ -115,25 +141,28 @@ export function connectorCrossesBox(g: ConnectorGeometry, box: Box): boolean {
  * elbows move their middle segment. Returns null if the route has no handle.
  */
 export function bendConnector(
-  c: ConnectorElement,
+  connector: ConnectorElement,
   world: Vec2,
-  getShape: (id: string) => ShapeElement | undefined,
+  getShape: ShapeLookup,
 ): Partial<Pick<ConnectorElement, 'route' | 'curve' | 'elbowAt'>> | null {
-  const route = c.route === 'straight' ? 'curve' : c.route;
-  const ends = resolveEnds({ ...c, route }, getShape);
+  const route = connector.route === 'straight' ? 'curve' : connector.route;
+  const ends = resolveEnds({ ...connector, route }, getShape);
   if (!ends) return null;
-  const [a, b] = ends;
+  const [start, end] = ends;
   if (route === 'curve') {
-    const [c0, c1] = autoControls(a, b);
-    const mid = bezierMid(a.p, c0, c1, b.p);
-    const { t, n, length } = chord(a, b);
-    const d = sub(world, mid);
+    const [startControl, endControl] = autoControls(start, end);
+    const middle = bezierMiddle(start.point, startControl, endControl, end.point);
+    const { tangent, normal, length } = chord(start, end);
+    const offset = subtract(world, middle);
     return {
       route,
-      curve: { along: (d.x * t.x + d.y * t.y) / length, across: (d.x * n.x + d.y * n.y) / length },
+      curve: {
+        along: (offset.x * tangent.x + offset.y * tangent.y) / length,
+        across: (offset.x * normal.x + offset.y * normal.y) / length,
+      },
     };
   }
-  const { bend } = elbowLayout(a, b, c.elbowAt);
+  const { bend } = elbowLayout(start, end, connector.elbowAt);
   if (!bend || Math.abs(bend.to - bend.from) < 1e-6) return null;
   const at = (world[bend.axis] - bend.from) / (bend.to - bend.from);
   return { elbowAt: Math.min(4, Math.max(-3, at)) };
@@ -147,60 +176,81 @@ export const resetBend = (): Pick<ConnectorElement, 'curve' | 'elbowAt'> => ({
 
 /** Patch that swaps start and end (caps stay, so arrows point the other way); the bend keeps its shape. */
 export function reverseConnector(
-  c: ConnectorElement,
+  connector: ConnectorElement,
 ): Pick<ConnectorElement, 'start' | 'end' | 'curve' | 'elbowAt'> {
   return {
-    start: c.end,
-    end: c.start,
-    curve: c.curve && { along: -c.curve.along, across: -c.curve.across },
-    elbowAt: c.elbowAt === undefined ? undefined : 1 - c.elbowAt,
+    start: connector.end,
+    end: connector.start,
+    curve: connector.curve && { along: -connector.curve.along, across: -connector.curve.across },
+    elbowAt: connector.elbowAt === undefined ? undefined : 1 - connector.elbowAt,
   };
 }
 
-function distToSegment(p: Vec2, a: Vec2, b: Vec2): number {
-  const abx = b.x - a.x;
-  const aby = b.y - a.y;
-  const l2 = abx * abx + aby * aby;
-  const t = l2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby) / l2)) : 0;
-  return Math.hypot(p.x - (a.x + abx * t), p.y - (a.y + aby * t));
-}
-
 /** Distance from a point to the connector's line (not counting stroke width). */
-export function distanceToConnector(g: ConnectorGeometry, p: Vec2): number {
+export function distanceToConnector(geometry: ConnectorGeometry, point: Vec2): number {
   let best = Infinity;
-  for (let i = 0; i + 1 < g.points.length; i++) {
-    best = Math.min(best, distToSegment(p, g.points[i]!, g.points[i + 1]!));
+  for (let index = 0; index + 1 < geometry.points.length; index++) {
+    best = Math.min(
+      best,
+      distanceToSegment(point, geometry.points[index]!, geometry.points[index + 1]!),
+    );
   }
   return best;
 }
 
 export function hitTestConnector(
-  c: ConnectorElement,
-  g: ConnectorGeometry,
-  p: Vec2,
+  connector: ConnectorElement,
+  geometry: ConnectorGeometry,
+  point: Vec2,
   tolerance = 0,
 ): boolean {
-  if (distanceToConnector(g, p) <= c.strokeWidth / 2 + tolerance) return true;
+  if (distanceToConnector(geometry, point) <= connector.strokeWidth / 2 + tolerance) return true;
   // Caps are wider than the line: count clicks inside their box too.
-  const size = capSize(c.strokeWidth);
-  const inCap = (tip: Vec2, dir: Vec2) => {
-    const dx = p.x - tip.x;
-    const dy = p.y - tip.y;
-    const back = -(dx * dir.x + dy * dir.y); // distance behind the tip
-    const side = Math.abs(dx * dir.y - dy * dir.x);
+  const size = capSize(connector.strokeWidth);
+  const inCap = (tip: Vec2, direction: Vec2) => {
+    const deltaX = point.x - tip.x;
+    const deltaY = point.y - tip.y;
+    const back = -(deltaX * direction.x + deltaY * direction.y); // distance behind the tip
+    const side = Math.abs(deltaX * direction.y - deltaY * direction.x);
     return back >= -tolerance && back <= size + tolerance && side <= size / 2 + tolerance;
   };
-  if (c.startCap !== 'none' && inCap(g.points[0]!, g.startDir)) return true;
-  return c.endCap !== 'none' && inCap(g.points[g.points.length - 1]!, g.endDir);
+  if (connector.startCap !== 'none' && inCap(geometry.points[0]!, geometry.startDirection))
+    return true;
+  return (
+    connector.endCap !== 'none' &&
+    inCap(geometry.points[geometry.points.length - 1]!, geometry.endDirection)
+  );
 }
 
 /** Ids of shapes a connector is attached to. */
-export function attachedIds(c: ConnectorElement): string[] {
-  const out: string[] = [];
-  if (c.start.kind === 'element') out.push(c.start.id);
-  if (c.end.kind === 'element' && !(c.start.kind === 'element' && c.start.id === c.end.id))
-    out.push(c.end.id);
-  return out;
+export function attachedIds(connector: ConnectorElement): string[] {
+  const ids: string[] = [];
+  if (connector.start.kind === 'element') ids.push(connector.start.id);
+  if (
+    connector.end.kind === 'element' &&
+    !(connector.start.kind === 'element' && connector.start.id === connector.end.id)
+  )
+    ids.push(connector.end.id);
+  return ids;
+}
+
+/**
+ * The connector with every end attached to a shape that `keep` rejects turned into a free
+ * end where it is drawn now, so the line looks the same without that shape (a copy or an
+ * export of part of the board). `geometry` is its current geometry (null: ends stay).
+ */
+export function detachEnds(
+  connector: ConnectorElement,
+  geometry: ConnectorGeometry | null,
+  keep: (shapeId: string) => boolean,
+): ConnectorElement {
+  const free = (end: ConnectorEnd, at: Vec2 | undefined): ConnectorEnd =>
+    end.kind === 'element' && !keep(end.id) && at ? { kind: 'point', x: at.x, y: at.y } : end;
+  const start = free(connector.start, geometry?.points[0]);
+  const end = free(connector.end, geometry?.points[geometry.points.length - 1]);
+  return start === connector.start && end === connector.end
+    ? connector
+    : { ...connector, start, end };
 }
 
 /**
@@ -210,22 +260,53 @@ export function attachedIds(c: ConnectorElement): string[] {
  * Returns null if nothing is floating (or the connector can't be resolved).
  */
 export function freezeConnectorEnds(
-  c: ConnectorElement,
-  getShape: (id: string) => ShapeElement | undefined,
+  connector: ConnectorElement,
+  getShape: ShapeLookup,
 ): Pick<ConnectorElement, 'start' | 'end'> | null {
-  if (!isFloating(c.start) && !isFloating(c.end)) return null;
-  const g = resolveConnector(c, getShape);
-  if (!g) return null;
+  if (!isFloating(connector.start) && !isFloating(connector.end)) return null;
+  const geometry = resolveConnector(connector, getShape);
+  if (!geometry) return null;
   const freeze = (end: ConnectorEnd, at: Vec2): ConnectorEnd => {
     if (end.kind !== 'element' || end.anchor) return end;
-    const s = getShape(end.id);
-    if (!s) return end;
+    const shape = getShape(end.id);
+    if (!shape) return end;
     // The end sits just outside the border: anchor at the outline point under it.
-    const local = projectToOutline(s, toLocal(s, at));
-    return { kind: 'element', id: end.id, anchor: anchorOf(s, toWorld(s, local)) };
+    const local = projectToOutline(shape, worldToLocal(shape, at));
+    return { kind: 'element', id: end.id, anchor: anchorOf(shape, localToWorld(shape, local)) };
   };
   return {
-    start: freeze(c.start, g.points[0]!),
-    end: freeze(c.end, g.points[g.points.length - 1]!),
+    start: freeze(connector.start, geometry.points[0]!),
+    end: freeze(connector.end, geometry.points[geometry.points.length - 1]!),
+  };
+}
+
+/** The same geometry moved by (`deltaX`, `deltaY`). */
+export function translateGeometry(
+  geometry: ConnectorGeometry,
+  deltaX: number,
+  deltaY: number,
+): ConnectorGeometry {
+  const move = (point: Vec2): Vec2 => ({ x: point.x + deltaX, y: point.y + deltaY });
+  const { bounds, handle, path, arcs } = geometry;
+  return {
+    ...geometry,
+    points: geometry.points.map(move),
+    bounds: {
+      minX: bounds.minX + deltaX,
+      minY: bounds.minY + deltaY,
+      maxX: bounds.maxX + deltaX,
+      maxY: bounds.maxY + deltaY,
+    },
+    handle: handle && { ...handle, point: move(handle.point) },
+    ...(path ? { path: path.map(move) } : {}),
+    ...(arcs
+      ? {
+          arcs: arcs.map((arc) => ({
+            ...arc,
+            centerX: arc.centerX + deltaX,
+            centerY: arc.centerY + deltaY,
+          })),
+        }
+      : {}),
   };
 }

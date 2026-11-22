@@ -1,4 +1,5 @@
 import {
+  newId,
   isShape,
   type CameraAnimator,
   type BoardElement,
@@ -8,12 +9,11 @@ import {
   type ConnectorEnd,
   type ElementPatch,
   type FontMeasurer,
-  type History,
   type Scene,
   type ShapeElement,
+  type UndoHistory,
   type Vec2,
 } from '@apeiro/core';
-import { newId } from '../ids';
 import type { Overlay } from '../overlay/overlay';
 import type { PlaceKind, ToolState } from '../tools/tool-state';
 import { MIN_DOT_SHAPE_PX } from './constants';
@@ -32,7 +32,7 @@ export interface ControlsHooks {
    * Undo history: each pointer gesture becomes one step (a drag is one move, not one per
    * pointermove), and Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y undo and redo.
    */
-  history?: Pick<History, 'beginGroup' | 'endGroup' | 'undo' | 'redo'>;
+  history?: Pick<UndoHistory, 'beginGroup' | 'endGroup' | 'undo' | 'redo'>;
   /**
    * Text tool: a click at `at` (world) makes auto-width text there, a drag a text box
    * `width` wide that wraps. The element is created by the host (it opens the editor).
@@ -67,15 +67,12 @@ export interface ControlsHooks {
   /** Shift+0 / Shift+1 / Shift+2 and Ctrl +/−: zoom to 100%, everything, the selection, or by a step. */
   zoom?: (to: 'reset' | 'fit' | 'selection' | 'in' | 'out') => void;
   /**
-   * Elements another participant is working on: they can't be selected (see
-   * `Overlay.isLocked`), erased, cropped, typed into or have their volume changed.
-   */
-  isLocked?: (id: string) => boolean;
-  /**
    * A read-only board: pan, zoom, select (to copy), open links and play audio, but nothing
    * that changes it — no handles, creating tools, moving, typing, deleting or undo.
    */
   readOnly?: () => boolean;
+  /** Elements reserved by another participant cannot be selected or edited. */
+  isLocked?: (id: string) => boolean;
   /**
    * Whether keyboard shortcuts are for this board. With several boards on a page, only the
    * one in use should react to Delete, Ctrl+Z and the tool keys. Default: always.
@@ -105,14 +102,29 @@ export interface Modifiers {
  * small helpers. One per `attachControls`; the gesture modules take it as their first argument.
  */
 export class InputContext {
-  mode: Mode = { kind: 'idle' };
+  private current: Mode = { kind: 'idle' };
+
+  /** The gesture in progress. Setting it also tells the overlay which line is being dragged. */
+  get mode(): Mode {
+    return this.current;
+  }
+
+  set mode(next: Mode) {
+    this.current = next;
+    const dragged = next.kind === 'connect' || next.kind === 'bend' ? next.id : null;
+    if (dragged !== this.overlay.dragging) {
+      this.overlay.dragging = dragged;
+      this.overlay.request();
+    }
+  }
+
   readonly modifiers: Modifiers = { shift: false, alt: false, deep: false };
   /** Last pointer position (element-local screen px), null before the first event. */
   pointer: Vec2 | null = null;
   spaceDown = false;
 
   constructor(
-    readonly el: HTMLElement,
+    readonly element: HTMLElement,
     readonly scene: Scene,
     readonly camera: Camera,
     readonly overlay: Overlay,
@@ -121,55 +133,53 @@ export class InputContext {
     readonly hooks: ControlsHooks,
   ) {}
 
-  locked(id: string): boolean {
-    return this.hooks.isLocked?.(id) ?? false;
-  }
-
   readOnly(): boolean {
     return this.hooks.readOnly?.() ?? false;
   }
 
-  /** Screen distance between screen point `a` and world point `worldB`. */
-  screenDist(a: Vec2, worldB: Vec2): number {
-    const b = this.camera.worldToScreen(worldB);
-    return Math.hypot(a.x - b.x, a.y - b.y);
+  isLocked(id: string): boolean {
+    return this.hooks.isLocked?.(id) ?? false;
   }
 
-  /** A world-space distance for `px` screen pixels at the current zoom. */
-  px(px: number): number {
-    return px / this.camera.zoom;
+  /** Screen distance between `screenPoint` and `worldPoint`. */
+  screenDistance(screenPoint: Vec2, worldPoint: Vec2): number {
+    const otherScreenPoint = this.camera.worldToScreen(worldPoint);
+    return Math.hypot(screenPoint.x - otherScreenPoint.x, screenPoint.y - otherScreenPoint.y);
   }
 
-  world(p: Vec2): Vec2 {
-    return this.camera.screenToWorld(p);
+  /** A world-space distance for `pixels` screen pixels at the current zoom. */
+  pixelsToWorld(pixels: number): number {
+    return pixels / this.camera.zoom;
+  }
+
+  world(point: Vec2): Vec2 {
+    return this.camera.screenToWorld(point);
   }
 
   getShape = (id: string): ShapeElement | undefined => {
-    const s = this.scene.get(id);
-    return s && isShape(s) ? s : undefined;
+    const shape = this.scene.get(id);
+    return shape && isShape(shape) ? shape : undefined;
   };
 
   /** Shapes large enough on screen to show connection dots (pen strokes never do). */
-  showsDots(s: ShapeElement): boolean {
-    return s.type !== 'ink' && Math.min(s.w, s.h) * this.camera.zoom >= MIN_DOT_SHAPE_PX;
+  showsDots(shape: ShapeElement): boolean {
+    return (
+      shape.type !== 'ink' &&
+      Math.min(shape.width, shape.height) * this.camera.zoom >= MIN_DOT_SHAPE_PX
+    );
   }
 
   /** Pen strokes aren't connection targets. */
   notConnectable = (id: string): boolean => this.scene.get(id)?.type === 'ink';
 
-  /** Shapes whose text can be typed into (not images, audio players or pen strokes). */
-  static editable(s: BoardElement | null | undefined): s is ShapeElement {
-    return !!s && isShape(s) && s.type !== 'image' && s.type !== 'audio' && s.type !== 'ink';
-  }
-
   /** Selected elements that still exist, as they are now. */
   selectedElements(): BoardElement[] {
-    const out: BoardElement[] = [];
+    const elements: BoardElement[] = [];
     for (const id of this.overlay.selection) {
-      const el = this.scene.get(id);
-      if (el) out.push(el);
+      const element = this.scene.get(id);
+      if (element) elements.push(element);
     }
-    return out;
+    return elements;
   }
 
   applyPatches(patches: Map<string, ElementPatch>): void {
@@ -181,7 +191,7 @@ export class InputContext {
   /** Adds a connector in the current connector style, on top; returns its id. */
   createConnector(start: ConnectorEnd, end: ConnectorEnd): string {
     const id = newId('c');
-    const c: ConnectorElement = {
+    const connector: ConnectorElement = {
       id,
       type: 'connector',
       z: this.scene.maxZ() + 1,
@@ -189,12 +199,12 @@ export class InputContext {
       end,
       ...this.tools.style,
     };
-    this.scene.add(c);
+    this.scene.add(connector);
     return id;
   }
 
   setCursor(cursor: string): void {
-    if (this.el.style.cursor !== cursor) this.el.style.cursor = cursor;
+    if (this.element.style.cursor !== cursor) this.element.style.cursor = cursor;
   }
 
   /** Hides the connection dots (and the highlighted one). */

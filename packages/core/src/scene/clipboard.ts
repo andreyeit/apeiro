@@ -1,9 +1,12 @@
-import type { ConnectorElement, ConnectorEnd } from '../connectors/types';
+import { detachEnds } from '../connectors/connector';
+import type { ConnectorEnd } from '../connectors/types';
 import { isConnector, type BoardElement } from '../elements/element';
+import { newId } from '../elements/ids';
 import { validateElement } from '../elements/validation';
-import type { Box, Vec2 } from '../geometry/math';
-import { compareZ, type Scene } from './scene';
+import type { Box } from '../geometry/box';
+import type { Vec2 } from '../geometry/vector';
 import { plainText } from '../text/text-block';
+import { compareZ, type Scene } from './scene';
 
 /** Elements copied from a board: plain JSON, safe to store, send or put on the system clipboard. */
 export interface BoardClipboard {
@@ -28,30 +31,24 @@ export function copyElements(scene: Scene, ids: Iterable<string>): BoardClipboar
   if (picked.size === 0) return null;
   // Lines between copied shapes come along (duplicating a diagram keeps its arrows).
   for (const id of [...picked]) {
-    for (const c of scene.connectorsOf(id)) {
-      const el = scene.get(c);
-      if (el && isConnector(el) && endIn(el.start, picked) && endIn(el.end, picked)) picked.add(c);
+    for (const connectorId of scene.connectorsOf(id)) {
+      const element = scene.get(connectorId);
+      if (
+        element &&
+        isConnector(element) &&
+        endIn(element.start, picked) &&
+        endIn(element.end, picked)
+      )
+        picked.add(connectorId);
     }
   }
   const elements: BoardElement[] = [];
   for (const id of picked) {
-    const el = scene.get(id)!;
-    if (!isConnector(el)) {
-      elements.push(structuredClone(el));
-      continue;
-    }
-    const g = scene.connectorGeometry(id);
-    const free = (end: ConnectorEnd, at: Vec2 | undefined): ConnectorEnd =>
-      end.kind === 'element' && !picked.has(end.id) && at
-        ? { kind: 'point', x: at.x, y: at.y }
-        : end;
-    elements.push(
-      structuredClone({
-        ...el,
-        start: free(el.start, g?.points[0]),
-        end: free(el.end, g?.points[g.points.length - 1]),
-      }),
-    );
+    const element = scene.get(id)!;
+    const copied = isConnector(element)
+      ? detachEnds(element, scene.connectorGeometry(id), (shapeId) => picked.has(shapeId))
+      : element;
+    elements.push(structuredClone(copied));
   }
   elements.sort(compareZ);
   const bounds = scene.bounds(picked);
@@ -67,8 +64,8 @@ export interface PasteOptions {
   offset?: Vec2;
   /** Centers the copy on this world point instead (wins over `offset`). */
   at?: Vec2;
-  /** New element id; the default makes random ids. */
-  newId?: (old: BoardElement) => string;
+  /** New element id; the default makes random ids (see `newId`). */
+  newId?: (original: BoardElement) => string;
 }
 
 /**
@@ -81,24 +78,28 @@ export function pasteElements(
   data: BoardClipboard,
   options: PasteOptions = {},
 ): string[] {
-  const b = data.bounds;
+  const bounds = data.bounds;
   const delta = options.at
-    ? { x: options.at.x - (b.minX + b.maxX) / 2, y: options.at.y - (b.minY + b.maxY) / 2 }
+    ? {
+        x: options.at.x - (bounds.minX + bounds.maxX) / 2,
+        y: options.at.y - (bounds.minY + bounds.maxY) / 2,
+      }
     : (options.offset ?? { x: 0, y: 0 });
   const makeId =
-    options.newId ?? ((el: BoardElement) => randomId(el.type === 'connector' ? 'c' : 's'));
+    options.newId ?? ((element: BoardElement) => newId(isConnector(element) ? 'c' : 's'));
 
   const ids = new Map<string, string>();
-  for (const el of data.elements) ids.set(el.id, makeId(el));
+  for (const element of data.elements) ids.set(element.id, makeId(element));
   // A group survives only if at least two of its members are pasted.
   const groupSizes = new Map<string, number>();
-  for (const el of data.elements)
-    if (el.groupId) groupSizes.set(el.groupId, (groupSizes.get(el.groupId) ?? 0) + 1);
+  for (const element of data.elements)
+    if (element.groupId)
+      groupSizes.set(element.groupId, (groupSizes.get(element.groupId) ?? 0) + 1);
   const groups = new Map<string, string>();
-  const groupOf = (g: string | undefined) => {
-    if (!g || (groupSizes.get(g) ?? 0) < 2) return undefined;
-    let id = groups.get(g);
-    if (!id) groups.set(g, (id = randomId('g')));
+  const groupOf = (groupId: string | undefined) => {
+    if (!groupId || (groupSizes.get(groupId) ?? 0) < 2) return undefined;
+    let id = groups.get(groupId);
+    if (!id) groups.set(groupId, (id = newId('g')));
     return id;
   };
   const moveEnd = (end: ConnectorEnd): ConnectorEnd => {
@@ -107,30 +108,29 @@ export function pasteElements(
     return id ? { ...end, id } : end;
   };
 
-  const out: string[] = [];
+  const pasted: string[] = [];
   let z = scene.maxZ();
   scene.transact(() => {
-    for (const src of data.elements) {
-      const copy = structuredClone(src) as BoardElement;
-      copy.id = ids.get(src.id)!;
+    for (const source of data.elements) {
+      const copy = structuredClone(source) as BoardElement;
+      copy.id = ids.get(source.id)!;
       copy.z = ++z;
-      const groupId = groupOf(src.groupId);
+      const groupId = groupOf(source.groupId);
       if (groupId) copy.groupId = groupId;
       else delete copy.groupId;
       if (isConnector(copy)) {
-        const c = copy as ConnectorElement;
-        c.start = moveEnd(c.start);
-        c.end = moveEnd(c.end);
+        copy.start = moveEnd(copy.start);
+        copy.end = moveEnd(copy.end);
       } else {
         copy.x += delta.x;
         copy.y += delta.y;
       }
       if (validateElement(copy) || scene.has(copy.id)) continue;
       scene.add(copy);
-      out.push(copy.id);
+      pasted.push(copy.id);
     }
   });
-  return out;
+  return pasted;
 }
 
 /** Copies the elements and adds the copy right away, moved by `offset`. Returns the new ids. */
@@ -141,22 +141,27 @@ export function duplicateElements(scene: Scene, ids: Iterable<string>, offset: V
 
 /** Whether `value` looks like clipboard data (e.g. parsed from the system clipboard). */
 export function isBoardClipboard(value: unknown): value is BoardClipboard {
-  const v = value as Partial<BoardClipboard> | null;
+  const clipboard = value as Partial<BoardClipboard> | null;
   return (
-    !!v &&
-    typeof v === 'object' &&
-    v.kind === KIND &&
-    v.version === 1 &&
-    Array.isArray(v.elements) &&
-    !!v.bounds &&
-    [v.bounds.minX, v.bounds.minY, v.bounds.maxX, v.bounds.maxY].every(Number.isFinite)
+    !!clipboard &&
+    typeof clipboard === 'object' &&
+    clipboard.kind === KIND &&
+    clipboard.version === 1 &&
+    Array.isArray(clipboard.elements) &&
+    !!clipboard.bounds &&
+    [
+      clipboard.bounds.minX,
+      clipboard.bounds.minY,
+      clipboard.bounds.maxX,
+      clipboard.bounds.maxY,
+    ].every(Number.isFinite)
   );
 }
 
 /** The text of the copied elements, one per line (what a text editor gets when pasted there). */
 export function clipboardText(data: BoardClipboard): string {
   return data.elements
-    .map((el) => ('text' in el && el.text ? plainText(el.text).trim() : ''))
+    .map((element) => ('text' in element && element.text ? plainText(element.text).trim() : ''))
     .filter(Boolean)
     .join('\n');
 }
@@ -173,23 +178,18 @@ export function clipboardToHtml(data: BoardClipboard): string {
 
 /** Clipboard data embedded by `clipboardToHtml`, or null. */
 export function clipboardFromHtml(html: string): BoardClipboard | null {
-  const m = /data-apeiro="([^"]*)"/.exec(html);
-  if (!m) return null;
+  const match = /data-apeiro="([^"]*)"/.exec(html);
+  if (!match) return null;
   try {
-    const data: unknown = JSON.parse(decodeURIComponent(m[1]!));
+    const data: unknown = JSON.parse(decodeURIComponent(match[1]!));
     return isBoardClipboard(data) ? data : null;
   } catch {
     return null;
   }
 }
 
-const escapeHtml = (s: string) =>
-  s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
-
-function randomId(prefix: string): string {
-  const uuid =
-    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-  return `${prefix}-${uuid}`;
-}
+const escapeHtml = (text: string) =>
+  text.replace(
+    /[&<>"]/g,
+    (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[character]!,
+  );

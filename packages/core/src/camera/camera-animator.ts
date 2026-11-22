@@ -1,14 +1,16 @@
 import type { Camera, CameraState } from './camera';
-import { clamp, type Box, type Vec2 } from '../geometry/math';
+import type { Box } from '../geometry/box';
+import { clamp } from '../geometry/numbers';
+import type { Vec2 } from '../geometry/vector';
 
 export interface FrameScheduler {
-  request(cb: (now: number) => void): number;
+  request(callback: (now: number) => void): number;
   cancel(handle: number): void;
 }
 
 const defaultScheduler: FrameScheduler = {
-  request: (cb) => requestAnimationFrame(cb),
-  cancel: (h) => cancelAnimationFrame(h),
+  request: (callback) => requestAnimationFrame(callback),
+  cancel: (handle) => cancelAnimationFrame(handle),
 };
 
 export interface CameraAnimatorOptions {
@@ -33,7 +35,7 @@ export class CameraAnimator {
   /** Screen point that stays fixed while zooming. */
   private anchor: Vec2 = { x: 0, y: 0 };
   private frame = 0;
-  private last = 0;
+  private lastFrameTime = 0;
   private readonly scheduler: FrameScheduler;
 
   constructor(
@@ -57,37 +59,37 @@ export class CameraAnimator {
     const from = this.target ?? this.camera.getState();
     const zoom = clamp(from.zoom * factor, this.camera.minZoom, this.camera.maxZoom);
     // World point under the anchor in the target state stays under the anchor.
-    const wx = from.x + anchor.x / from.zoom;
-    const wy = from.y + anchor.y / from.zoom;
+    const worldX = from.x + anchor.x / from.zoom;
+    const worldY = from.y + anchor.y / from.zoom;
     this.anchor = anchor;
-    this.animate({ zoom, x: wx - anchor.x / zoom, y: wy - anchor.y / zoom });
+    this.animate({ zoom, x: worldX - anchor.x / zoom, y: worldY - anchor.y / zoom });
   }
 
   /** Moves the view by a screen-space delta. */
-  panBy(dx: number, dy: number): void {
+  panBy(deltaX: number, deltaY: number): void {
     if (!this.enabled) {
-      this.camera.panBy(dx, dy);
+      this.camera.panBy(deltaX, deltaY);
       return;
     }
     const from = this.target ?? this.camera.getState();
-    this.animate({ ...from, x: from.x - dx / from.zoom, y: from.y - dy / from.zoom });
+    this.animate({ ...from, x: from.x - deltaX / from.zoom, y: from.y - deltaY / from.zoom });
   }
 
   /**
    * Continues a released drag with its velocity (screen px per second), decaying
    * smoothly. The distance matches the velocity at release for this half-life.
    */
-  fling(vx: number, vy: number): void {
+  fling(velocityX: number, velocityY: number): void {
     if (!this.enabled) return;
-    const tau = this.halfLifeMs / 1000 / Math.LN2; // time constant of the decay, seconds
-    if (Math.hypot(vx, vy) * tau < 2) return; // not worth a frame
-    this.panBy(vx * tau, vy * tau);
+    const timeConstant = this.halfLifeMs / 1000 / Math.LN2; // of the decay, seconds
+    if (Math.hypot(velocityX, velocityY) * timeConstant < 2) return; // not worth a frame
+    this.panBy(velocityX * timeConstant, velocityY * timeConstant);
   }
 
   /** Moves to a state (animated when enabled). */
   animateTo(state: Partial<CameraState>, anchor?: Vec2): void {
-    const cur = this.camera.getState();
-    const next = { ...cur, ...state };
+    const current = this.camera.getState();
+    const next = { ...current, ...state };
     if (!this.enabled) {
       this.camera.set(next);
       return;
@@ -108,29 +110,31 @@ export class CameraAnimator {
     this.frame = 0;
   }
 
-  /** Advances the animation by `dtMs`. Exposed for tests; normally driven by the scheduler. */
-  step(dtMs: number): void {
-    const t = this.target;
-    if (!t) return;
-    const cur = this.camera.getState();
-    const k = 1 - Math.pow(0.5, dtMs / this.halfLifeMs);
-    const zoom = Math.exp(Math.log(cur.zoom) + (Math.log(t.zoom) - Math.log(cur.zoom)) * k);
+  /** Advances the animation by `elapsedMs`. Exposed for tests; normally driven by the scheduler. */
+  step(elapsedMs: number): void {
+    const target = this.target;
+    if (!target) return;
+    const current = this.camera.getState();
+    const blend = 1 - Math.pow(0.5, elapsedMs / this.halfLifeMs);
+    const zoom = Math.exp(
+      Math.log(current.zoom) + (Math.log(target.zoom) - Math.log(current.zoom)) * blend,
+    );
     // Interpolate the world point under the anchor, then place the camera so it stays there.
-    const a = this.anchor;
-    const wx = cur.x + a.x / cur.zoom;
-    const wy = cur.y + a.y / cur.zoom;
-    const twx = t.x + a.x / t.zoom;
-    const twy = t.y + a.y / t.zoom;
-    const nwx = wx + (twx - wx) * k;
-    const nwy = wy + (twy - wy) * k;
-    let next = { zoom, x: nwx - a.x / zoom, y: nwy - a.y / zoom };
+    const anchor = this.anchor;
+    const worldX = current.x + anchor.x / current.zoom;
+    const worldY = current.y + anchor.y / current.zoom;
+    const targetWorldX = target.x + anchor.x / target.zoom;
+    const targetWorldY = target.y + anchor.y / target.zoom;
+    const nextWorldX = worldX + (targetWorldX - worldX) * blend;
+    const nextWorldY = worldY + (targetWorldY - worldY) * blend;
+    let next = { zoom, x: nextWorldX - anchor.x / zoom, y: nextWorldY - anchor.y / zoom };
     // Close enough (sub-pixel on screen): land exactly.
     const done =
-      Math.abs(Math.log(t.zoom / zoom)) < 1e-4 &&
-      Math.abs(next.x - t.x) * zoom < 0.25 &&
-      Math.abs(next.y - t.y) * zoom < 0.25;
+      Math.abs(Math.log(target.zoom / zoom)) < 1e-4 &&
+      Math.abs(next.x - target.x) * zoom < 0.25 &&
+      Math.abs(next.y - target.y) * zoom < 0.25;
     if (done) {
-      next = t;
+      next = target;
       this.target = null;
     }
     this.camera.set(next);
@@ -144,19 +148,19 @@ export class CameraAnimator {
     let target = requested;
     if (zoom !== requested.zoom) {
       // Keep the world point under the anchor where the requested state would have put it.
-      const a = this.anchor;
-      const wx = requested.x + a.x / requested.zoom;
-      const wy = requested.y + a.y / requested.zoom;
-      target = { zoom, x: wx - a.x / zoom, y: wy - a.y / zoom };
+      const anchor = this.anchor;
+      const worldX = requested.x + anchor.x / requested.zoom;
+      const worldY = requested.y + anchor.y / requested.zoom;
+      target = { zoom, x: worldX - anchor.x / zoom, y: worldY - anchor.y / zoom };
     }
     this.target = target;
     if (this.frame) return;
-    this.last = 0;
+    this.lastFrameTime = 0;
     const tick = (now: number) => {
       this.frame = 0;
-      const dt = this.last ? Math.min(now - this.last, 64) : 16;
-      this.last = now;
-      this.step(dt);
+      const elapsed = this.lastFrameTime ? Math.min(now - this.lastFrameTime, 64) : 16;
+      this.lastFrameTime = now;
+      this.step(elapsed);
       if (this.target) this.frame = this.scheduler.request(tick);
     };
     this.frame = this.scheduler.request(tick);

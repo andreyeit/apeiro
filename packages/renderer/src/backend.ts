@@ -25,13 +25,13 @@ export interface MediaTextures {
 
 /** One image or audio player: a textured, rounded, rotated quad. */
 export interface MediaQuad {
-  /** x, y, w, h (world, unrotated box). */
-  rect: readonly [number, number, number, number];
+  /** x, y, width, height (world, unrotated box). */
+  box: readonly [number, number, number, number];
   rotation: number;
   depth: number;
   radius: number;
   /** Image (u, v) at the box's top-left and the (du, dv) it spans. */
-  uv: readonly [number, number, number, number];
+  textureCoordinates: readonly [number, number, number, number];
   /** null: draw the loading placeholder. */
   texture: TextureHandle | null;
 }
@@ -49,9 +49,9 @@ export interface FrameParams {
   y: number;
   zoom: number;
   /** CSS pixels. */
-  viewportW: number;
-  viewportH: number;
-  dpr: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  pixelRatio: number;
   /** Normalized RGB. */
   background: readonly [number, number, number, number];
   /** null: no grid this frame. */
@@ -99,4 +99,4 @@ export interface RenderBackend {
   destroy(): void;
 }
 
-export type BackendFactory = (ctx: BackendContext) => RenderBackend;
+export type BackendFactory = (context: BackendContext) => RenderBackend;

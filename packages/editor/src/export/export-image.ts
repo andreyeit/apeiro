@@ -1,4 +1,4 @@
-import { Camera, Scene, type BoardElement, type Box } from '@apeiro/core';
+import { Camera, detachEnds, isConnector, Scene, type BoardElement, type Box } from '@apeiro/core';
 import { createRenderer, type AudioWidgetStyle, type GridStyle } from '@apeiro/renderer';
 
 /** What `BoardEditor.exportImage` draws and how. */
@@ -43,30 +43,39 @@ export interface ExportFrame {
  * scaled down so neither side exceeds `maxSize` pixels.
  */
 export function exportFrame(bounds: Box, scale = 2, padding = 24, maxSize = 8192): ExportFrame {
-  const w = Math.max(1e-6, bounds.maxX - bounds.minX + padding * 2);
-  const h = Math.max(1e-6, bounds.maxY - bounds.minY + padding * 2);
-  const zoom = Math.min(scale, maxSize / w, maxSize / h);
+  const width = Math.max(1e-6, bounds.maxX - bounds.minX + padding * 2);
+  const height = Math.max(1e-6, bounds.maxY - bounds.minY + padding * 2);
+  const zoom = Math.min(scale, maxSize / width, maxSize / height);
   return {
     x: bounds.minX - padding,
     y: bounds.minY - padding,
-    width: Math.max(1, Math.round(w * zoom)),
-    height: Math.max(1, Math.round(h * zoom)),
+    width: Math.max(1, Math.round(width * zoom)),
+    height: Math.max(1, Math.round(height * zoom)),
     zoom,
   };
 }
 
-/** The elements of `ids` with the shapes their connectors need, as a scene of their own. */
+/**
+ * The elements of `ids` as a scene of their own. A connector end attached to a shape that
+ * isn't exported becomes a free end where it is drawn now, so the line still shows.
+ */
 export function sceneOf(scene: Scene, ids: Iterable<string>): Scene {
-  const picked: BoardElement[] = [];
-  for (const id of ids) {
-    const el = scene.get(id);
-    if (el) picked.push(el);
+  const picked = new Set<string>();
+  for (const id of ids) if (scene.has(id)) picked.add(id);
+  const exported: BoardElement[] = [];
+  for (const id of picked) {
+    const element = scene.get(id)!;
+    exported.push(
+      isConnector(element)
+        ? detachEnds(element, scene.connectorGeometry(id), (shapeId) => picked.has(shapeId))
+        : element,
+    );
   }
-  const sub = new Scene();
-  sub.transact(() => {
-    for (const el of picked) sub.add(el);
+  const part = new Scene();
+  part.transact(() => {
+    for (const element of exported) part.add(element);
   }, 'load');
-  return sub;
+  return part;
 }
 
 /** How the board draws, for an image that looks like it. */

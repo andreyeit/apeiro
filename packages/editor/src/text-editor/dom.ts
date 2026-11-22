@@ -1,5 +1,7 @@
 import {
+  cssColor,
   fontFamily,
+  LINK_COLOR,
   listMarkers,
   normalizeParagraphs,
   normalizeRuns,
@@ -23,81 +25,87 @@ import {
  * An empty paragraph holds a `<br data-sentinel>` so it has a line box and a caret spot.
  * Sizes and indents are written as `calc(var(--k) * Npx)`, where the editor sets `--k` to
  * the layout's autoFit scale, so the DOM shrinks exactly like the board text.
+ *
+ * While editing, this DOM is what shows the text (the board hides its own), so colors are
+ * written as the board draws them: `drawnColor` maps a stored color to the shown one (a dark
+ * theme may show it differently). Links without a color of their own take `LINK_COLOR`, and a
+ * list marker takes the color of its paragraph's first run (`--mc`), as on the board.
  */
 
-export const toCss = (rgba: number) =>
-  `rgba(${rgba >>> 24}, ${(rgba >>> 16) & 255}, ${(rgba >>> 8) & 255}, ${(rgba & 255) / 255})`;
-
-const scaled = (px: number) => `calc(var(--k, 1) * ${px}px)`;
+const scaled = (pixels: number) => `calc(var(--k, 1) * ${pixels}px)`;
 
 /** Splits runs at line breaks: the runs of each paragraph. */
 function splitParagraphs(runs: readonly TextRun[]): TextRun[][] {
-  const out: TextRun[][] = [[]];
+  const paragraphs: TextRun[][] = [[]];
   for (const run of runs) {
-    const parts = run.text.split('\n');
-    parts.forEach((text, i) => {
-      if (i > 0) out.push([]);
-      if (text) out[out.length - 1]!.push({ ...run, text });
+    run.text.split('\n').forEach((text, index) => {
+      if (index > 0) paragraphs.push([]);
+      if (text) paragraphs[paragraphs.length - 1]!.push({ ...run, text });
     });
   }
-  return out;
+  return paragraphs;
 }
 
 export function render(
   root: HTMLElement,
   block: TextBlock,
-  openLinkHint = 'Ctrl+click to open',
+  drawnColor: (color: number) => number = (color) => color,
 ): void {
   root.replaceChildren();
   const paragraphs = splitParagraphs(block.runs);
   const markers = block.paragraphs ? listMarkers(block, paragraphs.length) : [];
-  paragraphs.forEach((runs, i) => {
-    const div = document.createElement('div');
-    div.dataset.p = '1';
-    const style = paragraphStyle(block, i);
+  paragraphs.forEach((runs, index) => {
+    const paragraph = document.createElement('div');
+    paragraph.dataset.p = '1';
+    const style = paragraphStyle(block, index);
     if (style.list) {
       const indent = paragraphIndent(style, block.fontSize);
-      div.dataset.list = style.list;
-      if (style.indent) div.dataset.indent = String(style.indent);
-      div.dataset.marker = markers[i] ?? '';
-      div.style.paddingLeft = scaled(indent);
-      div.style.setProperty('--mw', scaled(indent));
+      paragraph.dataset.list = style.list;
+      if (style.indent) paragraph.dataset.indent = String(style.indent);
+      paragraph.dataset.marker = markers[index] ?? '';
+      paragraph.style.paddingLeft = scaled(indent);
+      paragraph.style.setProperty('--mw', scaled(indent));
+      const first = runs[0];
+      const markerColor = first?.color ?? (first?.link ? LINK_COLOR : block.color);
+      paragraph.style.setProperty('--mc', cssColor(drawnColor(markerColor)));
     }
-    for (const run of runs) div.append(span(run, openLinkHint));
+    for (const run of runs) paragraph.append(span(run, drawnColor));
     if (runs.length === 0) {
-      const br = document.createElement('br');
-      br.dataset.sentinel = '1';
-      div.append(br);
+      const lineBreak = document.createElement('br');
+      lineBreak.dataset.sentinel = '1';
+      paragraph.append(lineBreak);
     }
-    root.append(div);
+    root.append(paragraph);
   });
 }
 
-function span(run: TextRun, openLinkHint: string): HTMLSpanElement {
-  const s = document.createElement('span');
-  const d = s.dataset;
-  if (run.bold) d.b = '1';
-  if (run.italic) d.i = '1';
-  if (run.underline) d.u = '1';
-  if (run.strike) d.s = '1';
+function span(run: TextRun, drawnColor: (color: number) => number): HTMLSpanElement {
+  const span = document.createElement('span');
+  const data = span.dataset;
+  if (run.bold) data.b = '1';
+  if (run.italic) data.i = '1';
+  if (run.underline) data.u = '1';
+  if (run.strike) data.s = '1';
   if (run.color !== undefined) {
-    d.c = String(run.color);
-    s.style.color = toCss(run.color);
+    data.c = String(run.color);
+    span.style.color = cssColor(drawnColor(run.color));
+  } else if (run.link !== undefined) {
+    span.style.color = cssColor(drawnColor(LINK_COLOR));
   }
   if (run.size !== undefined) {
-    d.size = String(run.size);
-    s.style.fontSize = scaled(run.size);
+    data.size = String(run.size);
+    span.style.fontSize = scaled(run.size);
   }
   if (run.font !== undefined) {
-    d.font = run.font;
-    s.style.fontFamily = fontFamily(run.font).css;
+    data.font = run.font;
+    span.style.fontFamily = fontFamily(run.font).css;
   }
   if (run.link !== undefined) {
-    d.href = run.link;
-    s.title = `${run.link}\n${openLinkHint}`;
+    data.href = run.link;
+    span.title = run.link;
   }
-  s.textContent = run.text;
-  return s;
+  span.textContent = run.text;
+  return span;
 }
 
 const isBlock = (node: Node, root: HTMLElement): node is HTMLElement =>
@@ -110,7 +118,7 @@ function hasContent(node: Node): boolean {
   if (node.nodeType === Node.TEXT_NODE) return (node.textContent ?? '') !== '';
   if (!(node instanceof HTMLElement)) return false;
   if (node.tagName === 'BR') return !node.dataset.sentinel;
-  for (const c of node.childNodes) if (hasContent(c)) return true;
+  for (const child of node.childNodes) if (hasContent(child)) return true;
   return false;
 }
 
@@ -119,22 +127,22 @@ function hasContent(node: Node): boolean {
  * (browsers add one after deleting or merging lines): it is not a line break. Like in HTML
  * rendering, where such a trailing `<br>` adds no line.
  */
-function isFillerBreak(br: HTMLElement, root: HTMLElement): boolean {
-  if (br.dataset.sentinel) return true;
-  for (let n: Node = br; n !== root && !isBlock(n, root); n = n.parentNode!) {
-    for (let s = n.nextSibling; s; s = s.nextSibling) {
-      if (isBlock(s, root)) return true; // the next paragraph ends this line anyway
-      if (hasContent(s)) return false;
+function isFillerBreak(lineBreak: HTMLElement, root: HTMLElement): boolean {
+  if (lineBreak.dataset.sentinel) return true;
+  for (let node: Node = lineBreak; node !== root && !isBlock(node, root); node = node.parentNode!) {
+    for (let sibling = node.nextSibling; sibling; sibling = sibling.nextSibling) {
+      if (isBlock(sibling, root)) return true; // the next paragraph ends this line anyway
+      if (hasContent(sibling)) return false;
     }
-    if (!n.parentNode) break;
+    if (!node.parentNode) break;
   }
   return true;
 }
 
-function blockStyle(el: HTMLElement): ParagraphStyle {
-  const list = el.dataset.list;
+function blockStyle(element: HTMLElement): ParagraphStyle {
+  const list = element.dataset.list;
   if (list !== 'bullet' && list !== 'ordered') return {};
-  const indent = Number(el.dataset.indent ?? 0);
+  const indent = Number(element.dataset.indent ?? 0);
   return indent > 0 ? { list, indent } : { list };
 }
 
@@ -144,17 +152,17 @@ function blockStyle(el: HTMLElement): ParagraphStyle {
  */
 export function parse(root: HTMLElement): { runs: TextRun[]; paragraphs?: ParagraphStyle[] } {
   const runs: TextRun[] = [];
-  const paras: ParagraphStyle[] = [{}];
+  const styles: ParagraphStyle[] = [{}];
   let any = false;
   const newline = (style: ParagraphStyle) => {
     runs.push({ text: '\n' });
-    paras.push(style);
+    styles.push(style);
     any = true;
   };
-  const walk = (node: Node, style: TextStyle, para: ParagraphStyle) => {
+  const walk = (node: Node, style: TextStyle, paragraph: ParagraphStyle) => {
     if (node.nodeType === Node.TEXT_NODE) {
-      (node.textContent ?? '').split('\n').forEach((text, i) => {
-        if (i > 0) newline(para);
+      (node.textContent ?? '').split('\n').forEach((text, index) => {
+        if (index > 0) newline(paragraph);
         if (text) runs.push({ ...style, text });
       });
       any = true;
@@ -162,32 +170,32 @@ export function parse(root: HTMLElement): { runs: TextRun[]; paragraphs?: Paragr
     }
     if (!(node instanceof HTMLElement)) return;
     if (node.tagName === 'BR') {
-      if (!isFillerBreak(node, root)) newline(para);
+      if (!isFillerBreak(node, root)) newline(paragraph);
       return;
     }
-    let next = para;
+    let next = paragraph;
     if (isBlock(node, root)) {
       // Each block is a paragraph: the first one styles paragraph 0, the rest start new ones.
       next = blockStyle(node);
       if (any) newline(next);
-      else paras[0] = next;
+      else styles[0] = next;
       any = true;
     }
-    const d = node.dataset;
-    const s: TextStyle = { ...style };
-    if (d.b) s.bold = true;
-    if (d.i) s.italic = true;
-    if (d.u) s.underline = true;
-    if (d.s) s.strike = true;
-    if (d.c) s.color = Number(d.c);
-    if (d.size && Number(d.size) > 0) s.size = Number(d.size);
-    if (d.font) s.font = d.font;
-    if (d.href) s.link = d.href;
-    for (const child of node.childNodes) walk(child, s, next);
+    const data = node.dataset;
+    const styled: TextStyle = { ...style };
+    if (data.b) styled.bold = true;
+    if (data.i) styled.italic = true;
+    if (data.u) styled.underline = true;
+    if (data.s) styled.strike = true;
+    if (data.c) styled.color = Number(data.c);
+    if (data.size && Number(data.size) > 0) styled.size = Number(data.size);
+    if (data.font) styled.font = data.font;
+    if (data.href) styled.link = data.href;
+    for (const child of node.childNodes) walk(child, styled, next);
   };
   walk(root, {}, {});
   const normalized = normalizeRuns(runs);
-  const paragraphs = normalizeParagraphs(paras, paragraphCount(normalized));
+  const paragraphs = normalizeParagraphs(styles, paragraphCount(normalized));
   return paragraphs ? { runs: normalized, paragraphs } : { runs: normalized };
 }
 
@@ -203,8 +211,8 @@ export function offsetOf(root: HTMLElement, target: Node, targetOffset: number):
     }
     if (node === target && node.nodeType !== Node.TEXT_NODE) {
       // Offset counts child nodes.
-      for (let i = 0; i < targetOffset && i < node.childNodes.length; i++)
-        walk(node.childNodes[i]!);
+      for (let child = 0; child < targetOffset && child < node.childNodes.length; child++)
+        walk(node.childNodes[child]!);
       found = count;
       return true;
     }
@@ -234,21 +242,21 @@ export function offsetOf(root: HTMLElement, target: Node, targetOffset: number):
 /** DOM position for a plain-text offset in a canonical (rendered) editor. */
 export function positionOf(root: HTMLElement, offset: number): { node: Node; offset: number } {
   let remaining = offset;
-  const blocks = [...root.children].filter((c) => (c as HTMLElement).dataset.p);
-  for (const div of blocks) {
+  const blocks = [...root.children].filter((child) => (child as HTMLElement).dataset.p);
+  for (const paragraph of blocks) {
     const texts: Node[] = [];
-    for (const s of div.children)
-      if (s.firstChild?.nodeType === Node.TEXT_NODE) texts.push(s.firstChild);
-    const len = texts.reduce((n, t) => n + (t.textContent?.length ?? 0), 0);
-    if (remaining <= len) {
-      for (const t of texts) {
-        const l = t.textContent?.length ?? 0;
-        if (remaining <= l) return { node: t, offset: remaining };
-        remaining -= l;
+    for (const child of paragraph.children)
+      if (child.firstChild?.nodeType === Node.TEXT_NODE) texts.push(child.firstChild);
+    const length = texts.reduce((total, text) => total + (text.textContent?.length ?? 0), 0);
+    if (remaining <= length) {
+      for (const text of texts) {
+        const textLength = text.textContent?.length ?? 0;
+        if (remaining <= textLength) return { node: text, offset: remaining };
+        remaining -= textLength;
       }
-      return { node: div, offset: 0 }; // empty paragraph: before its <br>
+      return { node: paragraph, offset: 0 }; // empty paragraph: before its <br>
     }
-    remaining -= len + 1;
+    remaining -= length + 1;
   }
   // Not canonical (e.g. mid-edit): fall back to the end.
   const last = blocks[blocks.length - 1];

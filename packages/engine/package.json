@@ -1,7 +1,7 @@
 {
   "name": "apeiro",
   "version": "0.1.0",
-  "description": "Infinite canvas whiteboard for the web: WebGPU/WebGL2 rendering, shapes, connectors, rich text, pen, images and undo, with React bindings and real-time collaboration over Yjs.",
+  "description": "Infinite canvas whiteboard for the web: WebGPU/WebGL2 rendering, shapes, connectors, rich text, pen, images and undo, with React bindings.",
   "keywords": [
     "whiteboard",
     "infinite-canvas",
@@ -11,11 +11,7 @@
     "webgpu",
     "webgl",
     "react",
-    "nextjs",
-    "yjs",
-    "crdt",
-    "collaboration",
-    "socket.io"
+    "nextjs"
   ],
   "license": "MIT",
   "author": "andreyeit",
@@ -46,12 +42,20 @@
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
     },
-    "./sync": {
-      "types": "./dist/sync.d.ts",
-      "default": "./dist/sync.js"
-    },
     "./styles.css": "./dist/styles.css",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./yjs": {
+      "types": "./dist/yjs.d.ts",
+      "default": "./dist/yjs.js"
+    },
+    "./socket.io": {
+      "types": "./dist/socket.io.d.ts",
+      "default": "./dist/socket.io.js"
+    },
+    "./socket.io/server": {
+      "types": "./dist/socket.io-server.d.ts",
+      "default": "./dist/socket.io-server.js"
+    }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -66,7 +70,9 @@
   },
   "peerDependencies": {
     "react": "^18.2.0 || ^19.0.0",
-    "yjs": "^13.6.0",
+    "yjs": "^13.6.27",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
     "y-protocols": "^1.0.6"
   },
   "peerDependenciesMeta": {
@@ -74,6 +80,12 @@
       "optional": true
     },
     "yjs": {
+      "optional": true
+    },
+    "socket.io": {
+      "optional": true
+    },
+    "socket.io-client": {
       "optional": true
     },
     "y-protocols": {
@@ -85,12 +97,16 @@
     "@apeiro/editor": "workspace:*",
     "@apeiro/react": "workspace:*",
     "@apeiro/renderer": "workspace:*",
-    "@apeiro/yjs": "workspace:*",
     "@types/react": "^19.3.0",
     "react": "^19.3.1",
     "tsdown": "^0.23.7",
-    "yjs": "^13.6.33",
-    "y-protocols": "^1.0.7"
+    "yjs": "^13.6.27",
+    "y-protocols": "^1.0.6",
+    "happy-dom": "^21.0.4",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "lib0": "^0.2.85",
+    "@types/node": "^22.0.0"
   },
   "engines": {
     "node": ">=18"

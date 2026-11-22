@@ -1,5 +1,6 @@
+import { boxOfPoints } from '../geometry/box';
+import { distanceToSegment, type Vec2 } from '../geometry/vector';
 import type { ShapeElement } from './element';
-import type { Vec2 } from '../geometry/math';
 
 /**
  * Freehand pen strokes (`ink` elements). The polyline is stored as fractions of the box,
@@ -11,92 +12,137 @@ import type { Vec2 } from '../geometry/math';
 const MIN_EXTENT = 1e-3;
 
 /** World points of an ink stroke (rotation included). */
-export function inkWorldPoints(el: ShapeElement): Vec2[] {
-  const pts = el.points ?? [];
-  const cx = el.x + el.w / 2;
-  const cy = el.y + el.h / 2;
-  const c = Math.cos(el.rotation);
-  const s = Math.sin(el.rotation);
-  const out: Vec2[] = [];
-  for (let i = 0; i + 1 < pts.length; i += 2) {
-    const lx = (pts[i]! - 0.5) * el.w;
-    const ly = (pts[i + 1]! - 0.5) * el.h;
-    out.push({ x: cx + lx * c - ly * s, y: cy + lx * s + ly * c });
+export function inkWorldPoints(element: ShapeElement): Vec2[] {
+  const points = element.points ?? [];
+  const centerX = element.x + element.width / 2;
+  const centerY = element.y + element.height / 2;
+  const cosine = Math.cos(element.rotation);
+  const sine = Math.sin(element.rotation);
+  const world: Vec2[] = [];
+  for (let index = 0; index + 1 < points.length; index += 2) {
+    const localX = (points[index]! - 0.5) * element.width;
+    const localY = (points[index + 1]! - 0.5) * element.height;
+    world.push({
+      x: centerX + localX * cosine - localY * sine,
+      y: centerY + localX * sine + localY * cosine,
+    });
   }
-  return out;
+  return world;
 }
 
-/** Box and normalized points of an unrotated stroke through world points `pts`. */
+/** Box and normalized points of an unrotated stroke through `worldPoints`. */
 export function inkGeometry(
-  pts: readonly Vec2[],
-): Pick<ShapeElement, 'x' | 'y' | 'w' | 'h'> & { points: number[] } {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const p of pts) {
-    if (p.x < minX) minX = p.x;
-    if (p.y < minY) minY = p.y;
-    if (p.x > maxX) maxX = p.x;
-    if (p.y > maxY) maxY = p.y;
-  }
-  if (pts.length === 0) return { x: 0, y: 0, w: MIN_EXTENT, h: MIN_EXTENT, points: [] };
-  const w = Math.max(maxX - minX, MIN_EXTENT);
-  const h = Math.max(maxY - minY, MIN_EXTENT);
+  worldPoints: readonly Vec2[],
+): Pick<ShapeElement, 'x' | 'y' | 'width' | 'height'> & { points: number[] } {
+  if (worldPoints.length === 0)
+    return { x: 0, y: 0, width: MIN_EXTENT, height: MIN_EXTENT, points: [] };
+  const { minX, minY, maxX, maxY } = boxOfPoints(worldPoints);
+  const width = Math.max(maxX - minX, MIN_EXTENT);
+  const height = Math.max(maxY - minY, MIN_EXTENT);
   // A straight horizontal (or vertical) stroke has no height: center it in the minimal box.
-  const x = maxX - minX < MIN_EXTENT ? minX - w / 2 : minX;
-  const y = maxY - minY < MIN_EXTENT ? minY - h / 2 : minY;
+  const x = maxX - minX < MIN_EXTENT ? minX - width / 2 : minX;
+  const y = maxY - minY < MIN_EXTENT ? minY - height / 2 : minY;
   const points: number[] = [];
-  for (const p of pts) points.push((p.x - x) / w, (p.y - y) / h);
-  return { x, y, w, h, points };
+  for (const point of worldPoints) points.push((point.x - x) / width, (point.y - y) / height);
+  return { x, y, width, height, points };
 }
 
 /**
  * Ramer–Douglas–Peucker: drops points closer than `tolerance` to the line through
  * their neighbours. Keeps the first and last point.
  */
-export function simplifyStroke(pts: readonly Vec2[], tolerance: number): Vec2[] {
-  if (pts.length <= 2) return [...pts];
-  const keep = new Uint8Array(pts.length);
+export function simplifyStroke(points: readonly Vec2[], tolerance: number): Vec2[] {
+  if (points.length <= 2) return [...points];
+  const keep = new Uint8Array(points.length);
   keep[0] = 1;
-  keep[pts.length - 1] = 1;
-  const stack: Array<[number, number]> = [[0, pts.length - 1]];
+  keep[points.length - 1] = 1;
+  const stack: Array<[number, number]> = [[0, points.length - 1]];
   while (stack.length > 0) {
-    const [a, b] = stack.pop()!;
+    const [first, last] = stack.pop()!;
     let worst = -1;
-    let worstDist = tolerance;
-    for (let i = a + 1; i < b; i++) {
-      const d = segmentDistance(pts[i]!, pts[a]!, pts[b]!);
-      if (d > worstDist) {
-        worstDist = d;
-        worst = i;
+    let worstDistance = tolerance;
+    for (let index = first + 1; index < last; index++) {
+      const distance = distanceToSegment(points[index]!, points[first]!, points[last]!);
+      if (distance > worstDistance) {
+        worstDistance = distance;
+        worst = index;
       }
     }
     if (worst >= 0) {
       keep[worst] = 1;
-      stack.push([a, worst], [worst, b]);
+      stack.push([first, worst], [worst, last]);
     }
   }
-  return pts.filter((_, i) => keep[i] === 1);
+  return points.filter((_, index) => keep[index] === 1);
 }
 
-/** Distance from `p` to the segment a–b. */
-export function segmentDistance(p: Vec2, a: Vec2, b: Vec2): number {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const len2 = dx * dx + dy * dy;
-  const t = len2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2)) : 0;
-  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+/**
+ * Pen stabilizer ("lazy brush"): the drawn point hangs on a string of `length` behind the
+ * pointer and moves only when the pointer pulls the string tight. Hand tremor shorter than
+ * the string is dropped and sharp jerks turn into smooth arcs, as with the pen in Miro.
+ * Returns where the drawn point moves to, or null while the string is slack.
+ */
+export function pullString(drawn: Vec2, pointer: Vec2, length: number): Vec2 | null {
+  const distance = Math.hypot(pointer.x - drawn.x, pointer.y - drawn.y);
+  if (distance <= length) return null;
+  const pulled = (distance - length) / distance;
+  return {
+    x: drawn.x + (pointer.x - drawn.x) * pulled,
+    y: drawn.y + (pointer.y - drawn.y) * pulled,
+  };
+}
+
+/**
+ * Smooths a pen stroke: resamples it every `spacing` (so the result doesn't depend on how
+ * fast the hand moved) and then evens out each point with its neighbours (1-2-1 weights)
+ * `passes` times. The ends stay where they are. A circle shrinks a little, by about
+ * `spacing * passes / 8`.
+ */
+export function relaxStroke(points: readonly Vec2[], spacing: number, passes: number): Vec2[] {
+  if (points.length < 3 || !(spacing > 0)) return [...points];
+  const even: Vec2[] = [points[0]!];
+  let carried = 0; // length since the last resampled point
+  for (let index = 1; index < points.length; index++) {
+    const from = points[index - 1]!;
+    const to = points[index]!;
+    const length = Math.hypot(to.x - from.x, to.y - from.y);
+    let along = spacing - carried;
+    while (along <= length) {
+      const fraction = along / length;
+      even.push({ x: from.x + (to.x - from.x) * fraction, y: from.y + (to.y - from.y) * fraction });
+      along += spacing;
+    }
+    carried = length - (along - spacing);
+  }
+  const last = points[points.length - 1]!;
+  const tail = even[even.length - 1]!;
+  if (Math.hypot(last.x - tail.x, last.y - tail.y) > spacing * 0.25) even.push(last);
+  else even[even.length - 1] = last;
+  let current = even;
+  for (let pass = 0; pass < passes && current.length > 2; pass++) {
+    const next = current.slice();
+    for (let index = 1; index < current.length - 1; index++) {
+      const before = current[index - 1]!;
+      const point = current[index]!;
+      const after = current[index + 1]!;
+      next[index] = {
+        x: (before.x + 2 * point.x + after.x) / 4,
+        y: (before.y + 2 * point.y + after.y) / 4,
+      };
+    }
+    current = next;
+  }
+  return current;
 }
 
 /** Distance from a world point to the stroke's center line. */
-export function inkDistance(el: ShapeElement, p: Vec2): number {
-  const pts = inkWorldPoints(el);
-  if (pts.length === 1) return Math.hypot(p.x - pts[0]!.x, p.y - pts[0]!.y);
+export function inkDistance(element: ShapeElement, point: Vec2): number {
+  const points = inkWorldPoints(element);
+  if (points.length === 1) return Math.hypot(point.x - points[0]!.x, point.y - points[0]!.y);
   let best = Infinity;
-  for (let i = 0; i + 1 < pts.length; i++) {
-    const d = segmentDistance(p, pts[i]!, pts[i + 1]!);
-    if (d < best) best = d;
+  for (let index = 0; index + 1 < points.length; index++) {
+    const distance = distanceToSegment(point, points[index]!, points[index + 1]!);
+    if (distance < best) best = distance;
   }
   return best;
 }
@@ -110,41 +156,43 @@ const MAX_SMOOTH_STEPS = 24;
  * themselves stay on the curve, so it looks like the hand drew it, without the kinks of
  * a straight line from point to point.
  */
-export function smoothStroke(pts: readonly Vec2[], step: number): Vec2[] {
-  if (pts.length < 3) return [...pts];
-  const out: Vec2[] = [pts[0]!];
-  const n = pts.length;
-  for (let i = 0; i + 1 < n; i++) {
-    const p1 = pts[i]!;
-    const p2 = pts[i + 1]!;
+export function smoothStroke(points: readonly Vec2[], step: number): Vec2[] {
+  if (points.length < 3) return [...points];
+  const smooth: Vec2[] = [points[0]!];
+  const count = points.length;
+  for (let index = 0; index + 1 < count; index++) {
+    const start = points[index]!;
+    const end = points[index + 1]!;
     // Mirrored neighbours at the ends, so the curve starts and ends along the stroke.
-    const p0 = pts[i - 1] ?? { x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y };
-    const p3 = pts[i + 2] ?? { x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y };
-    const len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    const k = Math.min(MAX_SMOOTH_STEPS, Math.max(1, Math.ceil(len / Math.max(step, 1e-6))));
-    for (let j = 1; j <= k; j++) out.push(catmullRom(p0, p1, p2, p3, j / k));
+    const before = points[index - 1] ?? { x: 2 * start.x - end.x, y: 2 * start.y - end.y };
+    const after = points[index + 2] ?? { x: 2 * end.x - start.x, y: 2 * end.y - start.y };
+    const length = Math.hypot(end.x - start.x, end.y - start.y);
+    const steps = Math.min(MAX_SMOOTH_STEPS, Math.max(1, Math.ceil(length / Math.max(step, 1e-6))));
+    for (let step = 1; step <= steps; step++)
+      smooth.push(catmullRom(before, start, end, after, step / steps));
   }
-  return out;
+  return smooth;
 }
 
-/** Centripetal Catmull–Rom between p1 and p2 at t in 0..1 (Barry–Goldman). */
-function catmullRom(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: number): Vec2 {
-  const knot = (a: Vec2, b: Vec2) => Math.max(Math.sqrt(Math.hypot(b.x - a.x, b.y - a.y)), 1e-6);
-  const t0 = 0;
-  const t1 = t0 + knot(p0, p1);
-  const t2 = t1 + knot(p1, p2);
-  const t3 = t2 + knot(p2, p3);
-  const u = t1 + (t2 - t1) * t;
-  const lerp = (a: Vec2, b: Vec2, ta: number, tb: number): Vec2 => {
-    const w = (u - ta) / (tb - ta);
-    return { x: a.x + (b.x - a.x) * w, y: a.y + (b.y - a.y) * w };
+/** Centripetal Catmull–Rom from `start` to `end` at `fraction` (0..1), after Barry–Goldman. */
+function catmullRom(before: Vec2, start: Vec2, end: Vec2, after: Vec2, fraction: number): Vec2 {
+  const knot = (from: Vec2, to: Vec2) =>
+    Math.max(Math.sqrt(Math.hypot(to.x - from.x, to.y - from.y)), 1e-6);
+  const knotBefore = 0;
+  const knotStart = knotBefore + knot(before, start);
+  const knotEnd = knotStart + knot(start, end);
+  const knotAfter = knotEnd + knot(end, after);
+  const parameter = knotStart + (knotEnd - knotStart) * fraction;
+  const lerp = (from: Vec2, to: Vec2, knotFrom: number, knotTo: number): Vec2 => {
+    const weight = (parameter - knotFrom) / (knotTo - knotFrom);
+    return { x: from.x + (to.x - from.x) * weight, y: from.y + (to.y - from.y) * weight };
   };
-  const a1 = lerp(p0, p1, t0, t1);
-  const a2 = lerp(p1, p2, t1, t2);
-  const a3 = lerp(p2, p3, t2, t3);
-  const b1 = lerp(a1, a2, t0, t2);
-  const b2 = lerp(a2, a3, t1, t3);
-  return lerp(b1, b2, t1, t2);
+  const firstBefore = lerp(before, start, knotBefore, knotStart);
+  const firstMiddle = lerp(start, end, knotStart, knotEnd);
+  const firstAfter = lerp(end, after, knotEnd, knotAfter);
+  const secondStart = lerp(firstBefore, firstMiddle, knotBefore, knotEnd);
+  const secondEnd = lerp(firstMiddle, firstAfter, knotStart, knotAfter);
+  return lerp(secondStart, secondEnd, knotStart, knotEnd);
 }
 
 /**
@@ -152,59 +200,69 @@ function catmullRom(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: number): Vec2 {
  * stroke is cut exactly at the circle and falls apart into the pieces left outside it.
  * Returns those pieces (empty: nothing is left), or null if the circle doesn't touch it.
  */
-export function eraseStroke(pts: readonly Vec2[], center: Vec2, radius: number): Vec2[][] | null {
-  const inside = (p: Vec2) => Math.hypot(p.x - center.x, p.y - center.y) <= radius;
-  if (pts.length === 1) return inside(pts[0]!) ? [] : null;
+export function eraseStroke(
+  points: readonly Vec2[],
+  center: Vec2,
+  radius: number,
+): Vec2[][] | null {
+  const inside = (point: Vec2) => Math.hypot(point.x - center.x, point.y - center.y) <= radius;
+  if (points.length === 1) return inside(points[0]!) ? [] : null;
   // Fine enough that no stretch of the stroke can cross the circle unseen.
-  const dense = densify(pts, radius / 2);
+  const dense = densify(points, radius / 2);
   if (!dense.some(inside)) return null;
   const pieces: Vec2[][] = [];
-  let cur: Vec2[] = [];
-  for (let i = 0; i < dense.length; i++) {
-    const p = dense[i]!;
-    const prev = dense[i - 1];
-    if (!inside(p)) {
+  let current: Vec2[] = [];
+  for (let index = 0; index < dense.length; index++) {
+    const point = dense[index]!;
+    const previous = dense[index - 1];
+    if (!inside(point)) {
       // Leaving the circle: start the piece right on it.
-      if (cur.length === 0 && prev && inside(prev))
-        cur.push(circleCrossing(prev, p, center, radius));
-      cur.push(p);
-    } else if (cur.length > 0) {
+      if (current.length === 0 && previous && inside(previous))
+        current.push(circleCrossing(previous, point, center, radius));
+      current.push(point);
+    } else if (current.length > 0) {
       // Entering it: end the piece right on it.
-      cur.push(circleCrossing(prev!, p, center, radius));
-      pieces.push(cur);
-      cur = [];
+      current.push(circleCrossing(previous!, point, center, radius));
+      pieces.push(current);
+      current = [];
     }
   }
-  if (cur.length > 0) pieces.push(cur);
+  if (current.length > 0) pieces.push(current);
   return pieces.filter((piece) => piece.length >= 2);
 }
 
 /** The stroke with extra points so no segment is longer than `step`. */
-function densify(pts: readonly Vec2[], step: number): Vec2[] {
-  const out: Vec2[] = [pts[0]!];
-  for (let i = 0; i + 1 < pts.length; i++) {
-    const a = pts[i]!;
-    const b = pts[i + 1]!;
-    const k = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / Math.max(step, 1e-6)));
-    for (let j = 1; j <= k; j++)
-      out.push({ x: a.x + ((b.x - a.x) * j) / k, y: a.y + ((b.y - a.y) * j) / k });
+function densify(points: readonly Vec2[], step: number): Vec2[] {
+  const dense: Vec2[] = [points[0]!];
+  for (let index = 0; index + 1 < points.length; index++) {
+    const start = points[index]!;
+    const end = points[index + 1]!;
+    const steps = Math.max(
+      1,
+      Math.ceil(Math.hypot(end.x - start.x, end.y - start.y) / Math.max(step, 1e-6)),
+    );
+    for (let step = 1; step <= steps; step++)
+      dense.push({
+        x: start.x + ((end.x - start.x) * step) / steps,
+        y: start.y + ((end.y - start.y) * step) / steps,
+      });
   }
-  return out;
+  return dense;
 }
 
-/** Where the segment a–b (one end inside the circle, one outside) crosses the circle. */
-function circleCrossing(a: Vec2, b: Vec2, c: Vec2, r: number): Vec2 {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const fx = a.x - c.x;
-  const fy = a.y - c.y;
-  const A = dx * dx + dy * dy;
-  const B = 2 * (fx * dx + fy * dy);
-  const C = fx * fx + fy * fy - r * r;
-  const disc = Math.sqrt(Math.max(0, B * B - 4 * A * C));
+/** Where the segment from `start` to `end` (one inside the circle, one outside) crosses it. */
+function circleCrossing(start: Vec2, end: Vec2, center: Vec2, radius: number): Vec2 {
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const offsetX = start.x - center.x;
+  const offsetY = start.y - center.y;
+  const squaredTerm = deltaX * deltaX + deltaY * deltaY;
+  const linearTerm = 2 * (offsetX * deltaX + offsetY * deltaY);
+  const constantTerm = offsetX * offsetX + offsetY * offsetY - radius * radius;
+  const root = Math.sqrt(Math.max(0, linearTerm * linearTerm - 4 * squaredTerm * constantTerm));
   // The root within the segment.
-  let t = (-B - disc) / (2 * A || 1);
-  if (t < 0 || t > 1) t = (-B + disc) / (2 * A || 1);
-  t = Math.min(1, Math.max(0, t));
-  return { x: a.x + dx * t, y: a.y + dy * t };
+  let fraction = (-linearTerm - root) / (2 * squaredTerm || 1);
+  if (fraction < 0 || fraction > 1) fraction = (-linearTerm + root) / (2 * squaredTerm || 1);
+  fraction = Math.min(1, Math.max(0, fraction));
+  return { x: start.x + deltaX * fraction, y: start.y + deltaY * fraction };
 }

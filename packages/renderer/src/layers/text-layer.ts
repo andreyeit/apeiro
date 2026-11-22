@@ -1,7 +1,8 @@
-import { DirtyRanges, type BufferUpload } from './buffer-upload';
 import {
+  AUTO_GROW_SHARE,
   boxContainsBox,
   boxIntersects,
+  inflateBox,
   isColorGlyph,
   isShape,
   layoutText,
@@ -10,6 +11,7 @@ import {
   type Box,
   type FontMeasurer,
   type FontVariant,
+  type LaidOutGlyph,
   type Scene,
   type SceneChanges,
   type ShapeElement,
@@ -18,31 +20,66 @@ import {
 } from '@apeiro/core';
 import { ColorTheme } from '../color-theme';
 import { textDepth } from '../depth';
-import type { GlyphRasterizer } from '../text/font';
-import type { GlyphAtlas, GlyphInfo } from '../text/glyph-atlas';
+import type { BitmapRasterizer, GlyphRasterizer } from '../text/font';
+import type { AtlasGlyph, GlyphAtlas } from '../text/glyph-atlas';
+import { DirtyRanges, type BufferUpload } from './buffer-upload';
+import {
+  growBuffer,
+  vec4Attributes,
+  writeColorBytes,
+  type InstanceLayout,
+} from './instance-layout';
 
 /**
  * Per-quad instance (interleaved, 56 bytes):
  *   0  f32 anchorX, anchorY  element center (world)
- *   8  f32 offX, offY        quad top-left relative to the center, unrotated
- *   16 f32 w, h, rotation, depth
- *   32 f32 u0, v0, u1, v1    normalized atlas coords
+ *   8  f32 offsetX, offsetY  quad top-left relative to the center, unrotated
+ *   16 f32 width, height, rotation, depth
+ *   32 f32 startU, startV, endU, endV  normalized atlas coordinates
  *   48 f32 mode              MODE_*
  *   52 u8x4 color
  */
 export const GLYPH_STRIDE = 56;
 const FLOATS = GLYPH_STRIDE / 4;
+const COLOR_BYTE = 52;
+
+export const GLYPH_LAYOUT: InstanceLayout = {
+  stride: GLYPH_STRIDE,
+  attributes: [
+    ...vec4Attributes(0, 3),
+    { format: 'float32', components: 1, offset: 48 },
+    { format: 'unorm8', components: 4, offset: COLOR_BYTE },
+  ],
+};
 
 export const MODE_SDF = 0;
 export const MODE_COLOR = 1;
 /** Solid rectangle: underline, strike-through, greeking bars. */
 export const MODE_SOLID = 2;
+/**
+ * A glyph rasterized at exactly its size on screen and drawn pixel for pixel (its element's
+ * anchor snapped to the device pixel grid), the way the browser draws text: as crisp as the
+ * page's own text. Used once the zoom has settled; while it changes, glyphs come from the
+ * distance fields, which scale smoothly.
+ */
+export const MODE_BITMAP = 3;
+/** Horizontal glyph positions keep this many steps per pixel (spacing stays even). */
+const SUBPIXEL_STEPS = 4;
+/** Frames the zoom must stay the same before text is drawn from exact-size bitmaps. */
+const SETTLE_FRAMES = 3;
 
 /** Raster sizes. A glyph is drawn from the smallest tier that is at most ~1.5x magnified. */
 export const SDF_TIERS = [32, 64, 128, 256, 512] as const;
 /** Bitmaps don't scale down as well as distance fields: small emoji get their own tier. */
 export const COLOR_TIERS = [16, 32, 64, 128, 256] as const;
 const MAX_MAGNIFICATION = 1.5;
+/**
+ * Largest tier rasterized ahead of time (see `prefetchGlyphs`). Bigger ones cost a lot of
+ * atlas space and rasterization (a 512 px glyph takes 64 of the 400 units of a frame).
+ */
+const PREFETCH_MAX_TIER = 256;
+/** Glyphs waiting to be rasterized ahead of time, at most. */
+const PREFETCH_MAX_GLYPHS = 4096;
 /** Memory for quads kept per element between builds (oldest blocks are dropped first). */
 const BLOCK_CACHE_BYTES = 32 * 1024 * 1024;
 
@@ -62,24 +99,39 @@ export interface TextLayerOptions {
   budgetUnits?: number;
   /** Max cached layouts (FIFO eviction). */
   layoutCacheSize?: number;
+  /**
+   * Once the zoom settles, draw unrotated text from glyphs rasterized at their exact size on
+   * screen (see `MODE_BITMAP`) instead of distance fields (default true).
+   */
+  crisp?: boolean;
 }
 
 export interface TextRasterizers {
   sdf: GlyphRasterizer;
   color: GlyphRasterizer;
+  bitmap: BitmapRasterizer;
+}
+
+/** A glyph to rasterize ahead of time at the tier above the one it is drawn from. */
+interface PrefetchGlyph {
+  atlas: GlyphAtlas;
+  size: number;
+  cluster: string;
+  variant: FontVariant;
+  rasterize: GlyphRasterizer;
 }
 
 interface CachedLayout {
-  w: number;
-  h: number;
+  width: number;
+  height: number;
   layout: TextLayout;
 }
 
 /** Everything `textArea` and the layout depend on: if any of it changes, text is laid out again. */
 interface LayoutInputs {
   text: TextBlock;
-  w: number;
-  h: number;
+  width: number;
+  height: number;
   strokeWidth: number;
   type: ShapeElement['type'];
   sides: ShapeElement['sides'];
@@ -89,6 +141,8 @@ interface LayoutInputs {
 interface Range extends LayoutInputs {
   start: number;
   end: number;
+  /** Drawn from exact-size bitmaps: valid only unrotated and at the built scale. */
+  crisp: boolean;
 }
 
 /**
@@ -104,10 +158,12 @@ interface QuadBlock extends LayoutInputs {
   minPx: number;
   maxPx: number;
   tierCap: number;
+  /** Device px per world unit its bitmap glyphs were made for, null for distance fields. */
+  crispScale: number | null;
   generations: string;
   theme: ColorTheme;
-  cx: number;
-  cy: number;
+  centerX: number;
+  centerY: number;
   rotation: number;
   depth: number;
   /** Null for text that was too small to draw: only its `maxFontSize` is kept. */
@@ -138,20 +194,31 @@ export class TextLayer {
   private blocks = new Map<string, QuadBlock>();
   private blockBytes = 0;
   private buffer = new ArrayBuffer(4096 * GLYPH_STRIDE);
-  private f32 = new Float32Array(this.buffer);
-  private u8 = new Uint8Array(this.buffer);
-  private _count = 0;
+  private floats = new Float32Array(this.buffer);
+  private bytes = new Uint8Array(this.buffer);
+  private quadCount = 0;
   private covered: Box | null = null;
   private builtZoom = 0;
-  private builtDpr = 0;
+  private builtPixelRatio = 0;
   private builtGenerations = '';
   private builtTierCap = SDF_TIERS.length - 1;
+  /** Device px per world unit of the build's bitmap glyphs, null if it used distance fields. */
+  private builtCrispScale: number | null = null;
+  /** Device px per world unit of the last frame, and for how many frames it stayed so. */
+  private lastScale = 0;
+  private steadyFrames = 0;
   private dirty = true;
   private incomplete = false;
   /** The quad budget ran out in this build: the rest of the text is skipped. */
   private full = false;
   /** Elements to finish in a later frame: their layout or the wanted glyph tier was missing. */
   private pending: string[] = [];
+  /**
+   * Glyphs at the tier above the one they are drawn from, by atlas key: rasterized in frames
+   * with budget to spare, so zooming in finds them ready instead of magnifying the smaller
+   * tier (rounded corners, smudged strokes) until they are rasterized.
+   */
+  private prefetch = new Map<string, PrefetchGlyph>();
   private considered = new Map<string, Range>();
   private hidden = new Set<string>();
   private changed = new DirtyRanges();
@@ -183,18 +250,24 @@ export class TextLayer {
       budgetMs: options.budgetMs ?? 6,
       budgetUnits: options.budgetUnits ?? 400,
       layoutCacheSize: options.layoutCacheSize ?? 20_000,
+      crisp: options.crisp ?? true,
     };
   }
 
   get count(): number {
-    return this._count;
+    return this.quadCount;
   }
   get data(): ArrayBuffer {
     return this.buffer;
   }
   /** True while glyphs or layouts are still being produced over several frames. */
   get needsMoreFrames(): boolean {
-    return this.incomplete;
+    return this.incomplete || this.prefetch.size > 0 || this.awaitingCrisp;
+  }
+
+  /** The zoom stopped, but the text is not drawn from exact-size bitmaps yet. */
+  private get awaitingCrisp(): boolean {
+    return this.options.crisp && this.lastScale > 0 && this.builtCrispScale !== this.lastScale;
   }
 
   /** Returns what changed in the CPU buffer since the last call. */
@@ -222,54 +295,57 @@ export class TextLayer {
   resetLayouts(): void {
     this.layouts.clear();
     this.blocks.clear();
+    this.prefetch.clear();
     this.blockBytes = 0;
     this.dirty = true;
   }
 
   /** Cached layout of an element's text (computed synchronously if missing). */
-  layoutOf(el: ShapeElement): TextLayout | undefined {
-    if (!el.text) return undefined;
-    return this.layout(el, el.text, true);
+  layoutOf(element: ShapeElement): TextLayout | undefined {
+    if (!element.text) return undefined;
+    return this.layout(element, element.text, true);
   }
 
   /**
    * Applies scene changes: moves quads of elements that only moved/rotated,
    * and schedules a rebuild for anything else that affects visible text.
    */
-  applyChanges(c: SceneChanges): void {
-    for (const id of c.removed) this.forgetBlock(id);
+  applyChanges(changes: SceneChanges): void {
+    for (const id of changes.removed) this.forgetBlock(id);
     if (this.maxTextSize >= 0) {
-      for (const el of c.added) this.noteTextSize(el);
-      for (const el of c.updated) this.noteTextSize(el);
+      for (const element of changes.added) this.noteTextSize(element);
+      for (const element of changes.updated) this.noteTextSize(element);
     }
     if (this.dirty || !this.covered) return;
     const covered = this.covered;
-    for (const id of c.removed) {
+    for (const id of changes.removed) {
       const range = this.considered.get(id);
       if (range) this.hideRange(range);
       this.considered.delete(id);
     }
-    for (const el of c.added) {
-      if (isShape(el) && el.text && this.overlaps(el, covered)) {
+    for (const element of changes.added) {
+      if (isShape(element) && element.text && this.overlaps(element, covered)) {
         this.dirty = true;
         return;
       }
     }
-    for (const el of c.updated) {
-      if (!isShape(el)) continue;
-      const range = this.considered.get(el.id);
+    for (const element of changes.updated) {
+      if (!isShape(element)) continue;
+      const range = this.considered.get(element.id);
       if (!range) {
-        if (el.text && this.overlaps(el, covered)) {
+        if (element.text && this.overlaps(element, covered)) {
           this.dirty = true;
           return;
         }
         continue;
       }
-      if (!sameLayoutInputs(range, el)) {
+      // Bitmap glyphs can't turn: a rotation (or back to none) needs the other kind.
+      const crispNow = this.builtCrispScale !== null && element.rotation === 0;
+      if (!sameLayoutInputs(range, element) || range.crisp !== crispNow) {
         this.dirty = true;
         return;
       }
-      this.moveRange(range, el);
+      this.moveRange(range, element);
     }
   }
 
@@ -278,28 +354,42 @@ export class TextLayer {
     scene: Scene,
     view: Box,
     zoom: number,
-    dpr: number,
+    pixelRatio: number,
     slotOf: (id: string) => number | undefined,
   ): void {
+    // Bitmap glyphs once the zoom has stayed the same for a few frames.
+    const scale = zoom * pixelRatio;
+    this.steadyFrames = scale === this.lastScale ? this.steadyFrames + 1 : 0;
+    this.lastScale = scale;
+    const crispScale = this.options.crisp && this.steadyFrames >= SETTLE_FRAMES ? scale : null;
+    if (crispScale !== this.builtCrispScale) this.dirty = true;
     const zoomChanged = zoom > this.builtZoom * 1.25 || zoom < this.builtZoom / 1.25;
     const sameView =
       !zoomChanged &&
-      dpr === this.builtDpr &&
+      pixelRatio === this.builtPixelRatio &&
       this.builtGenerations === this.generations() &&
       this.covered !== null &&
       boxContainsBox(this.covered, view);
-    if (!this.dirty && !this.incomplete && sameView) return;
-    const t0 = performance.now();
+    if (!this.dirty && !this.incomplete && sameView) {
+      // Nothing to build: the frame's budget goes to glyphs for zooming in.
+      if (this.prefetch.size > 0) {
+        this.spentMs = 0;
+        this.spentUnits = 0;
+        this.prefetchGlyphs();
+      }
+      return;
+    }
+    const startTime = performance.now();
     this.spentMs = 0;
     this.spentUnits = 0;
     if (this.maxTextSize < 0) {
       this.maxTextSize = 0;
-      for (const el of scene.all()) this.noteTextSize(el);
+      for (const element of scene.all()) this.noteTextSize(element);
     }
     if (!this.dirty && sameView) {
       // Only work left over from earlier frames: add it to what is already built.
-      this.resume(scene, zoom, dpr, slotOf);
-      this.lastBuildMs = performance.now() - t0;
+      this.resume(scene, zoom, pixelRatio, slotOf);
+      this.lastBuildMs = performance.now() - startTime;
       return;
     }
     // An atlas change mid-build invalidates already written UVs (they are normalized by the
@@ -310,7 +400,7 @@ export class TextLayer {
     for (let attempt = 0; attempt < 3 && !settled; attempt++) {
       const before = this.generations();
       const resets = this.resets();
-      this.build(scene, view, zoom, dpr, slotOf, tierCap);
+      this.build(scene, view, zoom, pixelRatio, slotOf, tierCap, crispScale);
       settled = this.generations() === before;
       if (this.resets() !== resets) tierCap = Math.max(0, tierCap - 1);
     }
@@ -320,13 +410,13 @@ export class TextLayer {
       this.dirty = true;
       this.incomplete = true;
     }
-    this.lastBuildMs = performance.now() - t0;
+    this.lastBuildMs = performance.now() - startTime;
   }
 
   /** Changes whenever written atlas UVs become stale: a reset, or growth (UVs are normalized). */
   private generations(): string {
-    const { sdfAtlas: s, colorAtlas: c } = this;
-    return `${s.generation}:${s.size}:${c.generation}:${c.size}`;
+    const { sdfAtlas, colorAtlas } = this;
+    return `${sdfAtlas.generation}:${sdfAtlas.size}:${colorAtlas.generation}:${colorAtlas.size}`;
   }
 
   private resets(): string {
@@ -337,19 +427,14 @@ export class TextLayer {
     scene: Scene,
     view: Box,
     zoom: number,
-    dpr: number,
+    pixelRatio: number,
     slotOf: (id: string) => number | undefined,
     tierCap: number,
+    crispScale: number | null,
   ): void {
-    const mx = (view.maxX - view.minX) * 0.5;
-    const my = (view.maxY - view.minY) * 0.5;
-    const covered = {
-      minX: view.minX - mx,
-      minY: view.minY - my,
-      maxX: view.maxX + mx,
-      maxY: view.maxY + my,
-    };
-    this._count = 0;
+    // The viewport and half of it around: small pans need no rebuild.
+    const covered = inflateBox(view, (view.maxX - view.minX) * 0.5, (view.maxY - view.minY) * 0.5);
+    this.quadCount = 0;
     this.considered.clear();
     this.incomplete = false;
     this.full = false;
@@ -358,15 +443,16 @@ export class TextLayer {
 
     // Zoomed out so far that even the largest text on the board is invisible: nothing to visit.
     if (this.maxTextSize * zoom >= this.options.minGreekPx) {
-      for (const el of scene.queryBox(covered)) {
-        this.place(el, zoom, zoom * dpr, tierCap, generations, slotOf);
+      for (const element of scene.queryBox(covered)) {
+        this.place(element, zoom, zoom * pixelRatio, tierCap, crispScale, generations, slotOf);
       }
     }
 
     this.covered = covered;
     this.builtZoom = zoom;
-    this.builtDpr = dpr;
+    this.builtPixelRatio = pixelRatio;
     this.builtTierCap = tierCap;
+    this.builtCrispScale = crispScale;
     this.builtGenerations = this.generations();
     this.dirty = false;
     this.changed.markAll();
@@ -379,30 +465,38 @@ export class TextLayer {
   private resume(
     scene: Scene,
     zoom: number,
-    dpr: number,
+    pixelRatio: number,
     slotOf: (id: string) => number | undefined,
   ): void {
     const ids = this.pending;
     this.pending = [];
     this.incomplete = false;
     const generations = this.generations();
-    for (let i = 0; i < ids.length; i++) {
+    for (let index = 0; index < ids.length; index++) {
       if (!this.canWork()) {
         // This frame's budget is spent: the rest waits for the next one, untouched.
-        for (let j = i; j < ids.length; j++) this.defer(ids[j]!);
+        for (const rest of ids.slice(index)) this.defer(rest);
         break;
       }
-      const id = ids[i]!;
-      const old = this.considered.get(id);
-      if (old) {
-        this.hideRange(old);
+      const id = ids[index]!;
+      const previous = this.considered.get(id);
+      if (previous) {
+        this.hideRange(previous);
         this.considered.delete(id);
       }
-      const el = scene.get(id);
-      if (!el) continue;
-      const start = this._count;
-      this.place(el, zoom, zoom * dpr, this.builtTierCap, generations, slotOf);
-      if (this._count > start) this.changed.mark(start, this._count);
+      const element = scene.get(id);
+      if (!element) continue;
+      const start = this.quadCount;
+      this.place(
+        element,
+        zoom,
+        zoom * pixelRatio,
+        this.builtTierCap,
+        this.builtCrispScale,
+        generations,
+        slotOf,
+      );
+      if (this.quadCount > start) this.changed.mark(start, this.quadCount);
     }
     if (this.generations() !== generations) {
       // An atlas grew or started over: quads written before point at old positions.
@@ -414,44 +508,52 @@ export class TextLayer {
 
   /** Appends the quads of one element: copied from its cached block, or emitted. */
   private place(
-    el: BoardElement,
+    element: BoardElement,
     zoom: number,
-    pxPerUnit: number,
+    pixelsPerUnit: number,
     tierCap: number,
+    /** Device px per world unit to draw bitmap glyphs for, null for distance fields. */
+    crispScale: number | null,
     generations: string,
     slotOf: (id: string) => number | undefined,
   ): void {
-    if (!isShape(el)) return;
-    const block = el.text;
-    if (!block || block.runs.length === 0 || this.hidden.has(el.id)) return;
+    if (!isShape(element)) return;
+    const block = element.text;
+    if (!block || block.runs.length === 0 || this.hidden.has(element.id)) return;
     const { minGlyphPx, minGreekPx, maxQuads } = this.options;
-    const start = this._count;
-    const cached = this.blocks.get(el.id);
-    const known = cached !== undefined && sameLayoutInputs(cached, el);
-    // Cheap rejection before layout: autoFit can only shrink sizes.
-    if (this.full || (known ? cached.maxFontSize : largestSize(block)) * zoom < minGreekPx) {
-      this.considered.set(el.id, rangeOf(el, start, start));
+    const start = this.quadCount;
+    const cached = this.blocks.get(element.id);
+    const known = cached !== undefined && sameLayoutInputs(cached, element);
+    // Cheap rejection before layout: autoFit only shrinks sizes, autoGrow up to its limit.
+    const upperSize = block.autoGrow
+      ? Math.max(largestSize(block), AUTO_GROW_SHARE * Math.min(element.width, element.height))
+      : largestSize(block);
+    if (this.full || (known ? cached.maxFontSize : upperSize) * zoom < minGreekPx) {
+      this.considered.set(element.id, rangeOf(element, start, start, false));
       return;
     }
     let layout: TextLayout | undefined;
     let maxFontSize: number;
     if (known) maxFontSize = cached.maxFontSize;
     else {
-      layout = this.layout(el, block, false);
-      if (!layout) return this.defer(el.id); // out of budget: lay it out next frame
+      layout = this.layout(element, block, false);
+      if (!layout) return this.defer(element.id); // out of budget: lay it out next frame
       maxFontSize = layout.maxFontSize;
     }
     const screenSize = maxFontSize * zoom;
     if (screenSize < minGreekPx) {
       // Remember its size: next builds skip this text without looking up its layout.
-      if (!known) this.rememberBlock(el, maxFontSize, false, 0, null, tierCap, generations);
-      this.considered.set(el.id, rangeOf(el, start, start));
+      if (!known)
+        this.rememberBlock(element, maxFontSize, false, 0, null, tierCap, null, generations);
+      this.considered.set(element.id, rangeOf(element, start, start, false));
       return;
     }
-    const slot = slotOf(el.id);
+    const slot = slotOf(element.id);
     if (slot === undefined) return;
     const depth = textDepth(slot);
     const greek = screenSize < minGlyphPx;
+    // Bitmap glyphs are drawn upright on the pixel grid: rotated text keeps distance fields.
+    const elementCrisp = !greek && element.rotation === 0 ? crispScale : null;
 
     if (
       known &&
@@ -461,28 +563,38 @@ export class TextLayer {
       (greek ||
         (cached.generations === generations &&
           cached.tierCap === tierCap &&
-          pxPerUnit > cached.minPx &&
-          pxPerUnit <= cached.maxPx))
+          cached.crispScale === elementCrisp &&
+          (elementCrisp !== null ||
+            (pixelsPerUnit > cached.minPx && pixelsPerUnit <= cached.maxPx))))
     ) {
-      if (!this.copyBlock(cached, cached.quads, el, depth)) this.full = true;
+      if (!this.copyBlock(cached, cached.quads, element, depth)) this.full = true;
     } else {
-      layout ??= this.layout(el, block, false);
-      if (!layout) return this.defer(el.id);
+      layout ??= this.layout(element, block, false);
+      if (!layout) return this.defer(element.id);
       this.usedFallback = false;
       this.minPx = 0;
       this.maxPx = Infinity;
-      const ok = greek
-        ? this.emitGreek(el, layout, depth)
-        : this.emitGlyphs(el, layout, depth, pxPerUnit, tierCap);
-      if (!ok) this.full = true;
-      else if (this.usedFallback) this.defer(el.id); // drawn with borrowed glyphs for now
+      const emitted = greek
+        ? this.emitGreek(element, layout, depth)
+        : this.emitGlyphs(element, layout, depth, pixelsPerUnit, tierCap, elementCrisp);
+      if (!emitted) this.full = true;
+      else if (this.usedFallback) this.defer(element.id); // drawn with borrowed glyphs for now
       else {
-        const quads = this.f32.slice(start * FLOATS, this._count * FLOATS);
-        this.rememberBlock(el, layout.maxFontSize, greek, depth, quads, tierCap, generations);
+        const quads = this.floats.slice(start * FLOATS, this.quadCount * FLOATS);
+        this.rememberBlock(
+          element,
+          layout.maxFontSize,
+          greek,
+          depth,
+          quads,
+          tierCap,
+          elementCrisp,
+          generations,
+        );
       }
     }
-    if (this._count >= maxQuads) this.full = true;
-    this.considered.set(el.id, rangeOf(el, start, this._count));
+    if (this.quadCount >= maxQuads) this.full = true;
+    this.considered.set(element.id, rangeOf(element, start, this.quadCount, elementCrisp !== null));
   }
 
   private defer(id: string): void {
@@ -491,101 +603,111 @@ export class TextLayer {
   }
 
   /** Copies a cached block into the buffer (patched to where the element is now). */
-  private copyBlock(block: QuadBlock, q: Float32Array, el: ShapeElement, depth: number): boolean {
-    const cx = el.x + el.w / 2;
-    const cy = el.y + el.h / 2;
+  private copyBlock(
+    block: QuadBlock,
+    quads: Float32Array,
+    element: ShapeElement,
+    depth: number,
+  ): boolean {
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
     if (
-      block.cx !== cx ||
-      block.cy !== cy ||
-      block.rotation !== el.rotation ||
+      block.centerX !== centerX ||
+      block.centerY !== centerY ||
+      block.rotation !== element.rotation ||
       block.depth !== depth
     ) {
-      for (let f = 0; f < q.length; f += FLOATS) {
-        q[f] = cx;
-        q[f + 1] = cy;
-        q[f + 6] = el.rotation;
-        q[f + 7] = depth;
+      for (let offset = 0; offset < quads.length; offset += FLOATS) {
+        quads[offset] = centerX;
+        quads[offset + 1] = centerY;
+        quads[offset + 6] = element.rotation;
+        quads[offset + 7] = depth;
       }
-      block.cx = cx;
-      block.cy = cy;
-      block.rotation = el.rotation;
+      block.centerX = centerX;
+      block.centerY = centerY;
+      block.rotation = element.rotation;
       block.depth = depth;
     }
-    const room = this.options.maxQuads - this._count;
-    const n = Math.min(q.length / FLOATS, room);
-    this.ensureCapacity(this._count + n);
+    const room = this.options.maxQuads - this.quadCount;
+    const count = Math.min(quads.length / FLOATS, room);
+    this.ensureCapacity(this.quadCount + count);
     // Same-type typed array copy: bytes are preserved, colours included.
-    this.f32.set(n * FLOATS === q.length ? q : q.subarray(0, n * FLOATS), this._count * FLOATS);
-    this._count += n;
-    return n * FLOATS === q.length;
+    this.floats.set(
+      count * FLOATS === quads.length ? quads : quads.subarray(0, count * FLOATS),
+      this.quadCount * FLOATS,
+    );
+    this.quadCount += count;
+    return count * FLOATS === quads.length;
   }
 
   private rememberBlock(
-    el: ShapeElement,
+    element: ShapeElement,
     maxFontSize: number,
     greek: boolean,
     depth: number,
     quads: Float32Array | null,
     tierCap: number,
+    crispScale: number | null,
     generations: string,
   ): void {
-    this.forgetBlock(el.id);
-    this.blocks.set(el.id, {
-      text: el.text!,
-      w: el.w,
-      h: el.h,
-      strokeWidth: el.strokeWidth,
-      type: el.type,
-      sides: el.sides,
+    this.forgetBlock(element.id);
+    this.blocks.set(element.id, {
+      text: element.text!,
+      width: element.width,
+      height: element.height,
+      strokeWidth: element.strokeWidth,
+      type: element.type,
+      sides: element.sides,
       maxFontSize,
       greek,
       minPx: this.minPx,
       maxPx: this.maxPx,
       tierCap,
+      crispScale,
       generations,
       theme: this.theme,
-      cx: el.x + el.w / 2,
-      cy: el.y + el.h / 2,
-      rotation: el.rotation,
+      centerX: element.x + element.width / 2,
+      centerY: element.y + element.height / 2,
+      rotation: element.rotation,
       depth,
       quads,
     });
     this.blockBytes += blockSize(quads);
-    for (const [id, old] of this.blocks) {
+    for (const [id, oldest] of this.blocks) {
       if (this.blockBytes <= BLOCK_CACHE_BYTES) break;
       this.blocks.delete(id);
-      this.blockBytes -= blockSize(old.quads);
+      this.blockBytes -= blockSize(oldest.quads);
     }
   }
 
   private forgetBlock(id: string): void {
-    const old = this.blocks.get(id);
-    if (!old) return;
+    const block = this.blocks.get(id);
+    if (!block) return;
     this.blocks.delete(id);
-    this.blockBytes -= blockSize(old.quads);
+    this.blockBytes -= blockSize(block.quads);
   }
 
-  private noteTextSize(el: BoardElement): void {
-    const block = isShape(el) ? el.text : undefined;
+  private noteTextSize(element: BoardElement): void {
+    const block = isShape(element) ? element.text : undefined;
     if (block) this.maxTextSize = Math.max(this.maxTextSize, largestSize(block));
   }
 
-  private layout(el: ShapeElement, block: TextBlock, force: boolean): TextLayout | undefined {
+  private layout(element: ShapeElement, block: TextBlock, force: boolean): TextLayout | undefined {
     const cached = this.layouts.get(block);
     // Out of budget and nothing cached: no need to measure the text area just to say no.
     if (!cached && !force && !this.canWork()) return undefined;
-    const area = textArea(el);
-    const w = area.maxX - area.minX;
-    const h = area.maxY - area.minY;
-    if (cached && cached.w === w && cached.h === h) return cached.layout;
+    const area = textArea(element);
+    const width = area.maxX - area.minX;
+    const height = area.maxY - area.minY;
+    if (cached && cached.width === width && cached.height === height) return cached.layout;
     if (!force && !this.canWork()) return undefined;
-    const t = performance.now();
+    const startTime = performance.now();
     // Auto-width text never wraps: its box may lag behind (e.g. fonts loaded after it was sized).
-    const noWrap = el.type === 'text' && block.sizing === 'auto-width';
-    const layout = layoutText(block, w, h, this.measurer, noWrap);
-    this.spend(t, 1);
+    const noWrap = element.type === 'text' && block.sizing === 'auto-width';
+    const layout = layoutText(block, width, height, this.measurer, noWrap);
+    this.spend(startTime, 1);
     this.layouts.delete(block);
-    this.layouts.set(block, { w, h, layout });
+    this.layouts.set(block, { width, height, layout });
     if (this.layouts.size > this.options.layoutCacheSize) {
       this.layouts.delete(this.layouts.keys().next().value!);
     }
@@ -594,70 +716,135 @@ export class TextLayer {
 
   /** Returns false when the quad budget is exhausted. */
   private emitGlyphs(
-    el: ShapeElement,
+    element: ShapeElement,
     layout: TextLayout,
     depth: number,
     /** Device pixels per world unit. */
-    pxPerUnit: number,
+    pixelsPerUnit: number,
     tierCap: number,
+    /** Device px per world unit to draw bitmap glyphs for, null for distance fields. */
+    crispScale: number | null,
   ): boolean {
-    const area = textArea(el);
-    const cx = el.x + el.w / 2;
-    const cy = el.y + el.h / 2;
-    const ox = area.minX - el.w / 2;
-    const oy = area.minY - el.h / 2;
+    const area = textArea(element);
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    const offsetX = area.minX - element.width / 2;
+    const offsetY = area.minY - element.height / 2;
 
-    for (const g of layout.glyphs) {
-      if (this._count >= this.options.maxQuads) return false;
-      const color = isColorGlyph(g.char);
+    for (const laidOut of layout.glyphs) {
+      if (this.quadCount >= this.options.maxQuads) return false;
+      const color = isColorGlyph(laidOut.cluster);
+      if (crispScale !== null && !color) {
+        const position = { centerX, centerY, offsetX, offsetY, depth };
+        if (this.emitBitmapGlyph(element, laidOut, position, crispScale)) continue;
+      }
       const atlas = color ? this.colorAtlas : this.sdfAtlas;
       // Each glyph picks its own raster tier: sizes can differ within one text.
       const tiers = color ? COLOR_TIERS : SDF_TIERS;
-      const tier = pickTier(tiers, g.size * pxPerUnit, tierCap);
-      this.noteTierRange(tiers, tier, tierCap, g.size);
+      const tier = pickTier(tiers, laidOut.size * pixelsPerUnit, tierCap);
+      this.noteTierRange(tiers, tier, tierCap, laidOut.size);
       const glyph = this.glyph(
         atlas,
         tiers,
         tier,
-        g.char,
-        g.variant,
+        laidOut.cluster,
+        laidOut.variant,
         color ? this.rasterizers.color : this.rasterizers.sdf,
       );
       if (!glyph || glyph.width === 0) continue;
-      const scale = g.size / glyph.rasterSize;
-      const inv = 1 / atlas.size;
+      const scale = laidOut.size / glyph.rasterSize;
+      const texel = 1 / atlas.size;
       this.write(
-        cx,
-        cy,
-        ox + g.x + glyph.left * scale,
-        oy + g.y - glyph.top * scale,
+        centerX,
+        centerY,
+        offsetX + laidOut.x + glyph.left * scale,
+        offsetY + laidOut.y - glyph.top * scale,
         glyph.width * scale,
         glyph.height * scale,
-        el.rotation,
+        element.rotation,
         depth,
-        glyph.x * inv,
-        glyph.y * inv,
-        (glyph.x + glyph.width) * inv,
-        (glyph.y + glyph.height) * inv,
+        glyph.x * texel,
+        glyph.y * texel,
+        (glyph.x + glyph.width) * texel,
+        (glyph.y + glyph.height) * texel,
         color ? MODE_COLOR : MODE_SDF,
         // Color glyphs keep their own colors; only the text color's alpha applies.
-        color ? (0xffffff00 | (g.color & 255)) >>> 0 : this.theme.of(el.type, g.color),
+        color
+          ? (0xffffff00 | (laidOut.color & 255)) >>> 0
+          : this.theme.of(element.type, laidOut.color),
       );
     }
-    for (const d of layout.decorations) {
-      if (this._count >= this.options.maxQuads) return false;
+    for (const decoration of layout.decorations) {
+      if (this.quadCount >= this.options.maxQuads) return false;
       this.solid(
-        cx,
-        cy,
-        ox + d.x,
-        oy + d.y - d.thickness / 2,
-        d.width,
-        d.thickness,
-        el.rotation,
+        centerX,
+        centerY,
+        offsetX + decoration.x,
+        offsetY + decoration.y - decoration.thickness / 2,
+        decoration.width,
+        decoration.thickness,
+        element.rotation,
         depth,
-        this.theme.of(el.type, d.color),
+        this.theme.of(element.type, decoration.color),
       );
     }
+    return true;
+  }
+
+  /**
+   * Emits a glyph rasterized at exactly its size on screen (`MODE_BITMAP`): whole device
+   * pixels from its element's anchor, a quarter-pixel step across (baked into the bitmap),
+   * the baseline on a whole pixel, as the browser lays out text. False when it can't be
+   * rasterized this frame: the caller draws it from the distance field meanwhile.
+   */
+  private emitBitmapGlyph(
+    element: ShapeElement,
+    laidOut: LaidOutGlyph,
+    position: { centerX: number; centerY: number; offsetX: number; offsetY: number; depth: number },
+    scale: number,
+  ): boolean {
+    // Pen position relative to the element's center, in device pixels.
+    const penX = (position.offsetX + laidOut.x) * scale;
+    const penY = (position.offsetY + laidOut.y) * scale;
+    let pixelX = Math.floor(penX);
+    let subpixel = Math.round((penX - pixelX) * SUBPIXEL_STEPS) / SUBPIXEL_STEPS;
+    if (subpixel === 1) {
+      pixelX += 1;
+      subpixel = 0;
+    }
+    const baseline = Math.round(penY);
+    const size = Math.round(laidOut.size * scale * 4) / 4;
+    const key = `bitmap|${laidOut.variant}|${size}|${subpixel}|${laidOut.cluster}`;
+    let glyph = this.sdfAtlas.peek(key);
+    if (!glyph) {
+      if (!this.canWork()) {
+        this.incomplete = true;
+        this.usedFallback = true;
+        return false;
+      }
+      const startTime = performance.now();
+      const raster = this.rasterizers.bitmap(laidOut.cluster, laidOut.variant, size, subpixel);
+      glyph = this.sdfAtlas.insert(key, raster, size);
+      this.spend(startTime, rasterUnits(size));
+    }
+    if (glyph.width === 0) return true; // nothing to draw (a space)
+    const texel = 1 / this.sdfAtlas.size;
+    this.write(
+      position.centerX,
+      position.centerY,
+      (pixelX + glyph.left) / scale,
+      (baseline - glyph.top) / scale,
+      glyph.width / scale,
+      glyph.height / scale,
+      0,
+      position.depth,
+      glyph.x * texel,
+      glyph.y * texel,
+      (glyph.x + glyph.width) * texel,
+      (glyph.y + glyph.height) * texel,
+      MODE_BITMAP,
+      this.theme.of(element.type, laidOut.color),
+    );
     return true;
   }
 
@@ -677,27 +864,27 @@ export class TextLayer {
   }
 
   /** Far away, each line becomes a translucent bar so the board keeps its texture. */
-  private emitGreek(el: ShapeElement, layout: TextLayout, depth: number): boolean {
-    const area = textArea(el);
-    const cx = el.x + el.w / 2;
-    const cy = el.y + el.h / 2;
-    const ox = area.minX - el.w / 2;
-    const oy = area.minY - el.h / 2;
+  private emitGreek(element: ShapeElement, layout: TextLayout, depth: number): boolean {
+    const area = textArea(element);
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    const offsetX = area.minX - element.width / 2;
+    const offsetY = area.minY - element.height / 2;
     for (const line of layout.lines) {
       const size = line.size;
-      if (this._count >= this.options.maxQuads) return false;
-      const drawn = this.theme.of(el.type, line.color);
+      if (this.quadCount >= this.options.maxQuads) return false;
+      const drawn = this.theme.of(element.type, line.color);
       const alpha = Math.round((drawn & 255) * 0.35);
       const color = ((drawn & 0xffffff00) | alpha) >>> 0;
       // A bar over the x-height of the line.
       this.solid(
-        cx,
-        cy,
-        ox + line.x,
-        oy + line.y - size * 0.6,
+        centerX,
+        centerY,
+        offsetX + line.x,
+        offsetY + line.y - size * 0.6,
         line.width,
         size * 0.5,
-        el.rotation,
+        element.rotation,
         depth,
         color,
       );
@@ -717,26 +904,73 @@ export class TextLayer {
     cluster: string,
     variant: FontVariant,
     rasterize: GlyphRasterizer,
-  ): GlyphInfo | undefined {
-    const key = (t: number) => `${tiers[t]}|${variant}|${cluster}`;
+  ): AtlasGlyph | undefined {
+    const key = (tierIndex: number) => glyphKey(tiers[tierIndex]!, variant, cluster);
     const exact = atlas.peek(key(tier));
-    if (exact) return exact;
+    if (exact) {
+      this.notePrefetch(atlas, tiers, tier + 1, cluster, variant, rasterize);
+      return exact;
+    }
     if (this.canWork()) {
       const size = tiers[tier]!;
-      const t = performance.now();
-      const info = atlas.insert(key(tier), rasterize(cluster, variant, size), size);
-      this.spend(t, Math.max(1, (size * size) / 4096));
-      return info;
+      const startTime = performance.now();
+      const inserted = atlas.insert(key(tier), rasterize(cluster, variant, size), size);
+      this.spend(startTime, rasterUnits(size));
+      this.notePrefetch(atlas, tiers, tier + 1, cluster, variant, rasterize);
+      return inserted;
     }
     this.incomplete = true;
     this.usedFallback = true;
-    for (let d = 1; d < tiers.length; d++) {
-      const lower = tier - d >= 0 ? atlas.peek(key(tier - d)) : undefined;
-      if (lower) return lower;
-      const higher = tier + d < tiers.length ? atlas.peek(key(tier + d)) : undefined;
+    // A bigger tier first: drawn smaller it stays sharp, while a smaller one drawn bigger
+    // rounds the corners and smudges the strokes until the wanted tier is rasterized.
+    for (let distance = 1; distance < tiers.length; distance++) {
+      const higher = tier + distance < tiers.length ? atlas.peek(key(tier + distance)) : undefined;
       if (higher) return higher;
+      const lower = tier - distance >= 0 ? atlas.peek(key(tier - distance)) : undefined;
+      if (lower) return lower;
     }
     return undefined;
+  }
+
+  /** Queues a glyph at `tier` for `prefetchGlyphs`, unless it is there or too big. */
+  private notePrefetch(
+    atlas: GlyphAtlas,
+    tiers: readonly number[],
+    tier: number,
+    cluster: string,
+    variant: FontVariant,
+    rasterize: GlyphRasterizer,
+  ): void {
+    const size = tiers[tier];
+    if (size === undefined || size > PREFETCH_MAX_TIER) return;
+    if (this.prefetch.size >= PREFETCH_MAX_GLYPHS) return;
+    const key = glyphKey(size, variant, cluster);
+    const queueKey = `${atlas.channels}|${key}`;
+    if (this.prefetch.has(queueKey) || atlas.peek(key)) return;
+    this.prefetch.set(queueKey, { atlas, size, cluster, variant, rasterize });
+  }
+
+  /**
+   * Rasterizes queued glyphs at the tier above the one they are drawn from, within the
+   * frame's budget, while nothing else is to be done. Only into the space the atlases have
+   * left: growing or starting an atlas over would make the whole visible text build again,
+   * which is what this is meant to save. What doesn't fit is dropped.
+   */
+  private prefetchGlyphs(): void {
+    for (const [queueKey, glyph] of this.prefetch) {
+      if (!this.canWork()) return;
+      this.prefetch.delete(queueKey);
+      const { atlas, size, cluster, variant, rasterize } = glyph;
+      const key = glyphKey(size, variant, cluster);
+      if (atlas.peek(key)) continue;
+      // Rough bitmap bound before rasterizing: a glyph with its SDF padding is about a tier
+      // square (wide ones, e.g. "W" or emoji, up to twice that).
+      if (!atlas.hasRoom(size * 2, size * 2)) continue;
+      const startTime = performance.now();
+      const raster = rasterize(cluster, variant, size);
+      if (atlas.hasRoom(raster.width, raster.height)) atlas.insert(key, raster, size);
+      this.spend(startTime, rasterUnits(size));
+    }
   }
 
   private canWork(): boolean {
@@ -749,138 +983,165 @@ export class TextLayer {
   }
 
   private solid(
-    cx: number,
-    cy: number,
-    ox: number,
-    oy: number,
-    w: number,
-    h: number,
+    centerX: number,
+    centerY: number,
+    offsetX: number,
+    offsetY: number,
+    width: number,
+    height: number,
     rotation: number,
     depth: number,
     color: number,
   ): void {
-    this.write(cx, cy, ox, oy, w, h, rotation, depth, 0, 0, 0, 0, MODE_SOLID, color);
+    this.write(
+      centerX,
+      centerY,
+      offsetX,
+      offsetY,
+      width,
+      height,
+      rotation,
+      depth,
+      0,
+      0,
+      0,
+      0,
+      MODE_SOLID,
+      color,
+    );
   }
 
   private write(
-    ax: number,
-    ay: number,
-    ox: number,
-    oy: number,
-    w: number,
-    h: number,
+    anchorX: number,
+    anchorY: number,
+    offsetX: number,
+    offsetY: number,
+    width: number,
+    height: number,
     rotation: number,
     depth: number,
-    u0: number,
-    v0: number,
-    u1: number,
-    v1: number,
+    startU: number,
+    startV: number,
+    endU: number,
+    endV: number,
     mode: number,
     color: number,
   ): void {
-    this.ensureCapacity(this._count + 1);
-    const i = this._count++;
-    const f = i * FLOATS;
-    const f32 = this.f32;
-    f32[f] = ax;
-    f32[f + 1] = ay;
-    f32[f + 2] = ox;
-    f32[f + 3] = oy;
-    f32[f + 4] = w;
-    f32[f + 5] = h;
-    f32[f + 6] = rotation;
-    f32[f + 7] = depth;
-    f32[f + 8] = u0;
-    f32[f + 9] = v0;
-    f32[f + 10] = u1;
-    f32[f + 11] = v1;
-    f32[f + 12] = mode;
-    const b = i * GLYPH_STRIDE + 52;
-    this.u8[b] = (color >>> 24) & 255;
-    this.u8[b + 1] = (color >>> 16) & 255;
-    this.u8[b + 2] = (color >>> 8) & 255;
-    this.u8[b + 3] = color & 255;
+    this.ensureCapacity(this.quadCount + 1);
+    const quad = this.quadCount++;
+    const floatOffset = quad * FLOATS;
+    const floats = this.floats;
+    floats[floatOffset] = anchorX;
+    floats[floatOffset + 1] = anchorY;
+    floats[floatOffset + 2] = offsetX;
+    floats[floatOffset + 3] = offsetY;
+    floats[floatOffset + 4] = width;
+    floats[floatOffset + 5] = height;
+    floats[floatOffset + 6] = rotation;
+    floats[floatOffset + 7] = depth;
+    floats[floatOffset + 8] = startU;
+    floats[floatOffset + 9] = startV;
+    floats[floatOffset + 10] = endU;
+    floats[floatOffset + 11] = endV;
+    floats[floatOffset + 12] = mode;
+    writeColorBytes(this.bytes, quad * GLYPH_STRIDE + COLOR_BYTE, color);
   }
 
   /** Updates anchor and rotation of an element's quads (drag/rotate without relayout). */
-  private moveRange(range: Range, el: ShapeElement): void {
-    const cx = el.x + el.w / 2;
-    const cy = el.y + el.h / 2;
-    for (let i = range.start; i < range.end; i++) {
-      const f = i * FLOATS;
-      this.f32[f] = cx;
-      this.f32[f + 1] = cy;
-      this.f32[f + 6] = el.rotation;
+  private moveRange(range: Range, element: ShapeElement): void {
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    for (let quad = range.start; quad < range.end; quad++) {
+      const floatOffset = quad * FLOATS;
+      this.floats[floatOffset] = centerX;
+      this.floats[floatOffset + 1] = centerY;
+      this.floats[floatOffset + 6] = element.rotation;
     }
     this.changed.mark(range.start, range.end);
   }
 
   private hideRange(range: Range): void {
-    for (let i = range.start; i < range.end; i++) {
-      const f = i * FLOATS;
-      this.f32[f + 4] = 0;
-      this.f32[f + 5] = 0;
+    for (let quad = range.start; quad < range.end; quad++) {
+      const floatOffset = quad * FLOATS;
+      this.floats[floatOffset + 4] = 0;
+      this.floats[floatOffset + 5] = 0;
     }
     this.changed.mark(range.start, range.end);
   }
 
   /** Conservative overlap test that works for any rotation. */
-  private overlaps(el: ShapeElement, box: Box): boolean {
-    const r = Math.hypot(el.w, el.h) / 2;
-    const cx = el.x + el.w / 2;
-    const cy = el.y + el.h / 2;
-    return boxIntersects(box, { minX: cx - r, minY: cy - r, maxX: cx + r, maxY: cy + r });
+  private overlaps(element: ShapeElement, box: Box): boolean {
+    const radius = Math.hypot(element.width, element.height) / 2;
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    return boxIntersects(box, {
+      minX: centerX - radius,
+      minY: centerY - radius,
+      maxX: centerX + radius,
+      maxY: centerY + radius,
+    });
   }
 
-  private ensureCapacity(n: number): void {
-    if (n * GLYPH_STRIDE <= this.buffer.byteLength) return;
-    const next = new ArrayBuffer(Math.max(n * GLYPH_STRIDE, this.buffer.byteLength * 2));
-    new Uint8Array(next).set(this.u8);
-    this.buffer = next;
-    this.f32 = new Float32Array(next);
-    this.u8 = new Uint8Array(next);
+  private ensureCapacity(count: number): void {
+    if (count * GLYPH_STRIDE <= this.buffer.byteLength) return;
+    this.buffer = growBuffer(
+      this.buffer,
+      Math.max(count * GLYPH_STRIDE, this.buffer.byteLength * 2),
+    );
+    this.floats = new Float32Array(this.buffer);
+    this.bytes = new Uint8Array(this.buffer);
   }
 }
 
-function sameLayoutInputs(a: LayoutInputs, el: ShapeElement): boolean {
+function sameLayoutInputs(inputs: LayoutInputs, element: ShapeElement): boolean {
   return (
-    a.text === el.text &&
-    a.w === el.w &&
-    a.h === el.h &&
-    a.strokeWidth === el.strokeWidth &&
-    a.type === el.type &&
-    a.sides === el.sides
+    inputs.text === element.text &&
+    inputs.width === element.width &&
+    inputs.height === element.height &&
+    inputs.strokeWidth === element.strokeWidth &&
+    inputs.type === element.type &&
+    inputs.sides === element.sides
   );
 }
 
-function rangeOf(el: ShapeElement, start: number, end: number): Range {
+function rangeOf(element: ShapeElement, start: number, end: number, crisp: boolean): Range {
   return {
     start,
     end,
-    text: el.text!,
-    w: el.w,
-    h: el.h,
-    strokeWidth: el.strokeWidth,
-    type: el.type,
-    sides: el.sides,
+    crisp,
+    text: element.text!,
+    width: element.width,
+    height: element.height,
+    strokeWidth: element.strokeWidth,
+    type: element.type,
+    sides: element.sides,
   };
 }
 
 /** Largest font size a block can show (its runs may be bigger than its default size). */
 function largestSize(block: TextBlock): number {
-  let max = block.fontSize;
-  for (const run of block.runs) if (run.size !== undefined && run.size > max) max = run.size;
-  return max;
+  let maximum = block.fontSize;
+  for (const run of block.runs)
+    if (run.size !== undefined && run.size > maximum) maximum = run.size;
+  return maximum;
 }
+
+/** Atlas key of a glyph rasterized at `size`. */
+const glyphKey = (size: number, variant: FontVariant, cluster: string) =>
+  `${size}|${variant}|${cluster}`;
+
+/** Share of a frame's rasterization budget one glyph at `size` costs. */
+const rasterUnits = (size: number) => Math.max(1, (size * size) / 4096);
 
 /** Smallest tier magnified at most MAX_MAGNIFICATION, capped by `cap`. */
 export function pickTier(
   tiers: readonly number[],
-  devicePx: number,
+  devicePixels: number,
   cap = tiers.length - 1,
 ): number {
   const last = Math.min(cap, tiers.length - 1);
-  for (let i = 0; i <= last; i++) if (tiers[i]! * MAX_MAGNIFICATION >= devicePx) return i;
+  for (let tier = 0; tier <= last; tier++)
+    if (tiers[tier]! * MAX_MAGNIFICATION >= devicePixels) return tier;
   return last;
 }
 

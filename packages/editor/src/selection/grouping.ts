@@ -1,4 +1,5 @@
 import {
+  newId,
   canGroup,
   canUngroup,
   groupElements,
@@ -6,7 +7,6 @@ import {
   ungroupElements,
   type Scene,
 } from '@apeiro/core';
-import { newId } from '../ids';
 
 /**
  * Selection after a press on element `hit`, Miro/Figma style:

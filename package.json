@@ -10,7 +10,8 @@
     "lint": "oxlint --max-warnings 0 .",
     "lint:fix": "oxlint --max-warnings 0 --fix .",
     "format": "oxfmt --write .",
-    "format:check": "oxfmt --check ."
+    "format:check": "oxfmt --check .",
+    "dev": "pnpm --filter @apeiro/playground dev"
   },
   "devDependencies": {
     "oxfmt": "^0.78.0",

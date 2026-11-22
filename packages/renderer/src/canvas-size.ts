@@ -19,11 +19,17 @@ export interface CanvasMetrics {
  * device pixels, so the browser stretches the buffer by a fraction of a pixel. The
  * `device-pixel-content-box` of a ResizeObserver reports the real size; browsers without
  * it (Safari) fall back to the computed one.
+ *
+ * The CSS size and the device size are watched by separate observers: an observer fires only
+ * when the box it watches changes, and each can change alone. Browser zoom keeps the window's
+ * device pixels (the device box stays the same) while the CSS size changes; moving to a screen
+ * with another ratio does the opposite. One observer on the device box missed the zoom: the
+ * board was then drawn for the old CSS size, smaller or larger than the page around it.
  */
 export class CanvasSize {
-  private observer: ResizeObserver | null = null;
-  private css: { w: number; h: number } | null = null;
-  private device: { w: number; h: number } | null = null;
+  private observers: ResizeObserver[] = [];
+  private css: { width: number; height: number } | null = null;
+  private device: { width: number; height: number } | null = null;
 
   /**
    * @param onChange called when the size or the pixel ratio changed (also when the window
@@ -34,20 +40,26 @@ export class CanvasSize {
     onChange: () => void,
   ) {
     if (typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(([entry]) => {
-      if (!entry) return;
-      const box = entry.contentBoxSize?.[0];
-      if (box) this.css = { w: box.inlineSize, h: box.blockSize };
-      const px = entry.devicePixelContentBoxSize?.[0];
-      this.device = px ? { w: px.inlineSize, h: px.blockSize } : null;
+    const cssObserver = new ResizeObserver(([entry]) => {
+      const box = entry?.contentBoxSize?.[0];
+      if (!box) return;
+      this.css = { width: box.inlineSize, height: box.blockSize };
+      onChange();
+    });
+    cssObserver.observe(canvas);
+    this.observers.push(cssObserver);
+    const deviceObserver = new ResizeObserver(([entry]) => {
+      const box = entry?.devicePixelContentBoxSize?.[0];
+      if (!box) return;
+      this.device = { width: box.inlineSize, height: box.blockSize };
       onChange();
     });
     try {
-      observer.observe(canvas, { box: 'device-pixel-content-box' });
+      deviceObserver.observe(canvas, { box: 'device-pixel-content-box' });
+      this.observers.push(deviceObserver);
     } catch {
-      observer.observe(canvas); // no device-pixel-content-box: computed sizes
+      // No device-pixel-content-box (Safari): the buffer size is computed from the CSS size.
     }
-    this.observer = observer;
   }
 
   /**
@@ -55,14 +67,14 @@ export class CanvasSize {
    * `maxRatio`, or exactly `fixedRatio` (e.g. 1 for an export).
    */
   measure(maxRatio: number, fixedRatio: number | null = null): CanvasMetrics {
-    const cssWidth = this.css?.w ?? this.canvas.clientWidth;
-    const cssHeight = this.css?.h ?? this.canvas.clientHeight;
+    const cssWidth = this.css?.width ?? this.canvas.clientWidth;
+    const cssHeight = this.css?.height ?? this.canvas.clientHeight;
     const screen = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
     const ratio = fixedRatio ?? Math.min(screen, maxRatio);
     // The screen's own pixels when they are what we draw at (not capped, not fixed).
     const exact = this.device && fixedRatio === null && screen <= maxRatio + 1e-6;
-    const pixelWidth = Math.max(1, exact ? this.device!.w : Math.round(cssWidth * ratio));
-    const pixelHeight = Math.max(1, exact ? this.device!.h : Math.round(cssHeight * ratio));
+    const pixelWidth = Math.max(1, exact ? this.device!.width : Math.round(cssWidth * ratio));
+    const pixelHeight = Math.max(1, exact ? this.device!.height : Math.round(cssHeight * ratio));
     return {
       cssWidth,
       cssHeight,
@@ -82,8 +94,8 @@ export class CanvasSize {
   }
 
   dispose(): void {
-    this.observer?.disconnect();
-    this.observer = null;
+    for (const observer of this.observers) observer.disconnect();
+    this.observers = [];
   }
 }
 

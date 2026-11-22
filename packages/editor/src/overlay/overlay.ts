@@ -1,18 +1,19 @@
 import {
-  imageRect,
+  imageRectangle,
   imageSize,
   groupOf,
+  inflateBox,
   anchorPoint,
   boxIntersects,
   CORNER_HANDLES,
-  effectiveRadius,
   HANDLE_SIGNS,
   isShape,
-  polygonSides,
-  polygonVertices,
+  SIDE_MIDPOINTS,
   type Box,
-  type Frame,
   type Camera,
+  type ConnectorElement,
+  type ConnectorGeometry,
+  type Frame,
   type Scene,
   type ShapeElement,
   type Vec2,
@@ -21,102 +22,53 @@ import {
 } from '@apeiro/core';
 import { CanvasSize, MAX_PIXEL_RATIO } from '@apeiro/renderer';
 import { enteredGroup } from '../selection/grouping';
+import { HANDLE_FILL, SELECTION_COLOR } from '../theme/board-theme';
 import {
-  ANCHOR_DOT_RADIUS_PX,
   anchorDot,
+  HANDLE_ACTIVE_RADIUS_PX,
+  handleScale,
   CORNER_HANDLE_PX,
-  COUNT_HANDLE_PX,
   countHandlePoint,
   HANDLE_RADIUS_PX,
-  RADIUS_HANDLE_RADIUS_PX,
   radiusHandlePoint,
   radiusHandleShape,
   selectionEdgeFrame,
-  SIDE_ANCHORS,
 } from './handles';
+import { traceBox, traceCap, traceConnector, traceShape } from './paths';
 
-/** color/accent-solid of the design: selection, handles, hover (see `Overlay.accent`). */
-export const SELECTION_COLOR = '#2563eb';
-/** The accent on a dark board. */
-export const SELECTION_COLOR_DARK = '#4f8bff';
-/** Inside of handles: color/background of the design, light and dark. */
-export const HANDLE_FILL = '#ffffff';
-export const HANDLE_FILL_DARK = '#0e0e10';
 /** Length of the crop frame's corner brackets (screen px). */
 const CROP_HANDLE_PX = 14;
 /** Smart guides: Figma's red, distinct from the selection blue. */
 const GUIDE = '#f24822';
-/** Beyond this many visible selected elements, draw one bounding box instead of outlines. */
+/** At most this many elements in view are outlined. */
 const MAX_OUTLINES = 2000;
-const CORNER_HANDLE_RADIUS_PX = 2;
+/** Width of an element's outline (selection, hover), screen px. */
+const OUTLINE_PX = 1.5;
+/** Shapes smaller than this on screen are outlined by their box. */
+const EXACT_OUTLINE_MIN_PX = 32;
 /** Border of the selection frame and its handles (screen px). */
 const HANDLE_BORDER_PX = 1.5;
 
-/** Adds the shape's outline (rounded corners, polygon, ellipse) to the path, in local coordinates. */
-export function traceShape(ctx: CanvasRenderingContext2D, s: ShapeElement, grow = 0): void {
-  const hw = s.w / 2 + grow;
-  const hh = s.h / 2 + grow;
-  if (s.type === 'ellipse') {
-    ctx.ellipse(0, 0, hw, hh, 0, 0, Math.PI * 2);
-    return;
-  }
-  const r = effectiveRadius(s);
-  if (s.type === 'polygon') {
-    const v = polygonVertices(s.w, s.h, polygonSides(s));
-    const n = v.length;
-    // Tangent arcs at every corner: the same rounding the shader draws.
-    const mid = (a: Vec2, b: Vec2) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-    const start = mid(v[n - 1]!, v[0]!);
-    ctx.moveTo(start.x, start.y);
-    for (let i = 0; i < n; i++) {
-      const p = v[i]!;
-      const q = v[(i + 1) % n]!;
-      ctx.arcTo(p.x, p.y, q.x, q.y, r);
-    }
-    ctx.closePath();
-    return;
-  }
-  if (r > 0) ctx.roundRect(-hw, -hh, hw * 2, hh * 2, r + grow);
-  else ctx.rect(-hw, -hh, hw * 2, hh * 2);
+/**
+ * Path radius of a round handle `outerPx` wide (radius, screen px) at this zoom: its border
+ * falls inside, so every handle's outer edge is exactly its size.
+ */
+function pathRadius(outerPx: number, zoom: number): number {
+  return Math.max(outerPx - HANDLE_BORDER_PX / 2, 0.5) / zoom;
 }
 
-/**
- * Lightweight 2D canvas on top of the WebGL canvas for transient UI: selection,
- * marquee, hover, connection dots and drop targets. Few elements, redrawn on change.
- */
 /** Extra drawing on the overlay, see `Overlay.addLayer`. */
-export type OverlayLayer = (ctx: CanvasRenderingContext2D, zoom: number) => void;
+export type OverlayLayer = (context: CanvasRenderingContext2D, zoom: number) => void;
 
+/**
+ * Lightweight 2D canvas on top of the GPU canvas for transient UI: selection, marquee,
+ * hover, handles, guides, connection dots and drop targets. Few elements, redrawn on change.
+ */
 export class Overlay {
-  private ctx: CanvasRenderingContext2D;
+  private context: CanvasRenderingContext2D;
   private frame = 0;
-  private selected = new Set<string>();
-  /**
-   * Elements this user may not select or edit (another participant is working on them).
-   * Assigning `selection` drops them; call `releaseLocked` when the answer changes.
-   */
-  isLocked: (id: string) => boolean = () => false;
-
-  /** Selected element ids. Locked elements (see `isLocked`) are left out when assigned. */
-  get selection(): Set<string> {
-    return this.selected;
-  }
-
-  set selection(ids: Set<string>) {
-    let locked = false;
-    for (const id of ids) if (this.isLocked(id)) locked = true;
-    this.selected = locked ? new Set([...ids].filter((id) => !this.isLocked(id))) : ids;
-  }
-
-  /** Drops elements that became locked from the selection; true if any were selected. */
-  releaseLocked(): boolean {
-    const before = this.selected.size;
-    this.selection = this.selected;
-    if (this.hover && this.isLocked(this.hover)) this.hover = null;
-    if (this.selected.size === before) return false;
-    this.request();
-    return true;
-  }
+  /** Selected element ids. */
+  selection = new Set<string>();
   marquee: Box | null = null;
   /** Smart guides of the move or resize in progress (see `snapBox`). */
   guides: SnapGuide[] = [];
@@ -129,6 +81,9 @@ export class Overlay {
   anchorsFor: string | null = null;
   /** The connection dot under the pointer (of `anchorsFor`), drawn highlighted. */
   hoverDot: Vec2 | null = null;
+  /** Line whose end or bend is being dragged: its handles are hidden (they'd sit under the
+   * cursor and cover the end being placed). */
+  dragging: string | null = null;
   /** Shape a dragged connector end would attach to, and the snapped anchor (if any). */
   target: string | null = null;
   snap: Vec2 | null = null;
@@ -168,16 +123,21 @@ export class Overlay {
     private scene: Scene,
     private camera: Camera,
   ) {
-    this.ctx = canvas.getContext('2d')!;
+    this.context = canvas.getContext('2d')!;
     this.size = new CanvasSize(canvas, () => this.resize());
   }
 
   /** Matches the drawing buffer to the canvas on screen, pixel for pixel (watched by itself too). */
   resize(): void {
-    const m = this.size.measure(MAX_PIXEL_RATIO);
-    this.size.apply(m);
-    this.ratio = m.ratio;
-    this.request();
+    const metrics = this.size.measure(MAX_PIXEL_RATIO);
+    const cleared = this.size.apply(metrics);
+    this.ratio = metrics.ratio;
+    if (cleared) {
+      // The resize cleared the buffer: draw now, not a frame later (see `Renderer.resize`).
+      if (this.frame) cancelAnimationFrame(this.frame);
+      this.frame = 0;
+      this.draw();
+    } else this.request();
   }
 
   request(): void {
@@ -203,41 +163,26 @@ export class Overlay {
   }
 
   draw(): void {
-    const { ctx, camera } = this;
-    const dpr = this.ratio;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    // World → device pixels in one transform; line widths are divided by zoom to stay constant.
-    const z = camera.zoom;
-    ctx.setTransform(dpr * z, 0, 0, dpr * z, -camera.x * z * dpr, -camera.y * z * dpr);
-    const view = camera.viewportBounds();
+    // Drawn now (e.g. after the board's frame): a redraw requested for later is not needed.
+    if (this.frame) cancelAnimationFrame(this.frame);
+    this.frame = 0;
+    const { context, camera } = this;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    const zoom = camera.zoom;
+    this.setWorldTransform();
 
     // Groups: a dashed frame around the group under the pointer, and around the group
     // the selection is inside of (its elements are being picked one by one).
     const inside = enteredGroup(this.scene, this.selection);
-    if (inside) this.groupFrame(inside, z, 0.7);
-    // A locked element is not picked: no hover feedback for it.
-    const hover = this.hover && !this.isLocked(this.hover) ? this.hover : null;
+    if (inside) this.groupFrame(inside, zoom, 0.7);
+    const hover = this.hover;
     const hovered = hover ? this.scene.get(hover) : undefined;
     const hoverGroup = hovered && !inside && !this.deep ? groupOf(this.scene, hovered) : null;
     if (hoverGroup && !hoverGroup.every((id) => this.selection.has(id)))
-      this.groupFrame(hoverGroup, z, 0.6);
+      this.groupFrame(hoverGroup, zoom, 0.6);
     else if (hover && !this.selection.has(hover) && hover !== this.editing)
-      this.outline(hover, view, 1.5 / z, 0.6, this.accent);
-
-    if (this.selection.size > 0) {
-      let drawn = 0;
-      for (const id of this.selection) {
-        if (drawn >= MAX_OUTLINES) break;
-        const b = this.scene.getBounds(id);
-        if (!b || !boxIntersects(b, view)) continue;
-        this.outline(id, view, 1.5 / z, 1, this.accent);
-        drawn++;
-      }
-    }
-    // Text being edited: one outline on its edge, the only focus mark (no DOM outline).
-    if (this.editing && !this.selection.has(this.editing))
-      this.outline(this.editing, view, 1.5 / z, 1, this.accent);
+      this.outlineElements([hover], 0.6, this.accent);
 
     // Transform frame with corner handles, and while resizing or rotating a badge with the
     // size or the angle. None while text is being edited: typing, not transforming.
@@ -245,19 +190,30 @@ export class Overlay {
       this.transformEnabled && !this.readOnly && !this.cropping && !this.editing
         ? selectionEdgeFrame(this.scene, this.selection)
         : null;
-    if (frame) this.drawTransformFrame(frame, z);
-    if (this.badge && this.selection.size > 0 && !this.editing) this.drawBadge(this.badge, z);
+    // Outlines show what a frame around several elements holds; a lone shape has just its
+    // frame (an outline on top of it would double the line).
+    if (this.selection.size > 0 && !(frame && this.selection.size === 1))
+      this.outlineElements(this.selection, 1, this.accent);
+    // Text being edited: one outline on its edge, the only focus mark (no DOM outline).
+    if (this.editing && !this.selection.has(this.editing))
+      this.outlineElements([this.editing], 1, this.accent);
 
-    this.drawGuides(z);
-    this.drawSpacing(z);
+    if (frame) this.drawTransformFrame(frame, zoom);
+    if (this.badge && this.selection.size > 0 && !this.editing) this.drawBadge(this.badge, zoom);
 
-    const connector = this.readOnly ? null : this.selectedConnector();
+    this.drawGuides(zoom);
+    this.drawSpacing(zoom);
+
+    const selected = this.readOnly ? null : this.selectedConnector();
+    const connector = selected === this.dragging ? null : selected;
     if (connector) {
-      const g = this.scene.connectorGeometry(connector);
-      if (g) {
-        this.handle(g.points[0]!, z);
-        this.handle(g.points[g.points.length - 1]!, z);
-        if (g.handle) this.bendHandle(g.handle.point, g.handle.axis, z);
+      const geometry = this.scene.connectorGeometry(connector);
+      if (geometry) {
+        const scale = handleScale(zoom);
+        this.handle(geometry.points[0]!, zoom, scale);
+        this.handle(geometry.points[geometry.points.length - 1]!, zoom, scale);
+        if (geometry.handle)
+          this.bendHandle(geometry.handle.point, geometry.handle.axis, zoom, scale);
       }
     }
 
@@ -268,62 +224,110 @@ export class Overlay {
       !this.selection.has(this.anchorsFor) &&
       !this.readOnly
     ) {
-      const s = this.scene.get(this.anchorsFor);
-      if (s && isShape(s)) {
-        for (const a of SIDE_ANCHORS) {
+      const shape = this.scene.get(this.anchorsFor);
+      if (shape && isShape(shape)) {
+        const scale = handleScale(zoom);
+        for (const anchor of SIDE_MIDPOINTS) {
           const hovered =
-            this.hoverDot !== null && this.hoverDot.x === a.x && this.hoverDot.y === a.y;
-          if (hovered) this.plusDot(anchorDot(s, a, z), z);
-          else this.dot(anchorDot(s, a, z), z, this.accent, 1, false, ANCHOR_DOT_RADIUS_PX);
+            this.hoverDot !== null && this.hoverDot.x === anchor.x && this.hoverDot.y === anchor.y;
+          if (hovered) this.plusDot(anchorDot(shape, anchor, zoom), zoom, scale);
+          else
+            this.dot(
+              anchorDot(shape, anchor, zoom),
+              zoom,
+              this.accent,
+              1,
+              false,
+              HANDLE_RADIUS_PX * scale,
+            );
         }
       }
     }
     if (this.target) {
       // Magnets on the drop target (no outline: the dots say where the end attaches); the
       // one the end is attached to is filled.
-      const s = this.scene.get(this.target);
-      if (s && isShape(s)) {
-        for (const a of SIDE_ANCHORS) this.dot(anchorPoint(s, a), z, this.accent, 0.5);
-        if (this.snap) this.dot(anchorPoint(s, this.snap), z, this.accent, 1, true);
+      const shape = this.scene.get(this.target);
+      if (shape && isShape(shape)) {
+        const scale = handleScale(zoom);
+        for (const anchor of SIDE_MIDPOINTS)
+          this.dot(
+            anchorPoint(shape, anchor),
+            zoom,
+            this.accent,
+            1,
+            false,
+            HANDLE_RADIUS_PX * scale,
+          );
+        if (this.snap)
+          this.dot(
+            anchorPoint(shape, this.snap),
+            zoom,
+            this.accent,
+            1,
+            true,
+            HANDLE_ACTIVE_RADIUS_PX * scale,
+          );
       }
     }
 
     if (this.marquee) {
-      const m = this.marquee;
-      ctx.fillStyle = this.accent;
-      ctx.strokeStyle = this.accent;
-      ctx.lineWidth = 1 / z;
-      ctx.globalAlpha = 0.08;
-      ctx.fillRect(m.minX, m.minY, m.maxX - m.minX, m.maxY - m.minY);
-      ctx.globalAlpha = 1;
-      ctx.strokeRect(m.minX, m.minY, m.maxX - m.minX, m.maxY - m.minY);
+      const marquee = this.marquee;
+      context.fillStyle = this.accent;
+      context.strokeStyle = this.accent;
+      context.lineWidth = 1 / zoom;
+      context.globalAlpha = 0.08;
+      context.fillRect(
+        marquee.minX,
+        marquee.minY,
+        marquee.maxX - marquee.minX,
+        marquee.maxY - marquee.minY,
+      );
+      context.globalAlpha = 1;
+      context.strokeRect(
+        marquee.minX,
+        marquee.minY,
+        marquee.maxX - marquee.minX,
+        marquee.maxY - marquee.minY,
+      );
     }
 
-    // Corner-radius handle of the selected shape, as in Figma.
     // Corner-radius handle (top-left corner, a polygon's top vertex), as in Figma.
     const rounded =
       this.cropping || this.editing || this.readOnly
         ? null
-        : radiusHandleShape(this.scene, this.selection, z);
+        : radiusHandleShape(this.scene, this.selection, zoom);
     if (rounded) {
-      const p = radiusHandlePoint(rounded, z);
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, RADIUS_HANDLE_RADIUS_PX / z, 0, Math.PI * 2);
-      ctx.fillStyle = this.radiusActive ? this.accent : this.handleFill;
-      ctx.fill();
-      ctx.lineWidth = 1.5 / z;
-      ctx.strokeStyle = this.accent;
-      ctx.stroke();
-      if (rounded.type === 'polygon') this.drawCountHandle(rounded, z);
+      const point = radiusHandlePoint(rounded, zoom);
+      context.beginPath();
+      context.arc(
+        point.x,
+        point.y,
+        pathRadius(HANDLE_RADIUS_PX * handleScale(zoom), zoom),
+        0,
+        Math.PI * 2,
+      );
+      context.fillStyle = this.radiusActive ? this.accent : this.handleFill;
+      context.fill();
+      context.lineWidth = 1.5 / zoom;
+      context.strokeStyle = this.accent;
+      context.stroke();
+      if (rounded.type === 'polygon') this.drawCountHandle(rounded, zoom);
     }
-    this.drawCrop(z);
+    this.drawCrop(zoom);
     for (const layer of this.layers) {
-      ctx.save();
-      ctx.setTransform(dpr * z, 0, 0, dpr * z, -camera.x * z * dpr, -camera.y * z * dpr);
-      layer(ctx, z);
-      ctx.restore();
+      context.save();
+      this.setWorldTransform();
+      layer(context, zoom);
+      context.restore();
     }
     this.onDraw?.();
+  }
+
+  /** World → device pixels in one transform; line widths are divided by zoom to stay constant. */
+  private setWorldTransform(): void {
+    const { camera } = this;
+    const scale = this.ratio * camera.zoom;
+    this.context.setTransform(scale, 0, 0, scale, -camera.x * scale, -camera.y * scale);
   }
 
   /**
@@ -342,435 +346,550 @@ export class Overlay {
 
   /**
    * The selection's transform frame, as in the design (Selection / Handle): a 1.5px accent
-   * outline and four 8×8 corner handles, radius 2, a 1.5px accent border inside, filled
-   * with the board background. The edges resize and the area just outside the corners
-   * rotates; the cursor shows it.
+   * line just outside the selection and round corner handles filled with the board
+   * background. The edges resize and the area just outside the corners rotates.
    */
-  private drawTransformFrame(frame: Frame, z: number): void {
-    const { ctx } = this;
-    ctx.save();
-    ctx.translate(frame.cx, frame.cy);
-    ctx.rotate(frame.rotation);
-    ctx.strokeStyle = this.accent;
-    const line = HANDLE_BORDER_PX / z;
-    ctx.lineWidth = line;
+  private drawTransformFrame(frame: Frame, zoom: number): void {
+    const { context } = this;
+    context.save();
+    context.translate(frame.centerX, frame.centerY);
+    context.rotate(frame.rotation);
+    context.strokeStyle = this.accent;
+    const line = HANDLE_BORDER_PX / zoom;
+    context.lineWidth = line;
     // The line runs just outside the edge (the canvas strokes on the path's center line).
-    const w = frame.w + line;
-    const h = frame.h + line;
-    ctx.strokeRect(-w / 2, -h / 2, w, h);
-    // Centered on the corners. A path half a border smaller makes the border fall inside the
-    // 8px, like CSS borders in the design.
-    const s = (CORNER_HANDLE_PX - HANDLE_BORDER_PX) / z;
-    const r = (CORNER_HANDLE_RADIUS_PX - HANDLE_BORDER_PX / 2) / z;
-    ctx.fillStyle = this.handleFill;
+    // The handles shrink when zoomed out.
+    const scale = handleScale(zoom);
+    const width = frame.width + line;
+    const height = frame.height + line;
+    context.strokeRect(-width / 2, -height / 2, width, height);
+    // Round handles centered on the corners, with a soft shadow to lift them off the board.
+    // A path half a border smaller makes the border fall inside the diameter.
+    const radius = pathRadius(HANDLE_RADIUS_PX * scale, zoom);
+    context.fillStyle = this.handleFill;
     for (const handle of CORNER_HANDLES) {
-      const [hx, hy] = HANDLE_SIGNS[handle];
-      ctx.beginPath();
-      ctx.roundRect((hx * w) / 2 - s / 2, (hy * h) / 2 - s / 2, s, s, r);
-      ctx.fill();
-      ctx.stroke();
+      const [signX, signY] = HANDLE_SIGNS[handle];
+      context.beginPath();
+      context.arc((signX * width) / 2, (signY * height) / 2, radius, 0, Math.PI * 2);
+      context.save();
+      context.shadowColor = 'rgba(0, 0, 0, 0.2)';
+      context.shadowBlur = 3 * this.ratio;
+      context.shadowOffsetY = this.ratio;
+      context.fill();
+      context.restore();
+      context.stroke();
     }
-    ctx.restore();
+    context.restore();
   }
 
   /** A label under the selection (its size while resizing, its angle while rotating). */
-  private drawBadge(text: string, z: number): void {
-    const b = this.scene.bounds(this.selection);
-    if (!b) return;
-    const { ctx } = this;
-    ctx.save();
-    ctx.font = `600 ${11 / z}px Geist, Inter, system-ui, sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    const w = ctx.measureText(text).width + 14 / z;
-    const h = 20 / z;
-    const x = (b.minX + b.maxX) / 2;
-    const y = b.maxY + 14 / z + h / 2;
-    ctx.fillStyle = this.accent;
-    ctx.beginPath();
-    ctx.roundRect(x - w / 2, y - h / 2, w, h, 5 / z);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.fillText(text, x, y + 0.5 / z);
-    ctx.restore();
+  private drawBadge(text: string, zoom: number): void {
+    const bounds = this.scene.bounds(this.selection);
+    if (!bounds) return;
+    const { context } = this;
+    context.save();
+    context.font = `600 ${11 / zoom}px Geist, Inter, system-ui, sans-serif`;
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    const width = context.measureText(text).width + 14 / zoom;
+    const height = 20 / zoom;
+    const x = (bounds.minX + bounds.maxX) / 2;
+    const y = bounds.maxY + 14 / zoom + height / 2;
+    context.fillStyle = this.accent;
+    context.beginPath();
+    context.roundRect(x - width / 2, y - height / 2, width, height, 5 / zoom);
+    context.fill();
+    context.fillStyle = '#fff';
+    context.fillText(text, x, y + 0.5 / zoom);
+    context.restore();
   }
 
   /** The polygon's corner-count handle (a diamond), and the count while it is dragged. */
-  private drawCountHandle(s: ShapeElement, z: number): void {
-    const { ctx } = this;
-    const p = countHandlePoint(s, z);
-    const k = COUNT_HANDLE_PX / z;
-    ctx.save();
-    ctx.translate(p.x, p.y);
-    ctx.rotate(s.rotation + Math.PI / 4);
-    ctx.beginPath();
-    ctx.rect(-k / 2 - 0.5 / z, -k / 2 - 0.5 / z, k + 1 / z, k + 1 / z);
-    ctx.fillStyle = this.countActive ? this.accent : this.handleFill;
-    ctx.fill();
-    ctx.lineWidth = 1.5 / z;
-    ctx.strokeStyle = this.accent;
-    ctx.stroke();
-    ctx.restore();
+  private drawCountHandle(shape: ShapeElement, zoom: number): void {
+    const { context } = this;
+    const point = countHandlePoint(shape, zoom);
+    // A diamond as big to the eye as the round handles: its diagonal 1.2× their diameter
+    // (about the same area), border inside.
+    const side =
+      (1.2 * Math.SQRT2 * HANDLE_RADIUS_PX * handleScale(zoom) - HANDLE_BORDER_PX) / zoom;
+    context.save();
+    context.translate(point.x, point.y);
+    context.rotate(shape.rotation + Math.PI / 4);
+    context.beginPath();
+    context.rect(-side / 2, -side / 2, side, side);
+    context.fillStyle = this.countActive ? this.accent : this.handleFill;
+    context.fill();
+    context.lineWidth = 1.5 / zoom;
+    context.strokeStyle = this.accent;
+    context.stroke();
+    context.restore();
     if (this.countLabel === null) return;
     const text = String(this.countLabel);
-    ctx.save();
-    ctx.font = `600 ${12 / z}px Geist, Inter, system-ui, sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    const w = ctx.measureText(text).width + 12 / z;
-    const h = 20 / z;
-    const x = p.x + 18 / z;
-    const y = p.y - 18 / z;
-    ctx.fillStyle = this.accent;
-    ctx.beginPath();
-    ctx.roundRect(x - w / 2, y - h / 2, w, h, 4 / z);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.fillText(text, x, y);
-    ctx.restore();
+    context.save();
+    context.font = `600 ${12 / zoom}px Geist, Inter, system-ui, sans-serif`;
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    const width = context.measureText(text).width + 12 / zoom;
+    const height = 20 / zoom;
+    const x = point.x + 18 / zoom;
+    const y = point.y - 18 / zoom;
+    context.fillStyle = this.accent;
+    context.beginPath();
+    context.roundRect(x - width / 2, y - height / 2, width, height, 4 / zoom);
+    context.fill();
+    context.fillStyle = '#fff';
+    context.fillText(text, x, y);
+    context.restore();
   }
 
   /** The decoded image for crop mode (loads once; redraws when it arrives). */
-  private imageOf(src: string): HTMLImageElement | null {
-    let img = this.images.get(src);
-    if (!img) {
-      img = new Image();
-      img.decoding = 'async';
-      img.onload = () => this.request();
-      img.src = src;
-      this.images.set(src, img);
+  private imageOf(source: string): HTMLImageElement | null {
+    let image = this.images.get(source);
+    if (!image) {
+      image = new Image();
+      image.decoding = 'async';
+      image.onload = () => this.request();
+      image.src = source;
+      this.images.set(source, image);
     }
-    return img.complete && img.naturalWidth > 0 ? img : null;
+    return image.complete && image.naturalWidth > 0 ? image : null;
   }
 
   /**
    * Crop mode, as in Figma: the image outside the frame shows faded with a thin outline,
    * and the frame gets crop handles (corner brackets and side bars).
    */
-  private drawCrop(z: number): void {
-    const el = this.cropping ? this.scene.get(this.cropping) : undefined;
-    if (!el || !isShape(el) || el.type !== 'image' || !el.media) return;
-    const { ctx } = this;
-    const img = this.imageOf(el.media.src);
-    const r = imageRect(
-      el,
-      imageSize(el, img ? { w: img.naturalWidth, h: img.naturalHeight } : null),
+  private drawCrop(zoom: number): void {
+    const element = this.cropping ? this.scene.get(this.cropping) : undefined;
+    if (!element || !isShape(element) || element.type !== 'image' || !element.media) return;
+    const { context } = this;
+    const image = this.imageOf(element.media.source);
+    const imageBounds = imageRectangle(
+      element,
+      imageSize(element, image ? { width: image.naturalWidth, height: image.naturalHeight } : null),
     );
-    ctx.save();
-    ctx.translate(el.x + el.w / 2, el.y + el.h / 2);
-    ctx.rotate(el.rotation);
-    ctx.translate(-el.w / 2, -el.h / 2);
+    context.save();
+    context.translate(element.x + element.width / 2, element.y + element.height / 2);
+    context.rotate(element.rotation);
+    context.translate(-element.width / 2, -element.height / 2);
     // The part of the image outside the frame: faded.
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(r.x, r.y, r.w, r.h);
-    ctx.rect(0, 0, el.w, el.h);
-    ctx.clip('evenodd');
-    ctx.globalAlpha = 0.35;
-    if (img) ctx.drawImage(img, r.x, r.y, r.w, r.h);
+    context.save();
+    context.beginPath();
+    context.rect(imageBounds.x, imageBounds.y, imageBounds.width, imageBounds.height);
+    context.rect(0, 0, element.width, element.height);
+    context.clip('evenodd');
+    context.globalAlpha = 0.35;
+    if (image)
+      context.drawImage(image, imageBounds.x, imageBounds.y, imageBounds.width, imageBounds.height);
     else {
-      ctx.fillStyle = 'rgba(120, 120, 128, 0.5)';
-      ctx.fillRect(r.x, r.y, r.w, r.h);
+      context.fillStyle = 'rgba(120, 120, 128, 0.5)';
+      context.fillRect(imageBounds.x, imageBounds.y, imageBounds.width, imageBounds.height);
     }
-    ctx.restore();
-    ctx.lineWidth = 1 / z;
-    ctx.strokeStyle = this.accent;
-    ctx.globalAlpha = 0.5;
-    ctx.strokeRect(r.x, r.y, r.w, r.h);
-    ctx.globalAlpha = 1;
+    context.restore();
+    context.lineWidth = 1 / zoom;
+    context.strokeStyle = this.accent;
+    context.globalAlpha = 0.5;
+    context.strokeRect(imageBounds.x, imageBounds.y, imageBounds.width, imageBounds.height);
+    context.globalAlpha = 1;
     // The image's own corner handles: drag to scale it (Figma).
-    const s = CORNER_HANDLE_PX / z;
-    ctx.fillStyle = this.handleFill;
-    ctx.strokeStyle = this.accent;
-    ctx.lineWidth = 1.5 / z;
+    const scale = handleScale(zoom);
+    const size = (CORNER_HANDLE_PX * scale) / zoom;
+    context.fillStyle = this.handleFill;
+    context.strokeStyle = this.accent;
+    context.lineWidth = 1.5 / zoom;
     for (const [x, y] of [
-      [r.x, r.y],
-      [r.x + r.w, r.y],
-      [r.x, r.y + r.h],
-      [r.x + r.w, r.y + r.h],
+      [imageBounds.x, imageBounds.y],
+      [imageBounds.x + imageBounds.width, imageBounds.y],
+      [imageBounds.x, imageBounds.y + imageBounds.height],
+      [imageBounds.x + imageBounds.width, imageBounds.y + imageBounds.height],
     ] as const) {
-      ctx.beginPath();
-      ctx.roundRect(x - s / 2, y - s / 2, s, s, 2 / z);
-      ctx.fill();
-      ctx.stroke();
+      context.beginPath();
+      context.roundRect(x - size / 2, y - size / 2, size, size, 2 / zoom);
+      context.fill();
+      context.stroke();
     }
     // The crop frame.
-    ctx.lineWidth = 1.5 / z;
-    ctx.strokeStyle = this.accent;
-    ctx.strokeRect(0, 0, el.w, el.h);
+    context.lineWidth = 1.5 / zoom;
+    context.strokeStyle = this.accent;
+    context.strokeRect(0, 0, element.width, element.height);
     // Handles: white brackets with a dark edge, readable on any image.
-    const len = Math.min(CROP_HANDLE_PX / z, el.w / 3, el.h / 3);
-    const bar = Math.min(CROP_HANDLE_PX / z, el.w / 3, el.h / 3) / 2;
-    ctx.lineCap = 'square';
+    const length = Math.min((CROP_HANDLE_PX * scale) / zoom, element.width / 3, element.height / 3);
+    const bar = length / 2;
+    context.lineCap = 'square';
     const path = () => {
-      ctx.beginPath();
-      for (const [x, y, dx, dy] of [
+      context.beginPath();
+      for (const [x, y, deltaX, deltaY] of [
         [0, 0, 1, 1],
-        [el.w, 0, -1, 1],
-        [0, el.h, 1, -1],
-        [el.w, el.h, -1, -1],
+        [element.width, 0, -1, 1],
+        [0, element.height, 1, -1],
+        [element.width, element.height, -1, -1],
       ] as const) {
-        ctx.moveTo(x + dx * len, y);
-        ctx.lineTo(x, y);
-        ctx.lineTo(x, y + dy * len);
+        context.moveTo(x + deltaX * length, y);
+        context.lineTo(x, y);
+        context.lineTo(x, y + deltaY * length);
       }
-      ctx.moveTo(el.w / 2 - bar, 0);
-      ctx.lineTo(el.w / 2 + bar, 0);
-      ctx.moveTo(el.w / 2 - bar, el.h);
-      ctx.lineTo(el.w / 2 + bar, el.h);
-      ctx.moveTo(0, el.h / 2 - bar);
-      ctx.lineTo(0, el.h / 2 + bar);
-      ctx.moveTo(el.w, el.h / 2 - bar);
-      ctx.lineTo(el.w, el.h / 2 + bar);
+      context.moveTo(element.width / 2 - bar, 0);
+      context.lineTo(element.width / 2 + bar, 0);
+      context.moveTo(element.width / 2 - bar, element.height);
+      context.lineTo(element.width / 2 + bar, element.height);
+      context.moveTo(0, element.height / 2 - bar);
+      context.lineTo(0, element.height / 2 + bar);
+      context.moveTo(element.width, element.height / 2 - bar);
+      context.lineTo(element.width, element.height / 2 + bar);
     };
     path();
-    ctx.lineWidth = 6 / z;
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.55)';
-    ctx.stroke();
+    context.lineWidth = 6 / zoom;
+    context.strokeStyle = 'rgba(0, 0, 0, 0.55)';
+    context.stroke();
     path();
-    ctx.lineWidth = 4 / z;
-    ctx.strokeStyle = '#fff';
-    ctx.stroke();
-    ctx.restore();
+    context.lineWidth = 4 / zoom;
+    context.strokeStyle = '#fff';
+    context.stroke();
+    context.restore();
   }
 
-  private handle(p: Vec2, z: number): void {
-    const { ctx } = this;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, HANDLE_RADIUS_PX / z, 0, Math.PI * 2);
-    ctx.fillStyle = this.handleFill;
-    ctx.fill();
-    ctx.lineWidth = 1.5 / z;
-    ctx.strokeStyle = this.accent;
-    ctx.stroke();
+  private handle(point: Vec2, zoom: number, scale: number): void {
+    const { context } = this;
+    context.beginPath();
+    context.arc(point.x, point.y, pathRadius(HANDLE_RADIUS_PX * scale, zoom), 0, Math.PI * 2);
+    context.fillStyle = this.handleFill;
+    context.fill();
+    context.lineWidth = 1.5 / zoom;
+    context.strokeStyle = this.accent;
+    context.stroke();
   }
 
   /** Filled handle in the middle of a line: a dot for curves, a pill across the elbow's middle segment. */
-  private bendHandle(p: Vec2, axis: 'x' | 'y' | undefined, z: number): void {
-    const { ctx } = this;
-    ctx.beginPath();
+  private bendHandle(point: Vec2, axis: 'x' | 'y' | undefined, zoom: number, scale: number): void {
+    const { context } = this;
+    context.beginPath();
     if (axis) {
-      const long = 12 / z;
-      const short = 6 / z;
-      const w = axis === 'x' ? short : long;
-      const h = axis === 'x' ? long : short;
-      ctx.roundRect(p.x - w / 2, p.y - h / 2, w, h, short / 2);
+      const long = (12 * scale) / zoom;
+      const short = (6 * scale) / zoom;
+      const width = axis === 'x' ? short : long;
+      const height = axis === 'x' ? long : short;
+      context.roundRect(point.x - width / 2, point.y - height / 2, width, height, short / 2);
     } else {
-      ctx.arc(p.x, p.y, HANDLE_RADIUS_PX / z, 0, Math.PI * 2);
+      context.arc(point.x, point.y, pathRadius(HANDLE_RADIUS_PX * scale, zoom), 0, Math.PI * 2);
     }
-    ctx.fillStyle = this.accent;
-    ctx.fill();
-    ctx.lineWidth = 1.5 / z;
-    ctx.strokeStyle = '#fff';
-    ctx.stroke();
+    context.fillStyle = this.accent;
+    context.fill();
+    context.lineWidth = 1.5 / zoom;
+    context.strokeStyle = '#fff';
+    context.stroke();
   }
 
   /** Hovered connection dot: larger, filled, with a plus — "drag to connect, click to add". */
-  private plusDot(p: Vec2, z: number): void {
-    const { ctx } = this;
-    const r = (ANCHOR_DOT_RADIUS_PX + 3) / z;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    ctx.fillStyle = this.accent;
-    ctx.fill();
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 1.5 / z;
-    const k = r * 0.5;
-    ctx.beginPath();
-    ctx.moveTo(p.x - k, p.y);
-    ctx.lineTo(p.x + k, p.y);
-    ctx.moveTo(p.x, p.y - k);
-    ctx.lineTo(p.x, p.y + k);
-    ctx.stroke();
+  private plusDot(point: Vec2, zoom: number, scale: number): void {
+    const { context } = this;
+    const radius = (HANDLE_ACTIVE_RADIUS_PX * scale) / zoom;
+    context.beginPath();
+    context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    context.fillStyle = this.accent;
+    context.fill();
+    context.strokeStyle = '#fff';
+    context.lineWidth = 1.5 / zoom;
+    const arm = radius * 0.5;
+    context.beginPath();
+    context.moveTo(point.x - arm, point.y);
+    context.lineTo(point.x + arm, point.y);
+    context.moveTo(point.x, point.y - arm);
+    context.lineTo(point.x, point.y + arm);
+    context.stroke();
   }
 
   private dot(
-    p: Vec2,
-    z: number,
+    point: Vec2,
+    zoom: number,
     color: string,
     alpha = 1,
     filled = false,
-    radiusPx = filled ? 6 : 4.5,
+    radiusPx = filled ? HANDLE_ACTIVE_RADIUS_PX : HANDLE_RADIUS_PX,
   ): void {
-    const { ctx } = this;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, radiusPx / z, 0, Math.PI * 2);
-    ctx.fillStyle = filled ? color : this.handleFill;
-    ctx.fill();
-    ctx.lineWidth = 1.5 / z;
-    ctx.strokeStyle = color;
-    ctx.stroke();
-    ctx.restore();
+    const { context } = this;
+    context.save();
+    context.globalAlpha = alpha;
+    context.beginPath();
+    context.arc(point.x, point.y, pathRadius(radiusPx, zoom), 0, Math.PI * 2);
+    context.fillStyle = filled ? color : this.handleFill;
+    context.fill();
+    context.lineWidth = 1.5 / zoom;
+    context.strokeStyle = color;
+    context.stroke();
+    context.restore();
   }
 
   /** Smart guides: thin lines with small crosses at the aligned points, as in Figma. */
-  private drawGuides(z: number): void {
+  private drawGuides(zoom: number): void {
     if (this.guides.length === 0) return;
-    const { ctx } = this;
-    const k = 3 / z; // half size of a cross
-    ctx.save();
-    ctx.strokeStyle = GUIDE;
-    ctx.lineWidth = 1 / z;
-    ctx.beginPath();
-    for (const g of this.guides) {
-      if (g.axis === 'x') {
-        ctx.moveTo(g.at, g.from);
-        ctx.lineTo(g.at, g.to);
-        for (const m of g.marks) {
-          ctx.moveTo(g.at - k, m - k);
-          ctx.lineTo(g.at + k, m + k);
-          ctx.moveTo(g.at + k, m - k);
-          ctx.lineTo(g.at - k, m + k);
+    const { context } = this;
+    const arm = 3 / zoom; // half size of a cross
+    context.save();
+    context.strokeStyle = GUIDE;
+    context.lineWidth = 1 / zoom;
+    context.beginPath();
+    for (const guide of this.guides) {
+      if (guide.axis === 'x') {
+        context.moveTo(guide.at, guide.from);
+        context.lineTo(guide.at, guide.to);
+        for (const mark of guide.marks) {
+          context.moveTo(guide.at - arm, mark - arm);
+          context.lineTo(guide.at + arm, mark + arm);
+          context.moveTo(guide.at + arm, mark - arm);
+          context.lineTo(guide.at - arm, mark + arm);
         }
       } else {
-        ctx.moveTo(g.from, g.at);
-        ctx.lineTo(g.to, g.at);
-        for (const m of g.marks) {
-          ctx.moveTo(m - k, g.at - k);
-          ctx.lineTo(m + k, g.at + k);
-          ctx.moveTo(m + k, g.at - k);
-          ctx.lineTo(m - k, g.at + k);
+        context.moveTo(guide.from, guide.at);
+        context.lineTo(guide.to, guide.at);
+        for (const mark of guide.marks) {
+          context.moveTo(mark - arm, guide.at - arm);
+          context.lineTo(mark + arm, guide.at + arm);
+          context.moveTo(mark + arm, guide.at - arm);
+          context.lineTo(mark - arm, guide.at + arm);
         }
       }
     }
-    ctx.stroke();
-    ctx.restore();
+    context.stroke();
+    context.restore();
   }
 
   /**
    * Equal spacing, as in Figma: each equal gap gets a line across it with end ticks and
    * a label with the distance.
    */
-  private drawSpacing(z: number): void {
+  private drawSpacing(zoom: number): void {
     if (this.spacing.length === 0) return;
-    const { ctx } = this;
-    const tick = 4 / z;
-    ctx.save();
-    ctx.strokeStyle = GUIDE;
-    ctx.lineWidth = 1 / z;
-    ctx.beginPath();
-    for (const g of this.spacing) {
-      for (const s of g.segments) {
-        if (g.axis === 'x') {
-          ctx.moveTo(s.from, s.at);
-          ctx.lineTo(s.to, s.at);
-          for (const e of [s.from, s.to]) {
-            ctx.moveTo(e, s.at - tick);
-            ctx.lineTo(e, s.at + tick);
+    const { context } = this;
+    const tick = 4 / zoom;
+    context.save();
+    context.strokeStyle = GUIDE;
+    context.lineWidth = 1 / zoom;
+    context.beginPath();
+    for (const guide of this.spacing) {
+      for (const segment of guide.segments) {
+        if (guide.axis === 'x') {
+          context.moveTo(segment.from, segment.at);
+          context.lineTo(segment.to, segment.at);
+          for (const edge of [segment.from, segment.to]) {
+            context.moveTo(edge, segment.at - tick);
+            context.lineTo(edge, segment.at + tick);
           }
         } else {
-          ctx.moveTo(s.at, s.from);
-          ctx.lineTo(s.at, s.to);
-          for (const e of [s.from, s.to]) {
-            ctx.moveTo(s.at - tick, e);
-            ctx.lineTo(s.at + tick, e);
+          context.moveTo(segment.at, segment.from);
+          context.lineTo(segment.at, segment.to);
+          for (const edge of [segment.from, segment.to]) {
+            context.moveTo(segment.at - tick, edge);
+            context.lineTo(segment.at + tick, edge);
           }
         }
       }
     }
-    ctx.stroke();
+    context.stroke();
     // Labels: white text on a red pill, centered on each gap.
-    ctx.font = `500 ${11 / z}px Geist, Inter, system-ui, sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (const g of this.spacing) {
-      const text = String(Math.round(g.distance));
-      const w = ctx.measureText(text).width + 8 / z;
-      const h = 16 / z;
-      for (const s of g.segments) {
-        const mid = (s.from + s.to) / 2;
-        const [cx, cy] = g.axis === 'x' ? [mid, s.at + h] : [s.at + w / 2 + 6 / z, mid];
-        ctx.fillStyle = GUIDE;
-        ctx.beginPath();
-        ctx.roundRect(cx - w / 2, cy - h / 2, w, h, 3 / z);
-        ctx.fill();
-        ctx.fillStyle = '#fff';
-        ctx.fillText(text, cx, cy);
+    context.font = `500 ${11 / zoom}px Geist, Inter, system-ui, sans-serif`;
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    for (const guide of this.spacing) {
+      const text = String(Math.round(guide.distance));
+      const width = context.measureText(text).width + 8 / zoom;
+      const height = 16 / zoom;
+      for (const segment of guide.segments) {
+        const middle = (segment.from + segment.to) / 2;
+        const [centerX, centerY] =
+          guide.axis === 'x'
+            ? [middle, segment.at + height]
+            : [segment.at + width / 2 + 6 / zoom, middle];
+        context.fillStyle = GUIDE;
+        context.beginPath();
+        context.roundRect(centerX - width / 2, centerY - height / 2, width, height, 3 / zoom);
+        context.fill();
+        context.fillStyle = '#fff';
+        context.fillText(text, centerX, centerY);
       }
     }
-    ctx.restore();
+    context.restore();
   }
 
   /** Dashed box around a group's elements. */
-  private groupFrame(ids: readonly string[], z: number, alpha: number): void {
-    const b = this.scene.bounds(ids);
-    if (!b) return;
-    const pad = 4 / z;
-    const { ctx } = this;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = this.accent;
-    ctx.lineWidth = 1 / z;
-    ctx.setLineDash([4 / z, 3 / z]);
-    ctx.strokeRect(
-      b.minX - pad,
-      b.minY - pad,
-      b.maxX - b.minX + pad * 2,
-      b.maxY - b.minY + pad * 2,
+  private groupFrame(ids: readonly string[], zoom: number, alpha: number): void {
+    const bounds = this.scene.bounds(ids);
+    if (!bounds) return;
+    const margin = 4 / zoom;
+    const { context } = this;
+    context.save();
+    context.globalAlpha = alpha;
+    context.strokeStyle = this.accent;
+    context.lineWidth = 1 / zoom;
+    context.setLineDash([4 / zoom, 3 / zoom]);
+    context.strokeRect(
+      bounds.minX - margin,
+      bounds.minY - margin,
+      bounds.maxX - bounds.minX + margin * 2,
+      bounds.maxY - bounds.minY + margin * 2,
     );
-    ctx.restore();
+    context.restore();
   }
 
   /**
-   * Another participant's selection: the same element outlines and frame as a selection
-   * here, in their color, without handles. For an overlay layer (world transform set).
+   * Elements outlined and framed like a selection, in `color`, without handles (e.g. what a
+   * preview removes). For an overlay layer (world transform set).
    */
-  drawForeignSelection(ids: ReadonlySet<string>, color: string): void {
+  drawTintedSelection(ids: ReadonlySet<string>, color: string): void {
     if (ids.size === 0) return;
-    const { ctx, camera } = this;
-    const z = camera.zoom;
-    const view = camera.viewportBounds();
-    let drawn = 0;
-    for (const id of ids) {
-      if (drawn >= MAX_OUTLINES) break;
-      const b = this.scene.getBounds(id);
-      if (!b || !boxIntersects(b, view)) continue;
-      this.outline(id, view, 1.5 / z, 1, color);
-      drawn++;
-    }
+    const { context, camera } = this;
+    const zoom = camera.zoom;
+    this.outlineElements(ids, 1, color);
     const frame = selectionEdgeFrame(this.scene, ids);
     if (!frame) return;
-    ctx.save();
-    ctx.translate(frame.cx, frame.cy);
-    ctx.rotate(frame.rotation);
-    ctx.strokeStyle = color;
-    const line = HANDLE_BORDER_PX / z;
-    ctx.lineWidth = line;
-    ctx.strokeRect(-(frame.w + line) / 2, -(frame.h + line) / 2, frame.w + line, frame.h + line);
-    ctx.restore();
+    context.save();
+    context.translate(frame.centerX, frame.centerY);
+    context.rotate(frame.rotation);
+    context.strokeStyle = color;
+    const line = HANDLE_BORDER_PX / zoom;
+    context.lineWidth = line;
+    context.strokeRect(
+      -(frame.width + line) / 2,
+      -(frame.height + line) / 2,
+      frame.width + line,
+      frame.height + line,
+    );
+    context.restore();
   }
 
-  private outline(id: string, view: Box, width: number, alpha: number, color: string): void {
-    const el = this.scene.get(id);
-    const b = this.scene.getBounds(id);
-    if (!el || !b || !boxIntersects(b, view)) return;
-    const { ctx } = this;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.beginPath();
-    if (isShape(el)) {
-      ctx.translate(el.x + el.w / 2, el.y + el.h / 2);
-      ctx.rotate(el.rotation);
-      // Just outside the shape's outer edge (its border included), not over it.
-      traceShape(ctx, el, el.strokeWidth / 2 + width / 2);
-      ctx.stroke();
-    } else {
-      // A halo along the line, wider than the stroke.
-      const g = this.scene.connectorGeometry(id);
-      if (g) {
-        ctx.lineWidth = el.strokeWidth + width * 4;
-        ctx.globalAlpha = alpha * 0.35;
-        ctx.lineJoin = 'round';
-        ctx.lineCap = 'round';
-        ctx.moveTo(g.points[0]!.x, g.points[0]!.y);
-        for (const p of g.points.slice(1)) ctx.lineTo(p.x, p.y);
-        ctx.stroke();
+  /**
+   * Outlines elements: shapes just outside their outer edge (their border included),
+   * connectors with a halo. Every outline of a kind goes into one path, so a selection of
+   * thousands costs one stroke instead of thousands. At most `MAX_OUTLINES` elements in
+   * view are drawn.
+   */
+  private outlineElements(ids: Iterable<string>, alpha: number, color: string): void {
+    const { context, camera, scene } = this;
+    const width = OUTLINE_PX / camera.zoom;
+    const view = camera.viewportBounds();
+    const shapes: ShapeElement[] = [];
+    const connectors: OutlinedConnector[] = [];
+    for (const id of ids) {
+      if (shapes.length + connectors.length >= MAX_OUTLINES) break;
+      const element = scene.get(id);
+      const bounds = scene.getBounds(id);
+      if (!element || !bounds || !boxIntersects(bounds, view)) continue;
+      if (isShape(element)) {
+        shapes.push(element);
+        continue;
+      }
+      const geometry = scene.connectorGeometry(id);
+      if (geometry) connectors.push({ element, geometry, bounds });
+    }
+    if (shapes.length === 0 && connectors.length === 0) return;
+    context.save();
+    context.globalAlpha = alpha;
+    context.strokeStyle = color;
+    if (shapes.length > 0) this.outlineShapes(shapes, width);
+    if (connectors.length > 0) this.haloConnectors(connectors, width, alpha);
+    context.restore();
+  }
+
+  private outlineShapes(shapes: readonly ShapeElement[], width: number): void {
+    const { context } = this;
+    const zoom = this.camera.zoom;
+    const grow = (shape: ShapeElement) => shape.strokeWidth / 2 + width / 2;
+    this.setWorldTransform();
+    context.beginPath();
+    const exact: ShapeElement[] = [];
+    for (const shape of shapes) {
+      // Too small on screen for its exact outline to show: its box, in world coordinates.
+      if (Math.max(shape.width, shape.height) * zoom < EXACT_OUTLINE_MIN_PX)
+        traceBox(context, shape, grow(shape));
+      else exact.push(shape);
+    }
+    for (const shape of exact) {
+      // A path keeps the transform it was built with: each outline is placed with its own,
+      // and all of them are stroked at once.
+      this.setWorldTransform();
+      context.translate(shape.x + shape.width / 2, shape.y + shape.height / 2);
+      context.rotate(shape.rotation);
+      traceShape(context, shape, grow(shape));
+    }
+    this.setWorldTransform();
+    context.lineWidth = width;
+    context.stroke();
+  }
+
+  /**
+   * Halos along connectors, wider than their stroke (narrower on lines small on screen, like
+   * their handles). Halos of one width share a path, so where they cross they merge into one
+   * layer instead of darkening; each width first clears its area for the same reason.
+   */
+  private haloConnectors(connectors: readonly OutlinedConnector[], width: number, alpha: number) {
+    const { context, camera, scene } = this;
+    const scale = handleScale(camera.zoom);
+    const haloOf = (connector: ConnectorElement) => connector.strokeWidth + width * 4 * scale;
+    context.lineJoin = 'round';
+    context.lineCap = 'round';
+    for (const [halo, geometries] of groupBy(connectors, ({ element }) => haloOf(element))) {
+      context.beginPath();
+      for (const { geometry } of geometries) traceConnector(context, geometry);
+      context.lineWidth = halo;
+      context.globalAlpha = 1;
+      context.globalCompositeOperation = 'destination-out';
+      context.stroke();
+      context.globalAlpha = alpha * 0.35;
+      context.globalCompositeOperation = 'source-over';
+      context.stroke();
+    }
+    // The halos lie under the lines: their own and every other line they cross are cut out
+    // of them (a halo drawn over a dark line reads as a stray stripe). The cut is half a
+    // pixel narrower than the line, so the halo tucks under its antialiased edge instead of
+    // leaving a seam of background between them.
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = 'destination-out';
+    const tuck = 1 / camera.zoom;
+    const cut = new Set<string>();
+    const lines: OutlinedConnector[] = [];
+    for (const { element, bounds } of connectors) {
+      for (const line of scene.queryBox(inflateBox(bounds, haloOf(element) / 2))) {
+        if (line.type !== 'connector' || cut.has(line.id) || line.strokeWidth <= tuck) continue;
+        cut.add(line.id);
+        const geometry = scene.connectorGeometry(line.id);
+        if (geometry) lines.push({ element: line, geometry, bounds });
       }
     }
-    ctx.restore();
+    for (const [strokeWidth, group] of groupBy(lines, ({ element }) => element.strokeWidth)) {
+      context.beginPath();
+      for (const { geometry } of group) traceConnector(context, geometry);
+      context.lineWidth = strokeWidth - tuck;
+      context.stroke();
+    }
+    for (const { element, geometry } of lines) {
+      const last = geometry.points[geometry.points.length - 1]!;
+      traceCap(
+        context,
+        element.startCap,
+        geometry.points[0]!,
+        geometry.startDirection,
+        element.strokeWidth,
+        tuck,
+      );
+      traceCap(context, element.endCap, last, geometry.endDirection, element.strokeWidth, tuck);
+    }
   }
+}
+
+/** A connector to outline, resolved. */
+interface OutlinedConnector {
+  element: ConnectorElement;
+  geometry: ConnectorGeometry;
+  bounds: Box;
+}
+
+/** `items` grouped by `keyOf`, in the order the keys first appear. */
+function groupBy<Item, Key>(items: readonly Item[], keyOf: (item: Item) => Key): Map<Key, Item[]> {
+  const groups = new Map<Key, Item[]>();
+  for (const item of items) {
+    const key = keyOf(item);
+    const group = groups.get(key);
+    if (group) group.push(item);
+    else groups.set(key, [item]);
+  }
+  return groups;
 }

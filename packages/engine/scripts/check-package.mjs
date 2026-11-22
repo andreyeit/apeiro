@@ -1,8 +1,9 @@
 // Checks the built package before publishing: every export resolves to a file, nothing
 // refers to the private workspace packages, the React entry is a client module and the
 // main entry loads without a DOM (server rendering). A separate TypeScript consumer checks
-// all three public entries with both bundler and NodeNext module resolution.
+// all public entries with both bundler and NodeNext module resolution.
 import console from 'node:console';
+import { execFileSync } from 'node:child_process';
 import {
   cpSync,
   existsSync,
@@ -48,22 +49,7 @@ for (const entry of ['dist/react.js']) {
   if (!readFileSync(join(root, entry), 'utf8').startsWith('"use client"'))
     problems.push(`${entry} does not start with "use client"`);
 }
-// yjs is optional: only `apeiro/sync` may load it, not `apeiro` or `apeiro/react`.
-for (const entry of ['dist/index.js', 'dist/react.js']) {
-  const seen = new Set();
-  const visit = (file) => {
-    if (seen.has(file)) return;
-    seen.add(file);
-    const code = readFileSync(file, 'utf8');
-    if (/from ["'](yjs|y-protocols)[/"']/.test(code))
-      problems.push(`${entry} loads yjs (through ${file})`);
-    for (const [, path] of code.matchAll(/from ["'](\.{1,2}\/[^"']+)["']/g))
-      visit(join(dirname(file), path));
-  };
-  visit(join(root, entry));
-}
-
-for (const entry of ['dist/index.js', 'dist/sync.js']) {
+for (const entry of ['dist/index.js']) {
   if (readFileSync(join(root, entry), 'utf8').includes('use client'))
     problems.push(`${entry} must not be a client module`);
 }
@@ -79,7 +65,7 @@ try {
   cpSync(join(root, 'package.json'), join(installed, 'package.json'));
   cpSync(join(root, 'scripts/consumer.tsx'), join(consumer, 'consumer.tsx'));
   writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
-  for (const dependency of ['react', 'yjs', 'y-protocols', '@mapbox']) {
+  for (const dependency of ['react', '@mapbox']) {
     symlinkSync(join(root, 'node_modules', dependency), join(modules, dependency), 'junction');
   }
   mkdirSync(join(modules, '@types'));
@@ -88,6 +74,57 @@ try {
     join(modules, '@types', 'react'),
     'junction',
   );
+  // The framework-free entry must work in a consumer without optional Yjs installed.
+  execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `const { BoardEditor } = await import(${JSON.stringify(pathToFileURL(join(installed, 'dist/index.js')).href)}); new BoardEditor().destroy(); await import(${JSON.stringify(pathToFileURL(join(installed, 'dist/react.js')).href)});`,
+    ],
+    { cwd: consumer },
+  );
+  // Even type-checking a plain React consumer must not require optional network peers.
+  const plainConsumer = join(consumer, 'plain.tsx');
+  writeFileSync(
+    plainConsumer,
+    `import { Board } from 'apeiro/react';
+export const local = <Board config={{ grid: 'dots' }} />;
+export const shared = <Board collaboration={{ url: 'http://localhost:3001', roomId: 'demo', socketOptions: { auth: { token: 'test' } } }} />;
+`,
+  );
+  const plainProgram = ts.createProgram([plainConsumer], {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    jsx: ts.JsxEmit.ReactJSX,
+    strict: true,
+    noEmit: true,
+    types: [],
+  });
+  const plainDiagnostics = ts.getPreEmitDiagnostics(plainProgram);
+  if (plainDiagnostics.length)
+    problems.push(
+      ts.formatDiagnostics(plainDiagnostics, {
+        getCanonicalFileName: (file) => file,
+        getCurrentDirectory: () => consumer,
+        getNewLine: () => '\n',
+      }),
+    );
+  // The collaboration entry needs only Yjs; presence types are structural.
+  symlinkSync(join(root, 'node_modules', 'yjs'), join(modules, 'yjs'), 'junction');
+  execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `await import(${JSON.stringify(pathToFileURL(join(installed, 'dist/yjs.js')).href)});`,
+    ],
+    { cwd: consumer },
+  );
+  for (const dependency of ['y-protocols', 'socket.io', 'socket.io-client']) {
+    symlinkSync(join(root, 'node_modules', dependency), join(modules, dependency), 'junction');
+  }
   for (const [name, module, moduleResolution] of [
     ['bundler', ts.ModuleKind.ESNext, ts.ModuleResolutionKind.Bundler],
     ['NodeNext', ts.ModuleKind.NodeNext, ts.ModuleResolutionKind.NodeNext],
@@ -120,14 +157,14 @@ try {
 try {
   const core = await import(pathToFileURL(join(root, 'dist/index.js')).href);
   const editor = new core.BoardEditor();
-  editor.addElements([
+  editor.elements.add([
     {
       id: 'a',
       type: 'rect',
       x: 0,
       y: 0,
-      w: 10,
-      h: 10,
+      width: 10,
+      height: 10,
       rotation: 0,
       z: 0,
       fill: 0,
@@ -136,7 +173,7 @@ try {
       radius: 0,
     },
   ]);
-  if (editor.selection[0] !== 'a') problems.push('BoardEditor does not work without a DOM');
+  if (editor.selection.ids[0] !== 'a') problems.push('BoardEditor does not work without a DOM');
   editor.destroy();
 } catch (e) {
   problems.push(`dist/index.js fails without a DOM: ${e}`);

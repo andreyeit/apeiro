@@ -13,29 +13,31 @@ const MAX_PENDING = 4096;
 
 /**
  * Sorts runs and merges overlapping ones and those separated by at most `gap` instances.
- * If more than `max` runs remain, the narrowest gaps are merged until at most `max` are left.
+ * If more than `maximum` runs remain, the narrowest gaps are merged until at most that many are left.
  */
 export function coalesceRuns(
   runs: Array<[number, number]>,
   gap = RUN_GAP,
-  max = MAX_RUNS,
+  maximum = MAX_RUNS,
 ): Array<[number, number]> {
-  runs.sort((a, b) => a[0] - b[0]);
-  const out: Array<[number, number]> = [];
+  runs.sort((first, second) => first[0] - second[0]);
+  const merged: Array<[number, number]> = [];
   for (const [from, to] of runs) {
-    const last = out[out.length - 1];
+    const last = merged[merged.length - 1];
     if (last && from <= last[1] + gap) last[1] = Math.max(last[1], to);
-    else out.push([from, to]);
+    else merged.push([from, to]);
   }
-  if (out.length <= max) return out;
-  // Merge exactly the (n - max) narrowest gaps: gap i lies between runs i - 1 and i.
-  const order = Array.from({ length: out.length - 1 }, (_, i) => i + 1);
-  order.sort((a, b) => out[a]![0] - out[a - 1]![1] - (out[b]![0] - out[b - 1]![1]));
-  const join = new Set(order.slice(0, out.length - max));
-  const capped: Array<[number, number]> = [out[0]!];
-  for (let i = 1; i < out.length; i++) {
-    if (join.has(i)) capped[capped.length - 1]![1] = out[i]![1];
-    else capped.push(out[i]!);
+  if (merged.length <= maximum) return merged;
+  // Merge exactly the (count - maximum) narrowest gaps: gap `index` lies between runs
+  // `index - 1` and `index`.
+  const gapWidth = (index: number) => merged[index]![0] - merged[index - 1]![1];
+  const order = Array.from({ length: merged.length - 1 }, (_, index) => index + 1);
+  order.sort((first, second) => gapWidth(first) - gapWidth(second));
+  const join = new Set(order.slice(0, merged.length - maximum));
+  const capped: Array<[number, number]> = [merged[0]!];
+  for (let index = 1; index < merged.length; index++) {
+    if (join.has(index)) capped[capped.length - 1]![1] = merged[index]![1];
+    else capped.push(merged[index]!);
   }
   return capped;
 }
@@ -73,41 +75,6 @@ export class DirtyRanges {
   }
 }
 
-export interface InstanceBuffer {
-  instances: WebGLBuffer;
-  instanceBytes: number;
-}
-
-/**
- * Uploads a CPU layer to its GPU buffer and returns bytes transferred (not allocated).
- * Growth invalidates the old contents, so even a partial update must upload all instances.
- * Spare capacity avoids reallocating when the visible text or a connector grows slightly.
- */
-export function uploadInstances(
-  gl: WebGL2RenderingContext,
-  target: InstanceBuffer,
-  data: ArrayBuffer,
-  count: number,
-  stride: number,
-  upload: BufferUpload,
-): number {
-  if (upload.kind === 'none' || count === 0) return 0;
-  const bytes = count * stride;
-  const grow = bytes > target.instanceBytes;
-  gl.bindBuffer(gl.ARRAY_BUFFER, target.instances);
-  if (grow) {
-    target.instanceBytes = Math.ceil(Math.max(bytes * 1.5, 64 * 1024));
-    gl.bufferData(gl.ARRAY_BUFFER, target.instanceBytes, gl.DYNAMIC_DRAW);
-  }
-  let uploaded = 0;
-  for (const [offset, length] of byteRuns(upload, grow, count, stride)) {
-    gl.bufferSubData(gl.ARRAY_BUFFER, offset, new Uint8Array(data, offset, length));
-    uploaded += length;
-  }
-  gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  return uploaded;
-}
-
 /**
  * Byte [offset, length] pairs to upload: every used byte for `all` or a fresh buffer,
  * otherwise each dirty run clipped to the instances in use.
@@ -120,10 +87,10 @@ export function byteRuns(
 ): Array<[number, number]> {
   if (upload.kind === 'none' || count === 0) return [];
   if (fresh || upload.kind === 'all') return [[0, count * stride]];
-  const out: Array<[number, number]> = [];
+  const byteRanges: Array<[number, number]> = [];
   for (const [from, to] of upload.runs) {
     const end = Math.min(to, count);
-    if (from < end) out.push([from * stride, (end - from) * stride]);
+    if (from < end) byteRanges.push([from * stride, (end - from) * stride]);
   }
-  return out;
+  return byteRanges;
 }

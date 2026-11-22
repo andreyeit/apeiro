@@ -1,27 +1,40 @@
-import { boxIntersects, type Box } from './math';
+import { boxIntersects, type Box } from './box';
 
 /** Cells are addressed in ±2^20 range per axis; packed into one safe integer key. */
 const CELL_OFFSET = 1 << 20;
 const CELL_SPAN = 1 << 21;
-const cellKey = (cx: number, cy: number): number =>
-  (cx + CELL_OFFSET) * CELL_SPAN + (cy + CELL_OFFSET);
+const cellKey = (cellX: number, cellY: number): number =>
+  (cellX + CELL_OFFSET) * CELL_SPAN + (cellY + CELL_OFFSET);
 
+/** The cells a box covers, inclusive on both ends. */
 interface CellRange {
-  x0: number;
-  y0: number;
-  x1: number;
-  y1: number;
+  minCellX: number;
+  minCellY: number;
+  maxCellX: number;
+  maxCellY: number;
 }
 
 /** Outside this range packed keys collide, and very large coordinates cannot be incremented. */
 function canPack(range: CellRange): boolean {
   return (
-    range.x0 >= -CELL_OFFSET &&
-    range.y0 >= -CELL_OFFSET &&
-    range.x1 < CELL_OFFSET &&
-    range.y1 < CELL_OFFSET
+    range.minCellX >= -CELL_OFFSET &&
+    range.minCellY >= -CELL_OFFSET &&
+    range.maxCellX < CELL_OFFSET &&
+    range.maxCellY < CELL_OFFSET
   );
 }
+
+const cellCount = (range: CellRange): number =>
+  (range.maxCellX - range.minCellX + 1) * (range.maxCellY - range.minCellY + 1);
+
+const sameRange = (first: CellRange | null, second: CellRange | null): boolean =>
+  first === second ||
+  (first !== null &&
+    second !== null &&
+    first.minCellX === second.minCellX &&
+    first.minCellY === second.minCellY &&
+    first.maxCellX === second.maxCellX &&
+    first.maxCellY === second.maxCellY);
 
 function validateBox(box: Box): void {
   if (
@@ -56,17 +69,17 @@ export interface SpatialIndexOptions {
  */
 export class SpatialIndex<Id = string> {
   private readonly cellSize: number;
-  private readonly maxCells: number;
+  private readonly maxCellsPerEntry: number;
   private cells = new Map<number, Set<Id>>();
   private entries = new Map<Id, Entry>();
   private large = new Set<Id>();
 
   constructor(options: SpatialIndexOptions = {}) {
     this.cellSize = options.cellSize ?? 256;
-    this.maxCells = options.maxCellsPerEntry ?? 64;
+    this.maxCellsPerEntry = options.maxCellsPerEntry ?? 64;
     if (!Number.isFinite(this.cellSize) || this.cellSize <= 0)
       throw new RangeError('cellSize must be finite and positive');
-    if (!Number.isSafeInteger(this.maxCells) || this.maxCells < 1)
+    if (!Number.isSafeInteger(this.maxCellsPerEntry) || this.maxCellsPerEntry < 1)
       throw new RangeError('maxCellsPerEntry must be a positive safe integer');
   }
 
@@ -85,37 +98,27 @@ export class SpatialIndex<Id = string> {
   /** Inserts or moves an entry. */
   set(id: Id, box: Box): void {
     validateBox(box);
-    const prev = this.entries.get(id);
+    const previous = this.entries.get(id);
     const range = this.cellRange(box);
-    const isLarge =
-      !canPack(range) || (range.x1 - range.x0 + 1) * (range.y1 - range.y0 + 1) > this.maxCells;
+    const isLarge = !canPack(range) || cellCount(range) > this.maxCellsPerEntry;
     const nextCells = isLarge ? null : range;
 
-    if (prev) {
-      const same =
-        (prev.cells === null && nextCells === null) ||
-        (prev.cells !== null &&
-          nextCells !== null &&
-          prev.cells.x0 === nextCells.x0 &&
-          prev.cells.y0 === nextCells.y0 &&
-          prev.cells.x1 === nextCells.x1 &&
-          prev.cells.y1 === nextCells.y1);
-      if (same) {
-        prev.box = box; // still in the same cells: cheap path for small moves
+    if (previous) {
+      if (sameRange(previous.cells, nextCells)) {
+        previous.box = box; // still in the same cells: cheap path for small moves
         return;
       }
-      this.unregister(id, prev);
+      this.unregister(id, previous);
     }
 
-    const entry: Entry = { box, cells: nextCells };
-    this.entries.set(id, entry);
+    this.entries.set(id, { box, cells: nextCells });
     if (nextCells === null) {
       this.large.add(id);
       return;
     }
-    for (let cx = nextCells.x0; cx <= nextCells.x1; cx++) {
-      for (let cy = nextCells.y0; cy <= nextCells.y1; cy++) {
-        const key = cellKey(cx, cy);
+    for (let cellX = nextCells.minCellX; cellX <= nextCells.maxCellX; cellX++) {
+      for (let cellY = nextCells.minCellY; cellY <= nextCells.maxCellY; cellY++) {
+        const key = cellKey(cellX, cellY);
         let bucket = this.cells.get(key);
         if (!bucket) {
           bucket = new Set();
@@ -145,24 +148,27 @@ export class SpatialIndex<Id = string> {
     validateBox(box);
     const out: Id[] = [];
     const range = this.cellRange(box);
-    const cellCount = (range.x1 - range.x0 + 1) * (range.y1 - range.y0 + 1);
 
-    if (!canPack(range) || cellCount > this.cells.size) {
+    if (!canPack(range) || cellCount(range) > this.cells.size) {
       // Query covers more cells than exist (zoomed far out): scan entries instead.
       for (const [id, entry] of this.entries) if (boxIntersects(entry.box, box)) out.push(id);
       return out;
     }
 
-    for (let cx = range.x0; cx <= range.x1; cx++) {
-      for (let cy = range.y0; cy <= range.y1; cy++) {
-        const bucket = this.cells.get(cellKey(cx, cy));
+    for (let cellX = range.minCellX; cellX <= range.maxCellX; cellX++) {
+      for (let cellY = range.minCellY; cellY <= range.maxCellY; cellY++) {
+        const bucket = this.cells.get(cellKey(cellX, cellY));
         if (!bucket) continue;
         for (const id of bucket) {
           const entry = this.entries.get(id)!;
-          const c = entry.cells!; // bucketed entries always have cells
+          const cells = entry.cells!; // bucketed entries always have cells
           // An entry sits in every cell of its range: report it only from the first cell that
           // range shares with the query, so it is reported once without a `seen` set.
-          if (Math.max(c.x0, range.x0) !== cx || Math.max(c.y0, range.y0) !== cy) continue;
+          if (
+            Math.max(cells.minCellX, range.minCellX) !== cellX ||
+            Math.max(cells.minCellY, range.minCellY) !== cellY
+          )
+            continue;
           if (boxIntersects(entry.box, box)) out.push(id);
         }
       }
@@ -177,13 +183,13 @@ export class SpatialIndex<Id = string> {
     return this.query({ minX: x, minY: y, maxX: x, maxY: y });
   }
 
-  private cellRange(box: Box) {
-    const s = this.cellSize;
+  private cellRange(box: Box): CellRange {
+    const cellSize = this.cellSize;
     return {
-      x0: Math.floor(box.minX / s),
-      y0: Math.floor(box.minY / s),
-      x1: Math.floor(box.maxX / s),
-      y1: Math.floor(box.maxY / s),
+      minCellX: Math.floor(box.minX / cellSize),
+      minCellY: Math.floor(box.minY / cellSize),
+      maxCellX: Math.floor(box.maxX / cellSize),
+      maxCellY: Math.floor(box.maxY / cellSize),
     };
   }
 
@@ -192,10 +198,10 @@ export class SpatialIndex<Id = string> {
       this.large.delete(id);
       return;
     }
-    const c = entry.cells;
-    for (let cx = c.x0; cx <= c.x1; cx++) {
-      for (let cy = c.y0; cy <= c.y1; cy++) {
-        const key = cellKey(cx, cy);
+    const cells = entry.cells;
+    for (let cellX = cells.minCellX; cellX <= cells.maxCellX; cellX++) {
+      for (let cellY = cells.minCellY; cellY <= cells.maxCellY; cellY++) {
+        const key = cellKey(cellX, cellY);
         const bucket = this.cells.get(key);
         if (!bucket) continue;
         bucket.delete(id);

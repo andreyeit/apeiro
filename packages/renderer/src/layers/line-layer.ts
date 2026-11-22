@@ -1,4 +1,3 @@
-import { DirtyRanges, type BufferUpload } from './buffer-upload';
 import {
   capSize,
   inkWorldPoints,
@@ -15,10 +14,17 @@ import {
 } from '@apeiro/core';
 import { ColorTheme } from '../color-theme';
 import { shapeDepth } from '../depth';
+import { DirtyRanges, type BufferUpload } from './buffer-upload';
+import {
+  growBuffer,
+  vec4Attributes,
+  writeColorBytes,
+  type InstanceLayout,
+} from './instance-layout';
 
 /**
  * Per-instance layout (interleaved, 52 bytes):
- *   0  f32 x0, y0, x1, y1          segment ends; for caps: tip and the point `size` behind it;
+ *   0  f32 startX, startY, endX, endY  segment ends; for caps: tip and the point `size` behind it;
  *                                  for arcs: center x, y, radius, start angle
  *   16 f32 halfWidth, mode, dash, gap
  *   32 f32 dashOffset, depth, capSize (arcs: sweep), joins
@@ -34,6 +40,16 @@ export const LINE_STRIDE = 52;
 const FLOATS = LINE_STRIDE / 4;
 /** Floats of an instance before its color. */
 const ITEM = 12;
+/** Float index of `mode` within an instance. */
+const MODE_FLOAT = 5;
+/** Float index of `joins` within an instance. */
+const JOINS_FLOAT = 11;
+const COLOR_BYTE = 48;
+
+export const LINE_LAYOUT: InstanceLayout = {
+  stride: LINE_STRIDE,
+  attributes: [...vec4Attributes(0, 3), { format: 'unorm8', components: 4, offset: COLOR_BYTE }],
+};
 
 export const JOIN_FLAG = 2048;
 export const JOIN_END = 4096;
@@ -42,8 +58,8 @@ const MAX_JOIN_TURN = Math.PI * 0.95;
 
 /** Bits of one joined end: the flag and the split line's angle quantized to 11 bits. */
 export function joinBits(angle: number): number {
-  const t = Math.max(-1, Math.min(1, angle / (Math.PI / 2)));
-  return JOIN_FLAG + Math.round((t * 0.5 + 0.5) * (JOIN_FLAG - 1));
+  const turn = Math.max(-1, Math.min(1, angle / (Math.PI / 2)));
+  return JOIN_FLAG + Math.round((turn * 0.5 + 0.5) * (JOIN_FLAG - 1));
 }
 
 export const LINE_HIDDEN = -1;
@@ -65,10 +81,10 @@ interface Range {
 export type LineUpload = BufferUpload;
 
 /** Dash pattern in world units: core length of a dash (without round ends) and period gap. */
-function dashPattern(c: ConnectorElement): [number, number] {
-  const w = Math.max(c.strokeWidth, 0.5);
-  if (c.dash === 'dashed') return [w * 4, w * 4];
-  if (c.dash === 'dotted') return [0, w * 2.5];
+function dashPattern(connector: ConnectorElement): [number, number] {
+  const width = Math.max(connector.strokeWidth, 0.5);
+  if (connector.dash === 'dashed') return [width * 4, width * 4];
+  if (connector.dash === 'dotted') return [0, width * 2.5];
   return [0, 0];
 }
 
@@ -82,8 +98,8 @@ export class LineLayer {
   /** Colors drawn in place of the stored ones (set by the renderer). */
   theme = new ColorTheme();
   private buffer = new ArrayBuffer(1024 * LINE_STRIDE);
-  private f32 = new Float32Array(this.buffer);
-  private u8 = new Uint8Array(this.buffer);
+  private floats = new Float32Array(this.buffer);
+  private bytes = new Uint8Array(this.buffer);
   private ranges = new Map<string, Range>();
   private used = 0;
   private holes = 0;
@@ -117,51 +133,56 @@ export class LineLayer {
     this.ranges.clear();
     this.used = 0;
     this.holes = 0;
-    for (const el of scene.all()) {
-      if (isConnector(el)) this.set(el, scene.connectorGeometry(el.id), slotOf(el.id));
-      else if (el.type === 'ink') this.setInk(el, slotOf(el.id));
+    for (const element of scene.all()) {
+      if (isConnector(element))
+        this.set(element, scene.connectorGeometry(element.id), slotOf(element.id));
+      else if (element.type === 'ink') this.setInk(element, slotOf(element.id));
     }
     this.dirty.markAll();
   }
 
   /** Writes (or hides, if geometry is null) a connector. */
-  set(c: ConnectorElement, g: ConnectorGeometry | null, slot: number | undefined): void {
+  set(
+    connector: ConnectorElement,
+    geometry: ConnectorGeometry | null,
+    slot: number | undefined,
+  ): void {
     this.items = 0;
-    if (g && slot !== undefined) this.instancesFor(c, g, shapeDepth(slot));
-    this.place(c.id, this.theme.of(c.type, c.stroke));
+    if (geometry && slot !== undefined) this.instancesFor(connector, geometry, shapeDepth(slot));
+    this.place(connector.id, this.theme.of(connector.type, connector.stroke));
   }
 
   /** Writes a pen stroke: a smooth curve through its points, as round-ended segments. */
-  setInk(el: ShapeElement, slot: number | undefined): void {
+  setInk(element: ShapeElement, slot: number | undefined): void {
     this.items = 0;
-    if (slot !== undefined && isShape(el) && el.strokeWidth > 0) {
+    if (slot !== undefined && isShape(element) && element.strokeWidth > 0) {
       const depth = shapeDepth(slot);
-      const hw = el.strokeWidth / 2;
+      const halfWidth = element.strokeWidth / 2;
       // Smoothed, so the stroke has no kinks between the points the pointer reported.
-      const pts = smoothStroke(inkWorldPoints(el), Math.max(hw, 1.5));
+      const points = smoothStroke(inkWorldPoints(element), Math.max(halfWidth, 1.5));
       // A dot (a click without moving) is a zero-length segment: just its round ends.
-      if (pts.length === 1) pts.push({ ...pts[0]! });
-      const dirs: number[] = [];
-      for (let i = 0; i + 1 < pts.length; i++) {
-        const a = pts[i]!;
-        const b = pts[i + 1]!;
-        this.item(a.x, a.y, b.x, b.y, hw, LINE_SEGMENT, 0, 0, 0, depth, 0);
-        const len = Math.hypot(b.x - a.x, b.y - a.y);
-        const dx = len > 1e-9 ? (b.x - a.x) / len : 0;
-        const dy = len > 1e-9 ? (b.y - a.y) / len : 0;
-        dirs.push(dx, dy, dx, dy);
+      if (points.length === 1) points.push({ ...points[0]! });
+      const directions: number[] = [];
+      for (let index = 0; index + 1 < points.length; index++) {
+        const start = points[index]!;
+        const end = points[index + 1]!;
+        this.item(start.x, start.y, end.x, end.y, halfWidth, LINE_SEGMENT, 0, 0, 0, depth, 0);
+        const length = Math.hypot(end.x - start.x, end.y - start.y);
+        const deltaX = length > 1e-9 ? (end.x - start.x) / length : 0;
+        const deltaY = length > 1e-9 ? (end.y - start.y) / length : 0;
+        directions.push(deltaX, deltaY, deltaX, deltaY);
       }
-      this.joinPieces(dirs);
+      this.joinPieces(directions);
     }
-    this.place(el.id, this.theme.of(el.type, el.stroke));
+    this.place(element.id, this.theme.of(element.type, element.stroke));
   }
 
   /** Appends an instance to `scratch`; the last float of an item is unused. */
   private item(
-    x0: number,
-    y0: number,
-    x1: number,
-    y1: number,
+    startX: number,
+    startY: number,
+    endX: number,
+    endY: number,
     halfWidth: number,
     mode: number,
     dash: number,
@@ -170,135 +191,137 @@ export class LineLayer {
     depth: number,
     size: number,
   ): void {
-    let s = this.scratch;
+    let scratch = this.scratch;
     const at = this.items * ITEM;
-    if (at + ITEM > s.length) {
-      const next = new Float32Array(s.length * 2);
-      next.set(s);
-      this.scratch = s = next;
+    if (at + ITEM > scratch.length) {
+      const next = new Float32Array(scratch.length * 2);
+      next.set(scratch);
+      this.scratch = scratch = next;
     }
-    s[at] = x0;
-    s[at + 1] = y0;
-    s[at + 2] = x1;
-    s[at + 3] = y1;
-    s[at + 4] = halfWidth;
-    s[at + 5] = mode;
-    s[at + 6] = dash;
-    s[at + 7] = gap;
-    s[at + 8] = dashOffset;
-    s[at + 9] = depth;
-    s[at + 10] = size;
-    s[at + 11] = 0;
+    scratch[at] = startX;
+    scratch[at + 1] = startY;
+    scratch[at + 2] = endX;
+    scratch[at + 3] = endY;
+    scratch[at + 4] = halfWidth;
+    scratch[at + 5] = mode;
+    scratch[at + 6] = dash;
+    scratch[at + 7] = gap;
+    scratch[at + 8] = dashOffset;
+    scratch[at + 9] = depth;
+    scratch[at + 10] = size;
+    scratch[at + 11] = 0;
     this.items++;
   }
 
   /**
    * Splits every joint between consecutive pieces in `scratch` (all of them so far, in path
-   * order) between its two pieces; `dirs` has each piece's direction in and out (x, y, x, y).
+   * order) between its two pieces; `directions` has each piece's direction in and out (x, y, x, y).
    * Without it, both pieces draw the joint and its translucent edge pixels are blended twice:
    * a knot at every bend, plainly visible once the line is a pixel or two wide on screen.
    */
-  private joinPieces(dirs: readonly number[]): void {
-    const s = this.scratch;
-    for (let i = 0; i + 1 < this.items; i++) {
-      const ax = dirs[i * 4 + 2]!;
-      const ay = dirs[i * 4 + 3]!;
-      const bx = dirs[i * 4 + 4]!;
-      const by = dirs[i * 4 + 5]!;
-      if ((ax === 0 && ay === 0) || (bx === 0 && by === 0)) continue; // a zero-length piece
+  private joinPieces(directions: readonly number[]): void {
+    const scratch = this.scratch;
+    for (let piece = 0; piece + 1 < this.items; piece++) {
+      const incomingX = directions[piece * 4 + 2]!;
+      const incomingY = directions[piece * 4 + 3]!;
+      const outgoingX = directions[piece * 4 + 4]!;
+      const outgoingY = directions[piece * 4 + 5]!;
+      if ((incomingX === 0 && incomingY === 0) || (outgoingX === 0 && outgoingY === 0)) continue; // a zero-length piece
       // The split line's normal is the bisector of the two directions: half the turn from
       // the first piece's direction, minus half the turn from the second's.
-      const turn = Math.atan2(ax * by - ay * bx, ax * bx + ay * by);
+      const turn = Math.atan2(
+        incomingX * outgoingY - incomingY * outgoingX,
+        incomingX * outgoingX + incomingY * outgoingY,
+      );
       if (Math.abs(turn) > MAX_JOIN_TURN) continue;
       // Arcs split at their own end radius (only their flag is read); bends are tangent.
-      const arcBefore = s[i * ITEM + 5] === LINE_ARC;
-      const arcAfter = s[(i + 1) * ITEM + 5] === LINE_ARC;
-      const end = i * ITEM + 11;
-      const start = (i + 1) * ITEM + 11;
-      s[end] = s[end]! + joinBits(arcBefore ? 0 : turn / 2) * JOIN_END;
-      s[start] = s[start]! + joinBits(arcAfter ? 0 : -turn / 2);
+      const arcBefore = scratch[piece * ITEM + MODE_FLOAT] === LINE_ARC;
+      const arcAfter = scratch[(piece + 1) * ITEM + MODE_FLOAT] === LINE_ARC;
+      const end = piece * ITEM + JOINS_FLOAT;
+      const start = (piece + 1) * ITEM + JOINS_FLOAT;
+      scratch[end] = scratch[end]! + joinBits(arcBefore ? 0 : turn / 2) * JOIN_END;
+      scratch[start] = scratch[start]! + joinBits(arcAfter ? 0 : -turn / 2);
     }
   }
 
   /** Moves the `scratch` instances into the line's range, growing (moving) it if needed. */
   private place(id: string, color: number): void {
-    const n = this.items;
+    const count = this.items;
     let range = this.ranges.get(id);
-    if (!range || n > range.capacity) {
-      if (range) this.hide(range, range.capacity, true);
+    if (!range || count > range.capacity) {
+      if (range) this.release(range);
       // Slack: a line switching between e.g. 3 and 5 elbow segments stays in place, and a
       // stroke being drawn moves O(log n) times instead of on almost every point.
-      const capacity = n === 0 ? 0 : n + Math.max(4, n >> 1);
+      const capacity = count === 0 ? 0 : count + Math.max(4, count >> 1);
       range = { start: this.used, capacity };
       this.ensureCapacity(this.used + capacity);
       this.used += capacity;
       this.ranges.set(id, range);
     }
-    const r = (color >>> 24) & 255;
-    const g = (color >>> 16) & 255;
-    const b = (color >>> 8) & 255;
-    const a = color & 255;
-    for (let i = 0; i < n; i++) {
-      const slot = range.start + i;
-      this.f32.set(this.scratch.subarray(i * ITEM, i * ITEM + ITEM), slot * FLOATS);
-      const c = slot * LINE_STRIDE + 48;
-      this.u8[c] = r;
-      this.u8[c + 1] = g;
-      this.u8[c + 2] = b;
-      this.u8[c + 3] = a;
+    for (let item = 0; item < count; item++) {
+      const slot = range.start + item;
+      this.floats.set(this.scratch.subarray(item * ITEM, item * ITEM + ITEM), slot * FLOATS);
+      writeColorBytes(this.bytes, slot * LINE_STRIDE + COLOR_BYTE, color);
     }
-    for (let i = n; i < range.capacity; i++) this.f32[(range.start + i) * FLOATS + 5] = LINE_HIDDEN;
+    for (let item = count; item < range.capacity; item++)
+      this.floats[(range.start + item) * FLOATS + MODE_FLOAT] = LINE_HIDDEN;
     this.mark(range.start, range.start + range.capacity);
   }
 
   remove(id: string): void {
     const range = this.ranges.get(id);
     if (!range) return;
-    this.hide(range, range.capacity, true);
+    this.release(range);
     this.ranges.delete(id);
   }
 
-  private hide(range: Range, n: number, countAsHoles: boolean): void {
-    for (let i = 0; i < n; i++) this.f32[(range.start + i) * FLOATS + 5] = LINE_HIDDEN;
-    if (countAsHoles) this.holes += range.capacity;
-    this.mark(range.start, range.start + n);
+  /** Hides a range for good: it becomes a hole until the next rebuild. */
+  private release(range: Range): void {
+    for (let item = 0; item < range.capacity; item++)
+      this.floats[(range.start + item) * FLOATS + MODE_FLOAT] = LINE_HIDDEN;
+    this.holes += range.capacity;
+    this.mark(range.start, range.start + range.capacity);
   }
 
   /** Writes a connector's segments, arcs and caps into `scratch`. */
-  private instancesFor(c: ConnectorElement, g: ConnectorGeometry, depth: number): void {
-    const hw = c.strokeWidth / 2;
-    const size = capSize(c.strokeWidth);
-    const [dash, gap] = dashPattern(c);
-    const pts = g.points.map((p) => ({ ...p }));
+  private instancesFor(
+    connector: ConnectorElement,
+    geometry: ConnectorGeometry,
+    depth: number,
+  ): void {
+    const halfWidth = connector.strokeWidth / 2;
+    const size = capSize(connector.strokeWidth);
+    const [dash, gap] = dashPattern(connector);
+    const points = geometry.points.map((point) => ({ ...point }));
 
     // Filled caps cover the line end: stop the line inside them so it doesn't poke out of the tip.
-    const shorten = (cap: CapKind, idx: number, nextIdx: number, dir: Vec2) => {
+    const shorten = (cap: CapKind, index: number, nextIndex: number, direction: Vec2) => {
       if (cap === 'none' || cap === 'arrow') return;
-      const p = pts[idx]!;
-      const q = pts[nextIdx]!;
-      const segLen = Math.hypot(p.x - q.x, p.y - q.y);
-      const k = Math.min(size * 0.7, segLen);
-      p.x -= dir.x * k;
-      p.y -= dir.y * k;
+      const end = points[index]!;
+      const neighbour = points[nextIndex]!;
+      const segmentLength = Math.hypot(end.x - neighbour.x, end.y - neighbour.y);
+      const shortening = Math.min(size * 0.7, segmentLength);
+      end.x -= direction.x * shortening;
+      end.y -= direction.y * shortening;
     };
-    shorten(c.startCap, 0, 1, g.startDir);
-    shorten(c.endCap, pts.length - 1, pts.length - 2, g.endDir);
+    shorten(connector.startCap, 0, 1, geometry.startDirection);
+    shorten(connector.endCap, points.length - 1, points.length - 2, geometry.endDirection);
 
     // Rounded bends are one exact arc each instead of their flattened points.
     const arcAt = new Map<number, ConnectorArc>();
-    for (const arc of g.arcs ?? []) arcAt.set(arc.from, arc);
+    for (const arc of geometry.arcs ?? []) arcAt.set(arc.from, arc);
     let offset = 0;
     // Direction in and out of every piece, for the joints between them.
-    const dirs: number[] = [];
-    for (let i = 0; i + 1 < pts.length;) {
-      const arc = arcAt.get(i);
+    const directions: number[] = [];
+    for (let index = 0; index + 1 < points.length;) {
+      const arc = arcAt.get(index);
       if (arc) {
         this.item(
-          arc.cx,
-          arc.cy,
-          arc.r,
+          arc.centerX,
+          arc.centerY,
+          arc.radius,
           arc.start,
-          hw,
+          halfWidth,
           LINE_ARC,
           dash,
           gap,
@@ -307,38 +330,50 @@ export class LineLayer {
           arc.sweep,
         );
         // Tangents at the ends: the radius turned a quarter in the direction of travel.
-        const s = arc.sweep < 0 ? -1 : 1;
-        const a1 = arc.start + arc.sweep;
-        dirs.push(
-          -Math.sin(arc.start) * s,
-          Math.cos(arc.start) * s,
-          -Math.sin(a1) * s,
-          Math.cos(a1) * s,
+        const sign = arc.sweep < 0 ? -1 : 1;
+        const endAngle = arc.start + arc.sweep;
+        directions.push(
+          -Math.sin(arc.start) * sign,
+          Math.cos(arc.start) * sign,
+          -Math.sin(endAngle) * sign,
+          Math.cos(endAngle) * sign,
         );
-        offset += arc.r * Math.abs(arc.sweep); // dashes continue along the arc's true length
-        i = arc.to;
+        offset += arc.radius * Math.abs(arc.sweep); // dashes continue along the arc's true length
+        index = arc.to;
         continue;
       }
-      const a = pts[i]!;
-      const b = pts[i + 1]!;
-      const len = Math.hypot(b.x - a.x, b.y - a.y);
-      i++;
-      if (len < 1e-6) continue;
-      this.item(a.x, a.y, b.x, b.y, hw, LINE_SEGMENT, dash, gap, offset, depth, size);
-      const dx = (b.x - a.x) / len;
-      const dy = (b.y - a.y) / len;
-      dirs.push(dx, dy, dx, dy);
-      offset += len;
+      const from = points[index]!;
+      const to = points[index + 1]!;
+      const length = Math.hypot(to.x - from.x, to.y - from.y);
+      index++;
+      if (length < 1e-6) continue;
+      this.item(
+        from.x,
+        from.y,
+        to.x,
+        to.y,
+        halfWidth,
+        LINE_SEGMENT,
+        dash,
+        gap,
+        offset,
+        depth,
+        size,
+      );
+      const deltaX = (to.x - from.x) / length;
+      const deltaY = (to.y - from.y) / length;
+      directions.push(deltaX, deltaY, deltaX, deltaY);
+      offset += length;
     }
-    this.joinPieces(dirs);
-    const cap = (kind: CapKind, tip: Vec2, dir: Vec2) => {
+    this.joinPieces(directions);
+    const cap = (kind: CapKind, tip: Vec2, direction: Vec2) => {
       if (kind === 'none') return;
       this.item(
         tip.x,
         tip.y,
-        tip.x - dir.x * size,
-        tip.y - dir.y * size,
-        hw,
+        tip.x - direction.x * size,
+        tip.y - direction.y * size,
+        halfWidth,
         CAP_MODE[kind],
         0,
         0,
@@ -347,21 +382,22 @@ export class LineLayer {
         size,
       );
     };
-    cap(c.startCap, g.points[0]!, g.startDir);
-    cap(c.endCap, g.points[g.points.length - 1]!, g.endDir);
+    cap(connector.startCap, geometry.points[0]!, geometry.startDirection);
+    cap(connector.endCap, geometry.points[geometry.points.length - 1]!, geometry.endDirection);
   }
 
   private mark(from: number, to: number): void {
     this.dirty.mark(from, to);
   }
 
-  private ensureCapacity(n: number): void {
-    if (n * LINE_STRIDE <= this.buffer.byteLength) return;
-    const next = new ArrayBuffer(Math.max(n * LINE_STRIDE, this.buffer.byteLength * 2));
-    new Uint8Array(next).set(this.u8);
-    this.buffer = next;
-    this.f32 = new Float32Array(next);
-    this.u8 = new Uint8Array(next);
+  private ensureCapacity(count: number): void {
+    if (count * LINE_STRIDE <= this.buffer.byteLength) return;
+    this.buffer = growBuffer(
+      this.buffer,
+      Math.max(count * LINE_STRIDE, this.buffer.byteLength * 2),
+    );
+    this.floats = new Float32Array(this.buffer);
+    this.bytes = new Uint8Array(this.buffer);
     this.dirty.markAll();
   }
 }

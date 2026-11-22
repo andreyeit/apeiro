@@ -1,23 +1,25 @@
 import {
   audioLayout,
+  cssColor,
   effectiveRadius,
   imageSize,
   imageUv,
-  isAllowedMediaSrc,
+  isAllowedMediaSource,
   isMedia,
-  type MediaInfo,
+  type MediaFile,
   type ShapeElement,
 } from '@apeiro/core';
-
-type MediaElement = ShapeElement & { media: MediaInfo };
+import type { MediaQuad, MediaSource, MediaTextures, TextureHandle } from '../backend';
 import {
   DEFAULT_AUDIO_STYLE,
   drawAudioWidget,
   type AudioCard,
   type AudioVisualState,
   type AudioWidgetStyle,
+  type Context2D,
 } from './audio-widget';
-import type { MediaQuad, MediaSource, MediaTextures, TextureHandle } from '../backend';
+
+type MediaElement = ShapeElement & { media: MediaFile };
 
 /**
  * Longest side of an image texture; bigger images are downscaled on load (and never past
@@ -39,11 +41,11 @@ export interface MediaPassOptions {
   /** Origins (e.g. `https://cdn.example.com`) media may be loaded from, besides the page's own. */
   allowedOrigins?: readonly string[];
   /** Full control over which `src` may be loaded; overrides `allowedOrigins`. */
-  isAllowedSrc?: (src: string) => boolean;
+  isAllowedSource?: (source: string) => boolean;
 }
 
 export interface MediaDrawItem {
-  el: ShapeElement;
+  element: ShapeElement;
   /** Depth of the element's slot (see depth.ts). */
   depth: number;
 }
@@ -70,12 +72,12 @@ interface AudioEntry {
   lastUsed: number;
 }
 
-function createCanvas(w: number, h: number): MediaSource {
-  if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h);
-  const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
-  return c;
+function createCanvas(width: number, height: number): MediaSource {
+  if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(width, height);
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
 }
 
 /**
@@ -84,7 +86,7 @@ function createCanvas(w: number, h: number): MediaSource {
  * meanwhile. Audio players are drawn with Canvas 2D into a texture, redrawn only when what
  * they show changes, at a resolution that follows the zoom.
  *
- * The owner reports when an image src or audio element is no longer used
+ * The owner reports when an image source or audio element is no longer used
  * (`releaseImage`, `releaseAudio`), so their textures are freed right away. Textures are
  * created by the backend (`MediaTextures`): this class decides what to upload and when,
  * and turns the visible elements into quads for the backend to draw.
@@ -102,7 +104,7 @@ export class MediaPass {
   private frame = 0;
   private generation = 0;
   private errorLogged = false;
-  private readonly allowed: (src: string) => boolean;
+  private readonly allowed: (source: string) => boolean;
 
   constructor(
     private readonly textures: MediaTextures,
@@ -110,23 +112,24 @@ export class MediaPass {
     options: MediaPassOptions = {},
   ) {
     this.allowed =
-      options.isAllowedSrc ?? ((src) => isAllowedMediaSrc(src, options.allowedOrigins ?? []));
+      options.isAllowedSource ??
+      ((source) => isAllowedMediaSource(source, options.allowedOrigins ?? []));
   }
 
   /** True while any image is still loading, or decoded and visible but not uploaded yet. */
   get pending(): boolean {
-    for (const e of this.images.values()) {
-      if (e.state === 'loading') return true;
-      if (e.state === 'decoded' && e.lastUsed >= this.frame - 1) return true;
+    for (const entry of this.images.values()) {
+      if (entry.state === 'loading') return true;
+      if (entry.state === 'decoded' && entry.lastUsed >= this.frame - 1) return true;
     }
     return false;
   }
 
   /** The GPU is (again) available. */
-  init(): void {
+  initialize(): void {
     this.alive = true;
     // Textures from a previous context are gone: everything reloads/redraws on demand.
-    for (const e of this.images.values()) e.bitmap?.close();
+    for (const entry of this.images.values()) entry.bitmap?.close();
     this.images.clear();
     this.audio.clear();
     this.generation++;
@@ -138,11 +141,11 @@ export class MediaPass {
   }
 
   dispose(): void {
-    for (const e of this.images.values()) {
-      if (e.texture && this.alive) this.textures.release(e.texture);
-      e.bitmap?.close();
+    for (const entry of this.images.values()) {
+      if (entry.texture && this.alive) this.textures.release(entry.texture);
+      entry.bitmap?.close();
     }
-    if (this.alive) for (const e of this.audio.values()) this.textures.release(e.texture);
+    if (this.alive) for (const entry of this.audio.values()) this.textures.release(entry.texture);
     this.images.clear();
     this.audio.clear();
     this.audioState.clear();
@@ -160,46 +163,52 @@ export class MediaPass {
   }
 
   /** No element uses this image any more: free its texture (an in-flight load is dropped). */
-  releaseImage(src: string): void {
-    const e = this.images.get(src);
-    if (!e) return;
-    if (e.texture && this.alive) this.textures.release(e.texture);
-    e.bitmap?.close();
-    this.images.delete(src);
+  releaseImage(source: string): void {
+    const entry = this.images.get(source);
+    if (!entry) return;
+    if (entry.texture && this.alive) this.textures.release(entry.texture);
+    entry.bitmap?.close();
+    this.images.delete(source);
   }
 
   /** The audio element is gone (or no longer audio): free its texture and playback state. */
   releaseAudio(id: string): void {
-    const e = this.audio.get(id);
-    if (e && this.alive) this.textures.release(e.texture);
+    const entry = this.audio.get(id);
+    if (entry && this.alive) this.textures.release(entry.texture);
     this.audio.delete(id);
     this.audioState.delete(id);
   }
 
   /** Quads for the visible media, in the given order; uploads what they need first. */
-  prepare(items: MediaDrawItem[], x: number, y: number, zoom: number, dpr: number): MediaQuad[] {
+  prepare(
+    items: MediaDrawItem[],
+    x: number,
+    y: number,
+    zoom: number,
+    pixelRatio: number,
+  ): MediaQuad[] {
     if (!this.alive || items.length === 0) return [];
     this.frame++;
     this.uploadOneDecoded();
     const quads: MediaQuad[] = [];
-    const k = zoom * dpr; // device pixels per world unit
-    for (const { el, depth } of items) {
-      if (!isMedia(el)) continue;
+    const devicePixelsPerUnit = zoom * pixelRatio;
+    for (const { element, depth } of items) {
+      if (!isMedia(element)) continue;
       try {
-        quads.push(this.quad(el, depth, x, y, k));
-      } catch (e) {
+        quads.push(this.quad(element, depth, x, y, devicePixelsPerUnit));
+      } catch (error) {
         // Element data (from other participants, eventually) must not stop the frame:
         // this element shows the placeholder, everything else is drawn as usual.
         if (!this.errorLogged) {
           this.errorLogged = true;
-          console.error('apeiro: a media element could not be drawn, showing a placeholder', e);
+          console.error('apeiro: a media element could not be drawn, showing a placeholder', error);
         }
         quads.push({
-          rect: [el.x, el.y, el.w, el.h],
-          rotation: el.rotation,
+          box: [element.x, element.y, element.width, element.height],
+          rotation: element.rotation,
           depth,
           radius: 0,
-          uv: [0, 0, 1, 1],
+          textureCoordinates: [0, 0, 1, 1],
           texture: null,
         });
       }
@@ -208,36 +217,52 @@ export class MediaPass {
     return quads;
   }
 
-  private quad(el: MediaElement, depth: number, x: number, y: number, k: number): MediaQuad {
+  private quad(
+    element: MediaElement,
+    depth: number,
+    x: number,
+    y: number,
+    devicePixelsPerUnit: number,
+  ): MediaQuad {
     let texture: TextureHandle | null;
-    let rect: MediaQuad['rect'] = [el.x, el.y, el.w, el.h];
-    let uv: MediaQuad['uv'];
-    if (el.type === 'image') {
-      texture = this.imageTexture(el.media.src);
-      const decoded = this.images.get(el.media.src);
+    let box: MediaQuad['box'] = [element.x, element.y, element.width, element.height];
+    let textureCoordinates: MediaQuad['textureCoordinates'];
+    if (element.type === 'image') {
+      texture = this.imageTexture(element.media.source);
+      const decoded = this.images.get(element.media.source);
       const fit = imageUv(
-        el,
-        imageSize(el, decoded?.width ? { w: decoded.width, h: decoded.height } : null),
+        element,
+        imageSize(
+          element,
+          decoded?.width ? { width: decoded.width, height: decoded.height } : null,
+        ),
       );
-      uv = [fit.u, fit.v, fit.du, fit.dv];
+      textureCoordinates = [fit.u, fit.v, fit.spanU, fit.spanV];
     } else {
       // Audio textures are drawn 1:1 to device pixels: the box is snapped to the pixel
       // grid and sized to the texture, so the thin controls stay sharp (no resampling).
-      const a = this.audioTexture(el, k);
-      texture = a.texture;
-      uv = [0, 0, 1, 1]; // the player texture is the box
-      if (el.rotation === 0 && a.scale === k) {
-        const sx = Math.round((el.x - x) * k) / k + x;
-        const sy = Math.round((el.y - y) * k) / k + y;
-        rect = [sx, sy, a.width / k, a.height / k];
+      const audio = this.audioTexture(element, devicePixelsPerUnit);
+      texture = audio.texture;
+      textureCoordinates = [0, 0, 1, 1]; // the player texture is the box
+      if (element.rotation === 0 && audio.scale === devicePixelsPerUnit) {
+        const snappedX =
+          Math.round((element.x - x) * devicePixelsPerUnit) / devicePixelsPerUnit + x;
+        const snappedY =
+          Math.round((element.y - y) * devicePixelsPerUnit) / devicePixelsPerUnit + y;
+        box = [
+          snappedX,
+          snappedY,
+          audio.width / devicePixelsPerUnit,
+          audio.height / devicePixelsPerUnit,
+        ];
       }
     }
     return {
-      rect,
-      rotation: el.rotation,
+      box,
+      rotation: element.rotation,
       depth,
-      radius: el.type === 'image' ? effectiveRadius(el) : 0,
-      uv,
+      radius: element.type === 'image' ? effectiveRadius(element) : 0,
+      textureCoordinates,
       // An image without one shows the placeholder: loading, failed or not allowed.
       texture,
     };
@@ -245,8 +270,8 @@ export class MediaPass {
 
   // --- Images -------------------------------------------------------------------
 
-  private imageTexture(src: string): TextureHandle | null {
-    let entry = this.images.get(src);
+  private imageTexture(source: string): TextureHandle | null {
+    let entry = this.images.get(source);
     if (!entry) {
       entry = {
         state: 'loading',
@@ -259,21 +284,21 @@ export class MediaPass {
         failures: 0,
         retryAt: 0,
       };
-      this.images.set(src, entry);
-      if (this.allowed(src)) void this.load(src, entry, this.generation);
+      this.images.set(source, entry);
+      if (this.allowed(source)) void this.load(source, entry, this.generation);
       else entry.state = 'blocked';
     } else if (entry.state === 'error' && performance.now() >= entry.retryAt) {
       entry.state = 'loading';
-      void this.load(src, entry, this.generation);
+      void this.load(source, entry, this.generation);
     }
     entry.lastUsed = this.frame;
     return entry.state === 'ready' ? entry.texture : null;
   }
 
-  private async load(src: string, entry: ImageEntry, generation: number): Promise<void> {
-    const current = () => generation === this.generation && this.images.get(src) === entry;
+  private async load(source: string, entry: ImageEntry, generation: number): Promise<void> {
+    const current = () => generation === this.generation && this.images.get(source) === entry;
     try {
-      const response = await fetch(src, { credentials: 'omit' });
+      const response = await fetch(source, { credentials: 'omit' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const declared = Number(response.headers.get('content-length') ?? 0);
       if (declared > MAX_IMAGE_BYTES) throw new Error('image too large');
@@ -281,14 +306,14 @@ export class MediaPass {
       if (blob.size > MAX_IMAGE_BYTES) throw new Error('image too large');
       let bitmap = await createImageBitmap(blob);
       const limit = Math.min(MAX_IMAGE_SIZE, this.textures.maxTextureSize ?? MAX_IMAGE_SIZE);
-      const k = Math.min(1, limit / Math.max(bitmap.width, bitmap.height));
-      if (k < 1) {
-        const w = Math.round(bitmap.width * k) || 1;
-        const h = Math.round(bitmap.height * k) || 1;
+      const scale = Math.min(1, limit / Math.max(bitmap.width, bitmap.height));
+      if (scale < 1) {
+        const width = Math.round(bitmap.width * scale) || 1;
+        const height = Math.round(bitmap.height * scale) || 1;
         bitmap.close();
         bitmap = await createImageBitmap(blob, {
-          resizeWidth: w,
-          resizeHeight: h,
+          resizeWidth: width,
+          resizeHeight: height,
           resizeQuality: 'high',
         });
       }
@@ -320,22 +345,20 @@ export class MediaPass {
   private uploadOneDecoded(): void {
     let found: ImageEntry | null = null;
     let more = false;
-    for (const e of this.images.values()) {
-      if (e.state !== 'decoded') continue;
+    for (const entry of this.images.values()) {
+      if (entry.state !== 'decoded') continue;
       if (found) {
         more = true;
         break;
       }
-      found = e;
+      found = entry;
     }
     if (!found || !found.bitmap) return;
     const bitmap = found.bitmap;
     // Go through a 2D canvas so every backend premultiplies it the same way in every browser.
     const canvas = createCanvas(bitmap.width, bitmap.height);
-    const ctx = canvas.getContext('2d') as
-      | CanvasRenderingContext2D
-      | OffscreenCanvasRenderingContext2D;
-    ctx.drawImage(bitmap, 0, 0);
+    const context = canvas.getContext('2d') as Context2D;
+    context.drawImage(bitmap, 0, 0);
     found.texture = this.textures.upload(canvas, true);
     found.bytes = Math.round(bitmap.width * bitmap.height * 4 * 1.33);
     found.state = 'ready';
@@ -347,42 +370,40 @@ export class MediaPass {
   // --- Audio players --------------------------------------------------------------
 
   private audioTexture(
-    el: ShapeElement & { media: { peaks?: number[]; duration?: number } },
-    devicePxPerWorld: number,
+    element: ShapeElement & { media: { peaks?: number[]; duration?: number } },
+    devicePixelsPerUnit: number,
   ): { texture: TextureHandle; scale: number; width: number; height: number } {
     // Drawn at the exact device resolution (players are few and cheap to redraw), so
     // hairlines and text stay crisp at any zoom; very large ones are capped.
     const scale = Math.min(
-      Math.max(devicePxPerWorld, 1e-3),
-      MAX_AUDIO_TEXTURE / Math.max(el.w, el.h, 1e-3),
+      Math.max(devicePixelsPerUnit, 1e-3),
+      MAX_AUDIO_TEXTURE / Math.max(element.width, element.height, 1e-3),
     );
-    const state = this.audioState.get(el.id) ?? { playing: false, progress: 0 };
-    const volume = el.volume ?? 1;
-    const pw = Math.max(1, Math.round(el.w * scale));
-    const ph = Math.max(1, Math.round(el.h * scale));
-    const duration = el.media.duration ?? 0;
+    const state = this.audioState.get(element.id) ?? { playing: false, progress: 0 };
+    const volume = element.volume ?? 1;
+    const pixelWidth = Math.max(1, Math.round(element.width * scale));
+    const pixelHeight = Math.max(1, Math.round(element.height * scale));
+    const duration = element.media.duration ?? 0;
     // The time label changes once per second, the waveform at bar granularity.
-    const card = this.audioCard(el);
-    const signature = `${pw}x${ph}|${card.fill}|${card.stroke}|${card.strokeWidth}|${card.radius}|${volume.toFixed(3)}|${state.playing}|${Math.floor(state.progress * 400)}|${Math.floor(state.progress * duration)}|${duration}|${this.audioStyleVersion}|${el.media.peaks?.length ?? 0}:${el.media.peaks?.[0] ?? ''}`;
-    let entry = this.audio.get(el.id);
+    const card = this.audioCard(element);
+    const signature = `${pixelWidth}x${pixelHeight}|${card.fill}|${card.stroke}|${card.strokeWidth}|${card.radius}|${volume.toFixed(3)}|${state.playing}|${Math.floor(state.progress * 400)}|${Math.floor(state.progress * duration)}|${duration}|${this.audioStyleVersion}|${element.media.peaks?.length ?? 0}:${element.media.peaks?.[0] ?? ''}`;
+    let entry = this.audio.get(element.id);
     if (entry && entry.signature === signature) {
       entry.lastUsed = this.frame;
-      return { texture: entry.texture, scale, width: pw, height: ph };
+      return { texture: entry.texture, scale, width: pixelWidth, height: pixelHeight };
     }
-    const canvas = entry?.canvas ?? createCanvas(pw, ph);
-    if (canvas.width !== pw || canvas.height !== ph) {
-      canvas.width = pw;
-      canvas.height = ph;
+    const canvas = entry?.canvas ?? createCanvas(pixelWidth, pixelHeight);
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
     }
-    const ctx = canvas.getContext('2d') as
-      | CanvasRenderingContext2D
-      | OffscreenCanvasRenderingContext2D;
+    const context = canvas.getContext('2d') as Context2D;
     drawAudioWidget(
-      ctx,
-      el.w,
-      el.h,
+      context,
+      element.width,
+      element.height,
       scale,
-      el.media.peaks,
+      element.media.peaks,
       volume,
       state,
       this.audioStyle,
@@ -392,41 +413,40 @@ export class MediaPass {
     if (entry) {
       entry.texture = this.textures.upload(canvas, false, entry.texture);
       entry.signature = signature;
-      entry.bytes = pw * ph * 4;
+      entry.bytes = pixelWidth * pixelHeight * 4;
       entry.lastUsed = this.frame;
     } else {
       entry = {
         canvas,
         texture: this.textures.upload(canvas, false),
         signature,
-        bytes: pw * ph * 4,
+        bytes: pixelWidth * pixelHeight * 4,
         lastUsed: this.frame,
       };
-      this.audio.set(el.id, entry);
+      this.audio.set(element.id, entry);
     }
-    return { texture: entry.texture, scale, width: pw, height: ph };
+    return { texture: entry.texture, scale, width: pixelWidth, height: pixelHeight };
   }
 
   /** Background and border of a player: the element's own fill and stroke, none by default. */
-  private audioCard(el: ShapeElement): AudioCard {
-    const css = (c: number) => {
-      const a = c & 255;
-      if (a === 0) return null;
-      return `rgba(${c >>> 24}, ${(c >>> 16) & 255}, ${(c >>> 8) & 255}, ${(a / 255).toFixed(3)})`;
-    };
+  private audioCard(element: ShapeElement): AudioCard {
+    const css = (color: number) => ((color & 255) === 0 ? null : cssColor(color));
     return {
-      fill: css(this.colorOf(el.type, el.fill)),
-      stroke: el.strokeWidth > 0 ? css(this.colorOf(el.type, el.stroke)) : null,
-      strokeWidth: el.strokeWidth,
-      radius: el.radius > 0 ? el.radius : audioLayout(el.w, el.h).card.radius,
+      fill: css(this.colorOf(element.type, element.fill)),
+      stroke: element.strokeWidth > 0 ? css(this.colorOf(element.type, element.stroke)) : null,
+      strokeWidth: element.strokeWidth,
+      radius:
+        element.radius > 0
+          ? element.radius
+          : audioLayout(element.width, element.height).card.radius,
     };
   }
 
   /** Frees least recently used textures (not used this frame) while over budget. */
   private evict(): void {
     let total = 0;
-    for (const e of this.images.values()) total += e.bytes;
-    for (const e of this.audio.values()) total += e.bytes;
+    for (const entry of this.images.values()) total += entry.bytes;
+    for (const entry of this.audio.values()) total += entry.bytes;
     if (total <= TEXTURE_BUDGET) return;
     const candidates: Array<{
       key: string;
@@ -434,21 +454,23 @@ export class MediaPass {
       lastUsed: number;
       bytes: number;
     }> = [];
-    for (const [key, e] of this.images)
-      if (e.state === 'ready' && e.lastUsed < this.frame)
-        candidates.push({ key, kind: 'image', lastUsed: e.lastUsed, bytes: e.bytes });
-    for (const [key, e] of this.audio)
-      if (e.lastUsed < this.frame)
-        candidates.push({ key, kind: 'audio', lastUsed: e.lastUsed, bytes: e.bytes });
-    candidates.sort((a, b) => a.lastUsed - b.lastUsed);
-    for (const c of candidates) {
+    for (const [key, entry] of this.images)
+      if (entry.state === 'ready' && entry.lastUsed < this.frame)
+        candidates.push({ key, kind: 'image', lastUsed: entry.lastUsed, bytes: entry.bytes });
+    for (const [key, entry] of this.audio)
+      if (entry.lastUsed < this.frame)
+        candidates.push({ key, kind: 'audio', lastUsed: entry.lastUsed, bytes: entry.bytes });
+    candidates.sort((first, second) => first.lastUsed - second.lastUsed);
+    for (const candidate of candidates) {
       if (total <= TEXTURE_BUDGET) break;
-      const tex =
-        c.kind === 'image' ? this.images.get(c.key)!.texture : this.audio.get(c.key)!.texture;
-      if (tex) this.textures.release(tex);
-      if (c.kind === 'image') this.images.delete(c.key);
-      else this.audio.delete(c.key);
-      total -= c.bytes;
+      const texture =
+        candidate.kind === 'image'
+          ? this.images.get(candidate.key)!.texture
+          : this.audio.get(candidate.key)!.texture;
+      if (texture) this.textures.release(texture);
+      if (candidate.kind === 'image') this.images.delete(candidate.key);
+      else this.audio.delete(candidate.key);
+      total -= candidate.bytes;
     }
   }
 }

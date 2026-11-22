@@ -36,7 +36,7 @@ export async function readSystemClipboard(): Promise<SystemClipboardContent | nu
   try {
     const items = await navigator.clipboard.read();
     for (const item of items) {
-      const image = item.types.find((t) => t.startsWith('image/'));
+      const image = item.types.find((type) => type.startsWith('image/'));
       if (image) {
         const blob = await item.getType(image);
         return { kind: 'image', file: new File([blob], 'pasted-image', { type: image }) };

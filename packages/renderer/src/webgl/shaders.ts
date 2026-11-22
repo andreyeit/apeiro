@@ -1,3 +1,5 @@
+import { TEXT_MAX_SAMPLES, TEXT_THINNING } from '../text/font';
+
 /**
  * All shapes share one program: a unit quad instanced per element,
  * with the outline computed analytically (SDF) in the fragment shader.
@@ -23,7 +25,7 @@ flat out vec4 v_fill;
 flat out vec4 v_stroke;
 flat out float v_strokeStyle;
 
-const float STICKY_SHADOW = 14.0;
+const float STICKY_SHADOW = 24.0;
 
 void main() {
   float kind = a_params.w;
@@ -246,9 +248,12 @@ void main() {
   }
 
   if (kind == 2.0) {
-    // Soft drop shadow under stickies, slightly offset down.
-    float sd = sdRoundBox(v_local - vec2(0.0, 6.0), v_half - 2.0, v_params.y + 4.0);
-    float shadow = 0.18 * (1.0 - smoothstep(-10.0, 10.0, sd));
+    // Shadow of a sticky as in Miro: paper lifting at its lower edge. A box a bit narrower
+    // than the note, shifted down, blurred, and fading in from top to bottom, so it shows
+    // under the lower edge and hardly at the sides.
+    float lift = smoothstep(-v_half.y * 0.3, v_half.y, v_local.y);
+    float sd = sdRoundBox(v_local - vec2(0.0, 8.0), v_half - vec2(6.0, 4.0), 6.0);
+    float shadow = 0.24 * lift * (1.0 - smoothstep(-12.0, 12.0, sd));
     color = color + vec4(0.0, 0.0, 0.0, shadow) * (1.0 - color.a);
   }
 
@@ -298,19 +303,21 @@ void main() {
 `;
 
 /**
- * All visible text in one draw call: SDF glyphs, color glyphs (emoji) and solid
- * quads (underline, strike-through, greeking bars), selected per instance.
+ * All visible text in one draw call: SDF glyphs, color glyphs (emoji), solid quads
+ * (underline, strike-through, greeking bars) and exact-size bitmap glyphs, selected per
+ * instance.
  */
 export const TEXT_VERTEX = /* glsl */ `#version 300 es
 layout(location = 0) in vec2 a_corner;
 layout(location = 1) in vec4 a_anchorOffset; // anchor.xy (element center), offset.xy
 layout(location = 2) in vec4 a_sizeRotDepth; // w, h, rotation, depth
 layout(location = 3) in vec4 a_uv;           // u0, v0, u1, v1
-layout(location = 4) in float a_mode;        // 0 sdf, 1 color, 2 solid
+layout(location = 4) in float a_mode;        // 0 sdf, 1 color, 2 solid, 3 bitmap
 layout(location = 5) in vec4 a_color;
 
 uniform vec3 u_camera;
 uniform vec2 u_viewport;
+uniform float u_pixelRatio;
 
 out vec2 v_uv;
 flat out float v_mode;
@@ -319,7 +326,7 @@ flat out vec4 v_color;
 void main() {
   vec2 size = a_sizeRotDepth.xy;
   vec2 offset = a_anchorOffset.zw;
-  if (a_mode > 1.5) {
+  if (a_mode > 1.5 && a_mode < 2.5) {
     // Keep thin solid quads (underlines, far-away bars) at least ~1px tall so they don't shimmer.
     float minH = 1.0 / u_camera.z;
     if (size.y < minH) {
@@ -331,6 +338,13 @@ void main() {
   float c = cos(a_sizeRotDepth.z);
   float s = sin(a_sizeRotDepth.z);
   vec2 world = a_anchorOffset.xy + vec2(local.x * c - local.y * s, local.x * s + local.y * c);
+  if (a_mode > 2.5) {
+    // Bitmap glyphs land on whole device pixels: their element's anchor is snapped to the
+    // pixel grid, so all its glyphs move together and keep their spacing.
+    float scale = u_camera.z * u_pixelRatio;
+    vec2 anchorPixels = (a_anchorOffset.xy - u_camera.xy) * scale;
+    world += (floor(anchorPixels + 0.5) - anchorPixels) / scale;
+  }
   vec2 clip = (world - u_camera.xy) * u_camera.z / u_viewport * 2.0 - 1.0;
   gl_Position = vec4(clip.x, -clip.y, a_sizeRotDepth.w * 2.0 - 1.0, 1.0);
   v_uv = mix(a_uv.xy, a_uv.zw, a_corner);
@@ -341,6 +355,8 @@ void main() {
 
 export const TEXT_FRAGMENT = /* glsl */ `#version 300 es
 precision highp float;
+#define TEXT_THINNING ${TEXT_THINNING.toFixed(2)}
+#define TEXT_MAX_SAMPLES ${TEXT_MAX_SAMPLES}
 in vec2 v_uv;
 flat in float v_mode;
 flat in vec4 v_color;
@@ -350,6 +366,13 @@ uniform float u_edge;   // SDF value at the glyph outline (1 - cutoff)
 out vec4 outColor;
 
 void main() {
+  if (v_mode > 2.5) {
+    // Coverage rasterized at this size, texel for pixel: as the browser draws it.
+    float coverage = texture(u_sdf, v_uv).r * v_color.a;
+    if (coverage <= 0.0) discard;
+    outColor = vec4(v_color.rgb * coverage, coverage);
+    return;
+  }
   if (v_mode > 1.5) {
     outColor = vec4(v_color.rgb * v_color.a, v_color.a);
     return;
@@ -374,25 +397,41 @@ void main() {
     return;
   }
   float d = texture(u_sdf, v_uv).r;
-  float fw = fwidth(d);
+  // SDF units per screen pixel across the outline: the gradient's length. fwidth (|dx|+|dy|)
+  // is up to 1.4x that on slanted and curved edges, which spread over more than a pixel.
+  float fw = length(vec2(dFdx(d), dFdy(d)));
+  // The outline moves inwards by TEXT_THINNING of a pixel (see there): otherwise glyphs come
+  // out heavier than the browser's and look smudged.
+  float edge = u_edge + TEXT_THINNING * fw;
   // Drawn at about its raster size or bigger: one sample with an edge one pixel wide, as
   // crisp as the browser's own text.
   float w1 = max(fw * 0.5, 1e-4);
-  float crisp = smoothstep(u_edge - w1, u_edge + w1, d);
-  // Shrunk a lot (zoomed out): four samples per pixel on a rotated grid, a box filter over
-  // the pixel; one sample would alias into blotchy, uneven strokes. Each sample covers a
-  // quarter of the pixel, so its own edge is half as wide.
-  float w4 = max(fw * 0.35, 1e-4);
-  float lo = u_edge - w4;
-  float hi = u_edge + w4;
-  float filtered = 0.25 * (
-    smoothstep(lo, hi, texture(u_sdf, v_uv + o1).r) +
-    smoothstep(lo, hi, texture(u_sdf, v_uv - o1).r) +
-    smoothstep(lo, hi, texture(u_sdf, v_uv + o2).r) +
-    smoothstep(lo, hi, texture(u_sdf, v_uv - o2).r)
-  );
-  // Atlas texels per screen pixel; blended, so zooming never pops between the two.
+  float crisp = smoothstep(edge - w1, edge + w1, d);
+  // Atlas texels per screen pixel.
   float shrink = max(length(dx), length(dy)) * float(textureSize(u_sdf, 0).x);
+  // Shrunk (zoomed out): a box filter over the pixel, n x n samples on a grid. One sample
+  // aliases into blotchy, uneven strokes; a fixed few are not enough either: zoomed far out,
+  // a pixel covers several atlas texels and thin strokes fall between the samples, so the
+  // text flickers and seems to jump from frame to frame. About one sample per two texels
+  // keeps every stroke in; each covers 1/n of the pixel, so its own edge is that much
+  // narrower. Small text covers few pixels: the extra samples cost little.
+  int n = int(clamp(ceil(shrink), 2.0, float(TEXT_MAX_SAMPLES)));
+  float cell = 1.0 / float(n);
+  float wn = max(fw * 0.7 * cell, 1e-4);
+  float lo = edge - wn;
+  float hi = edge + wn;
+  float filtered = 0.0;
+  for (int i = 0; i < TEXT_MAX_SAMPLES; i++) {
+    if (i >= n) break;
+    for (int j = 0; j < TEXT_MAX_SAMPLES; j++) {
+      if (j >= n) break;
+      vec2 offset = ((float(i) + 0.5) * cell - 0.5) * dx + ((float(j) + 0.5) * cell - 0.5) * dy;
+      // Explicit level: implicit derivatives are undefined inside this non-uniform loop.
+      filtered += smoothstep(lo, hi, textureLod(u_sdf, v_uv + offset, 0.0).r);
+    }
+  }
+  filtered *= cell * cell;
+  // Blended, so zooming never pops between the two.
   float a = mix(crisp, filtered, smoothstep(1.5, 2.5, shrink)) * v_color.a;
   if (a <= 0.0) discard;
   outColor = vec4(v_color.rgb * a, a);
@@ -507,14 +546,20 @@ flat in vec4 v_color;
 flat in float v_arcStart;
 flat in vec4 v_join;
 uniform vec3 u_camera;
+uniform float u_depthOnly; // 1: depth pass, drawn first (color writes are masked off)
 out vec4 outColor;
 
 // A joint belongs to one of its two pieces at each pixel (line-layer.ts): a piece draws from
 // the split line at its start, and up to a hundredth of a pixel past the one at its end. That
 // sliver, drawn by both, means float noise can't leave a pixel to neither of them.
-bool outsideJoints(float fromStart, float pastEnd, float px) {
-  return (v_join.xy != vec2(0.0) && fromStart < 0.0) ||
-         (v_join.zw != vec2(0.0) && pastEnd > 0.01 * px);
+// The split angles are quantized (line-layer.ts), so two neighbours' split lines differ by up
+// to JOIN_SLACK radians: a gap that widens away from the centre line. Each piece reaches that
+// far past its split ("across": distance from the centre line), so no pixel is left out.
+const float JOIN_SLACK = 0.002;
+bool outsideJoints(float fromStart, float pastEnd, float across, float px) {
+  float slack = across * JOIN_SLACK;
+  return (v_join.xy != vec2(0.0) && fromStart < -slack) ||
+         (v_join.zw != vec2(0.0) && pastEnd > 0.01 * px + slack);
 }
 
 // How far a point at arc length u (plus the connector's dash offset) is from a dash; 0 inside one.
@@ -572,13 +617,13 @@ void main() {
     float rel = mod((atan(v, u) - v_arcStart) * turn, tau); // here (u, v) = point - center
     float along = (rel <= span + (tau - span) * 0.5 ? rel : rel - tau) * r;
     // Joined ends split along the radius: the neighbouring segments are tangent there.
-    if (outsideJoints(along, along - span * r, px)) discard;
+    if (outsideJoints(along, along - span * r, abs(length(vec2(u, v)) - r), px)) discard;
     float off = abs(along - clamp(along, 0.0, span * r));
     off = max(off, toDash(along, v_extra.x, v_params.z, v_params.w));
     d = length(vec2(off, length(vec2(u, v)) - r)) - hw;
   } else if (mode < 0.5) {
     float len = v_extra.y;
-    if (outsideJoints(dot(vec2(u, v), v_join.xy), dot(vec2(u - len, v), v_join.zw), px)) discard;
+    if (outsideJoints(dot(vec2(u, v), v_join.xy), dot(vec2(u - len, v), v_join.zw), abs(v), px)) discard;
     float off = abs(u - clamp(u, 0.0, len)); // past the segment ends: round caps
     off = max(off, toDash(u, v_extra.x, v_params.z, v_params.w));
     d = length(vec2(off, v)) - hw;
@@ -595,6 +640,14 @@ void main() {
   }
 
   float a = clamp(0.5 - d / px, 0.0, 1.0) * v_color.a;
+  if (u_depthOnly > 0.5) {
+    // Only fully opaque pixels hide the lines below. An antialiased edge must not, or a
+    // line under it would be cut away there and the half-transparent edge would show the
+    // background: a light seam where lines cross.
+    if (a < 0.99) discard;
+    outColor = vec4(0.0);
+    return;
+  }
   if (a <= 0.01) discard;
   outColor = vec4(v_color.rgb * a, a);
 }
