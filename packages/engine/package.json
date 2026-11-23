@@ -1,6 +1,6 @@
 {
   "name": "apeiro",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Infinite canvas whiteboard for the web: WebGPU/WebGL2 rendering, shapes, connectors, rich text, pen, images and undo, with React bindings.",
   "keywords": [
     "whiteboard",
